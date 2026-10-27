@@ -518,6 +518,7 @@ mod tests {
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
             packet_offload: None,
+            aac_decoder: None,
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {
