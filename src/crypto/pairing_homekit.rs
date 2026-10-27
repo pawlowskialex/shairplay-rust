@@ -67,9 +67,12 @@ impl SrpServer {
             .ok_or_else(|| CryptoError::PairingHandshake("Failed to parse N".into()))?;
         let g = BigUint::from(G_3072);
 
-        // Generate random salt (16 bytes)
+        // Generate random salt (16 bytes). Its first byte is never 0: SRP implementations disagree on whether
+        // a leading zero byte of the salt is hashed, so one that never occurs avoids a failed pairing.
         let mut salt_bytes = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt_bytes);
+        while salt_bytes[0] == 0 {
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt_bytes);
+        }
         let salt = BigUint::from_bytes_be(&salt_bytes);
 
         // x = H(salt || H("Pair-Setup:pin"))
@@ -81,15 +84,18 @@ impl SrpServer {
         // k = H(pad(N) || pad(g))
         let k = h_nn_pad(&n, &g, N_3072_LEN);
 
-        // b = random 256-bit
-        let mut b_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
-        let b = BigUint::from_bytes_be(&b_bytes);
-
-        // B = (k*v + g^b) mod N
+        // b = random 256-bit; B = (k*v + g^b) mod N. B is drawn again in the rare case its first byte is 0
+        // (implementations disagree on padding B in the proof; a full-length B reads the same either way).
         let kv = (&k * &v) % &n;
-        let gb = g.modpow(&b, &n);
-        let big_b = (kv + gb) % &n;
+        let (b, big_b) = loop {
+            let mut b_bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
+            let b = BigUint::from_bytes_be(&b_bytes);
+            let big_b = (&kv + g.modpow(&b, &n)) % &n;
+            if to_bytes_be(&big_b).len() == N_3072_LEN {
+                break (b, big_b);
+            }
+        };
 
         Ok(Self {
             n,
@@ -175,30 +181,51 @@ impl SrpServer {
         let avu = (&big_a * &vu) % &self.n;
         let big_s = avu.modpow(&self.b, &self.n);
 
-        // session_key = H(S)
-        let s_bytes = to_bytes_be(&big_s);
-        self.session_key = sha512(&s_bytes).to_vec();
-
-        // Calculate expected M1
+        // session_key = H(S), and the expected client proof M1. Implementations disagree on whether S (in K)
+        // and A (in M1, M2) are hashed as minimal big-endian bytes or padded to N's length: they only differ
+        // when the number has a leading zero byte (~1 in 256 each), so accept either encoding.
         let salt_bn = BigUint::from_bytes_be(&self.salt);
-        let expected_m = calculate_m(
-            &self.n,
-            &self.g,
-            USERNAME,
-            &salt_bn,
-            &big_a,
-            &self.big_b,
-            &self.session_key,
-        );
-
-        // Constant-time comparison of the client's SRP proof.
-        if !bool::from(proof.ct_eq(expected_m.as_slice())) {
+        let enc = |v: &BigUint, pad: bool| {
+            if pad {
+                to_bytes_be_padded(v, N_3072_LEN)
+            } else {
+                to_bytes_be(v)
+            }
+        };
+        let short = |v: &BigUint| to_bytes_be(v).len() < N_3072_LEN;
+        let mut matched = None;
+        for pad_s in [false, true] {
+            if pad_s && !short(&big_s) {
+                break;
+            }
+            let session_key = sha512(&enc(&big_s, pad_s)).to_vec();
+            for pad_a in [false, true] {
+                if pad_a && !short(&big_a) {
+                    break;
+                }
+                let expected_m = calculate_m(
+                    &self.n,
+                    &self.g,
+                    USERNAME,
+                    &salt_bn,
+                    &enc(&big_a, pad_a),
+                    &self.big_b,
+                    &session_key,
+                );
+                // Constant-time comparison of the client's SRP proof.
+                if bool::from(proof.ct_eq(expected_m.as_slice())) {
+                    matched = Some((session_key.clone(), expected_m, enc(&big_a, pad_a)));
+                }
+            }
+        }
+        let Some((session_key, expected_m, a_bytes)) = matched else {
             self.verified = false;
             return Ok(false);
-        }
+        };
+        self.session_key = session_key;
 
         // Calculate M2 = H(A || M || session_key)
-        self.m2 = calculate_h_amk(&big_a, &expected_m, &self.session_key).to_vec();
+        self.m2 = calculate_h_amk(&a_bytes, &expected_m, &self.session_key).to_vec();
         self.verified = true;
         Ok(true)
     }
@@ -290,7 +317,7 @@ fn calculate_m(
     g: &BigUint,
     username: &str,
     salt: &BigUint,
-    big_a: &BigUint,
+    big_a: &[u8],
     big_b: &BigUint,
     session_key: &[u8],
 ) -> [u8; 64] {
@@ -306,16 +333,16 @@ fn calculate_m(
     hasher.update(h_xor);
     hasher.update(h_i);
     hasher.update(to_bytes_be(salt));
-    hasher.update(to_bytes_be(big_a));
+    hasher.update(big_a);
     hasher.update(to_bytes_be(big_b));
     hasher.update(session_key);
     hasher.finalize().into()
 }
 
-/// H_AMK = H(A || M || K)
-fn calculate_h_amk(big_a: &BigUint, m: &[u8], session_key: &[u8]) -> [u8; 64] {
+/// H_AMK = H(A || M || K), with A encoded as in the client's proof
+fn calculate_h_amk(big_a: &[u8], m: &[u8], session_key: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
-    hasher.update(to_bytes_be(big_a));
+    hasher.update(big_a);
     hasher.update(m);
     hasher.update(session_key);
     hasher.finalize().into()
@@ -801,7 +828,15 @@ mod tests {
         let big_s = base.modpow(&(&a + &u * &x), &n);
 
         let session_key = sha512(&to_bytes_be(&big_s));
-        let client_m = calculate_m(&n, &g, USERNAME, &salt_bn, &big_a, &big_b, &session_key);
+        let client_m = calculate_m(
+            &n,
+            &g,
+            USERNAME,
+            &salt_bn,
+            &to_bytes_be(&big_a),
+            &big_b,
+            &session_key,
+        );
 
         // Client sends M3
         let mut m3 = TlvValues::new();
@@ -819,7 +854,7 @@ mod tests {
         let server_proof = m4.get_type(TlvType::Proof).unwrap();
 
         // Client verifies M2 proof
-        let expected_hamk = calculate_h_amk(&big_a, &client_m, &session_key);
+        let expected_hamk = calculate_h_amk(&to_bytes_be(&big_a), &client_m, &session_key);
         assert_eq!(server_proof, &expected_hamk[..]);
 
         // Shared secret should match
@@ -912,7 +947,15 @@ mod tests {
         let base = (&big_b + &n - &kgx) % &n;
         let big_s = base.modpow(&(&a + &u * &x), &n);
         let session_key = sha512(&to_bytes_be(&big_s));
-        let client_m = calculate_m(&n, &g, USERNAME, &salt_bn, &big_a, &big_b, &session_key);
+        let client_m = calculate_m(
+            &n,
+            &g,
+            USERNAME,
+            &salt_bn,
+            &to_bytes_be(&big_a),
+            &big_b,
+            &session_key,
+        );
 
         let mut m3 = TlvValues::new();
         m3.add(TlvType::State as u8, &[3]);
@@ -1119,5 +1162,62 @@ mod tests {
 
         assert!(matches!(result, Err(CryptoError::PairingVerify)));
         assert!(server.shared_secret().is_none());
+    }
+
+    /// A client that pads A (and S) to N's length in the proof (fast-srp / HAP-NodeJS style) is accepted
+    /// too: with an A whose first byte is 0 the two encodings differ.
+    #[test]
+    fn transient_pairing_accepts_padded_a() {
+        let mut server = SrpServer::new(None).unwrap();
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::Method as u8, &[0]);
+        m1.add(TlvType::Flags as u8, &[0x10, 0, 0, 0]); // a 4-byte flags integer, as some senders send it
+        server.process_m1(&m1.encode()).unwrap();
+        assert!(server.is_transient());
+        let m2 = TlvValues::decode(&server.build_m2()).unwrap();
+        let salt = m2.get_type(TlvType::Salt).unwrap().to_vec();
+        assert_ne!(salt[0], 0, "salt never starts with a zero byte");
+        let big_b = BigUint::from_bytes_be(m2.get_type(TlvType::PublicKey).unwrap());
+        assert_eq!(
+            to_bytes_be(&big_b).len(),
+            N_3072_LEN,
+            "B is always full length"
+        );
+
+        let n = BigUint::parse_bytes(N_3072_HEX.as_bytes(), 16).unwrap();
+        let g = BigUint::from(G_3072);
+        // an a whose A has a leading zero byte (~1 in 256)
+        let (a, big_a) = loop {
+            let mut a_bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut a_bytes);
+            let a = BigUint::from_bytes_be(&a_bytes);
+            let big_a = g.modpow(&a, &n);
+            if to_bytes_be(&big_a).len() < N_3072_LEN {
+                break (a, big_a);
+            }
+        };
+        let salt_bn = BigUint::from_bytes_be(&salt);
+        let k = h_nn_pad(&n, &g, N_3072_LEN);
+        let u = h_nn_pad(&big_a, &big_b, N_3072_LEN);
+        let x = calculate_x(&salt_bn, USERNAME, b"3939");
+        let base = (&big_b + &n - (&k * g.modpow(&x, &n)) % &n) % &n;
+        let big_s = base.modpow(&(&a + &u * &x), &n);
+        let session_key = sha512(&to_bytes_be_padded(&big_s, N_3072_LEN));
+        let a_padded = to_bytes_be_padded(&big_a, N_3072_LEN);
+        let client_m = calculate_m(&n, &g, USERNAME, &salt_bn, &a_padded, &big_b, &session_key);
+
+        let mut m3 = TlvValues::new();
+        m3.add(TlvType::State as u8, &[3]);
+        m3.add(TlvType::PublicKey as u8, &a_padded);
+        m3.add(TlvType::Proof as u8, &client_m);
+        assert!(
+            server.process_m3(&m3.encode()).unwrap(),
+            "a padded-A proof is accepted"
+        );
+        let m4 = TlvValues::decode(&server.build_m4().unwrap()).unwrap();
+        let expected_hamk = calculate_h_amk(&a_padded, &client_m, &session_key);
+        assert_eq!(m4.get_type(TlvType::Proof).unwrap(), &expected_hamk[..]);
+        assert_eq!(server.shared_secret().unwrap(), &session_key[..]);
     }
 }
