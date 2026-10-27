@@ -36,6 +36,9 @@ pub(crate) struct RaopShared {
     pub(crate) audio_buffer_size: u32,
     #[cfg(feature = "ap2")]
     pub(crate) pin: Option<String>,
+    /// The next pair-setup's SRP state, made ahead of time.
+    #[cfg(feature = "ap2")]
+    pub(crate) srp_spare: std::sync::Arc<crate::crypto::pairing_homekit::SrpSpare>,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
     /// Shared video encryption keys — set by audio SETUP, read by video SETUP.
@@ -162,6 +165,12 @@ impl Drop for RaopConnectionHandler {
             .shared
             .handler
             .on_client_disconnected(&self.remote_addr);
+        // a sender has left and its audio stopped: the CPU is free to make the next pair-setup's SRP state
+        #[cfg(feature = "ap2")]
+        self.conn
+            .shared
+            .srp_spare
+            .refill(std::time::Duration::from_secs(1));
     }
 }
 

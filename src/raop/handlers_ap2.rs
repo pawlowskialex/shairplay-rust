@@ -1,7 +1,7 @@
 //! AP2 RTSP request handlers — pairing, encrypted SETUP, buffered audio, video.
 
 use crate::codec::alac::AlacFormat;
-use crate::crypto::pairing_homekit::{self, PairVerifyServer, SrpServer};
+use crate::crypto::pairing_homekit::{self, PairVerifyServer};
 #[cfg(feature = "video")]
 use crate::error::CryptoError;
 use crate::error::{ProtocolError, ShairplayError};
@@ -68,7 +68,7 @@ pub(crate) fn handle_pair_setup(
     match state {
         1 => {
             tracing::info!("AP2 pair-setup M1 received");
-            let mut srp = match SrpServer::new(conn.shared.pin.as_deref()) {
+            let mut srp = match conn.shared.srp_spare.take() {
                 Ok(srp) => srp,
                 Err(e) => {
                     tracing::warn!("pair-setup M1 init failed: {e}");

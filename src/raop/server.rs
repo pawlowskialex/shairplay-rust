@@ -354,6 +354,12 @@ impl RaopServerBuilder {
             output_max_channels: self.output_max_channels,
             audio_buffer_size: self.audio_buffer_size,
             #[cfg(feature = "ap2")]
+            srp_spare: {
+                let spare = crate::crypto::pairing_homekit::SrpSpare::new(self.pin.clone());
+                spare.refill(std::time::Duration::ZERO);
+                spare
+            },
+            #[cfg(feature = "ap2")]
             pin: self.pin,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,
