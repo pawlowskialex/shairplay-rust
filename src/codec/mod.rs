@@ -50,6 +50,20 @@ impl Pcm {
         )
     }
 
+    /// Hand the samples to the session with the time they should play (16-bit sessions; others untimed).
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
+    pub(crate) fn deliver_timed(
+        self,
+        session: &mut dyn AudioSession,
+        format: SampleFormat,
+        play_at_ns: Option<u64>,
+    ) {
+        match (play_at_ns, format) {
+            (Some(t), SampleFormat::S16) => session.audio_process_timed_s16(&self.into_s16(), t),
+            _ => self.deliver(session, format),
+        }
+    }
+
     /// Hand the samples to the session in its format.
     pub(crate) fn deliver(self, session: &mut dyn AudioSession, format: SampleFormat) {
         match (self, format) {

@@ -977,6 +977,12 @@ pub(crate) fn handle_set_rate_anchor_time(
         .and_then(|v| v.as_unsigned_integer())
         .unwrap_or(0);
 
+    // The PTP clock the network time is on (absent: whichever master is heard).
+    let timeline = dict
+        .get("networkTimeTimelineID")
+        .and_then(|v| v.as_unsigned_integer())
+        .unwrap_or(0);
+
     // Convert network time to nanoseconds (saturating: net_secs is peer-supplied).
     let frac_ns = ((net_frac >> 32) * 1_000_000_000) >> 32;
     let anchor_time_ns = net_secs
@@ -984,7 +990,12 @@ pub(crate) fn handle_set_rate_anchor_time(
         .saturating_add(frac_ns);
 
     if rate & 1 != 0 {
-        tracing::info!(rtp_time, anchor_time_ns, "AP2 play start");
+        tracing::info!(
+            rtp_time,
+            anchor_time_ns,
+            timeline = format!("{timeline:016x}"),
+            "AP2 play start"
+        );
     } else {
         tracing::info!("AP2 play pause");
     }
@@ -993,6 +1004,7 @@ pub(crate) fn handle_set_rate_anchor_time(
         let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
+            timeline,
             rate,
         });
     }
