@@ -64,3 +64,30 @@ pub trait PacketOffload: Send {
 /// Makes a stream's offload, or `None` to process the stream in software.
 pub type OffloadFactory =
     Arc<dyn Fn(&OffloadStream) -> Option<Box<dyn PacketOffload>> + Send + Sync>;
+
+/// An AAC-LC decoder supplied by the application, for AirPlay 2 buffered audio: raw access units in (no ADTS),
+/// interleaved 16-bit PCM out. Install with
+/// [`RaopServerBuilder::aac_decoder`](crate::RaopServerBuilder::aac_decoder).
+pub trait AacDecoder: Send {
+    /// Decode one access unit; `None` drops it.
+    fn decode(&mut self, access_unit: &[u8]) -> Option<Vec<i16>>;
+
+    /// A decoder that works asynchronously (on a coprocessor) queues an access unit under `tag` and returns
+    /// `true`; the playout then submits frames shortly before they are due and collects them in order. The
+    /// default, `false`, means every frame goes through [`decode`](Self::decode) when it is due.
+    fn submit(&mut self, _tag: u32, _access_unit: &[u8]) -> bool {
+        false
+    }
+
+    /// Hand over finished units in submission order, stopping at the first unfinished one (`None`: dropped).
+    fn collect(&mut self, _done: &mut dyn FnMut(u32, Option<&[i16]>)) {}
+
+    /// Units submitted and not yet collected.
+    fn in_flight(&self) -> usize {
+        0
+    }
+}
+
+/// Makes a stream's AAC decoder from its sample rate and channel count, or `None` to use the library's own
+/// (`aac-symphonia`).
+pub type AacDecoderFactory = Arc<dyn Fn(u32, u8) -> Option<Box<dyn AacDecoder>> + Send + Sync>;

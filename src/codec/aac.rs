@@ -141,6 +141,22 @@ pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
 /// An AAC-LC decoder: raw frames (no ADTS) in, interleaved PCM out, in the decoder's native format.
 pub(crate) trait AacBackend {
     fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm>;
+    /// The application's decoder, if this is one (for its asynchronous interface).
+    fn external(&mut self) -> Option<&mut dyn crate::raop::offload::AacDecoder> {
+        None
+    }
+}
+
+/// The application's decoder ([`crate::AacDecoder`]) behind the pipeline's interface.
+pub(crate) struct External(pub(crate) Box<dyn crate::raop::offload::AacDecoder>);
+
+impl AacBackend for External {
+    fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm> {
+        self.0.decode(raw_aac).map(Pcm::S16)
+    }
+    fn external(&mut self) -> Option<&mut dyn crate::raop::offload::AacDecoder> {
+        Some(self.0.as_mut())
+    }
 }
 
 /// The AAC decoder compiled in: symphonia's with `aac-symphonia`.

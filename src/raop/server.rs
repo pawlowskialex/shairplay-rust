@@ -82,6 +82,7 @@ pub struct RaopServerBuilder {
     output_format: crate::raop::SampleFormat,
     audio_buffer_size: u32,
     packet_offload: Option<crate::raop::offload::OffloadFactory>,
+    aac_decoder: Option<crate::raop::offload::AacDecoderFactory>,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2-core")]
@@ -121,6 +122,7 @@ impl RaopServerBuilder {
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
             packet_offload: None,
+            aac_decoder: None,
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2-core")]
@@ -265,6 +267,13 @@ impl RaopServerBuilder {
         self
     }
 
+    /// Decode AirPlay 2 buffered AAC with the application's decoder ([`AacDecoder`](crate::AacDecoder));
+    /// `factory` may decline a stream, which then goes to the library's own decoder.
+    pub fn aac_decoder(mut self, factory: crate::raop::offload::AacDecoderFactory) -> Self {
+        self.aac_decoder = Some(factory);
+        self
+    }
+
     /// Set the AP1 codecs advertised in the `_raop._tcp` `cn` TXT record.
     ///
     /// The receiver auto-detects the actual codec per connection from the SDP,
@@ -398,6 +407,7 @@ impl RaopServerBuilder {
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
             packet_offload: self.packet_offload.clone(),
+            aac_decoder: self.aac_decoder.clone(),
             #[cfg(feature = "ap2-core")]
             srp_spare: {
                 let spare = crate::crypto::pairing_homekit::SrpSpare::new(self.pin.clone());
