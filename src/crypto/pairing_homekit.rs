@@ -120,10 +120,12 @@ impl SrpServer {
             ));
         }
 
+        // Flags is a TLV8 integer: little-endian, any length (iOS sends one byte, some senders four)
         self.is_transient = tlv
             .get_type(TlvType::Flags)
-            .map(|f| f.len() == 1 && f[0] == PAIRING_FLAGS_TRANSIENT)
-            .unwrap_or(false);
+            .filter(|f| (1..=4).contains(&f.len()))
+            .map(|f| f.iter().rev().fold(0u32, |v, &b| v << 8 | u32::from(b)))
+            .is_some_and(|flags| flags & u32::from(PAIRING_FLAGS_TRANSIENT) != 0);
         if self.is_transient && !self.allow_transient {
             return Err(CryptoError::PairingHandshake(
                 "transient pair-setup is disabled when a PIN is configured".into(),
