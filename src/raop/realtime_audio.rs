@@ -1,7 +1,7 @@
 //! Realtime ALAC audio receiver (stream type 96).
 //!
 //! Receives UDP packets with RTP headers, decrypts with ChaCha20-Poly1305,
-//! decodes ALAC, resamples/mixes down, and delivers f32 PCM immediately.
+//! decodes ALAC, resamples/mixes down if asked, and delivers PCM in the session's sample format immediately.
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -30,6 +30,8 @@ pub(crate) struct OutputConfig {
     pub(crate) sample_rate: Option<u32>,
     /// Maximum output channels, or None to pass through.
     pub(crate) max_channels: Option<u8>,
+    /// Sample format of the PCM handed to the session.
+    pub(crate) format: crate::raop::SampleFormat,
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -103,7 +105,7 @@ pub(crate) async fn run(
 
             let format = AudioFormat {
                 codec: AudioCodec::Pcm,
-                bits: 32,
+                bits: output_config.format.bits(),
                 channels: out_ch,
                 sample_rate: output_config.sample_rate.unwrap_or(src_sr),
             };
@@ -117,28 +119,26 @@ pub(crate) async fn run(
             continue;
         };
 
-        // Decode ALAC → f32 PCM
-        let Some(mut samples) = decoder
+        // Decode ALAC → PCM (16-bit streams stay integer)
+        let Some(pcm) = decoder
             .as_mut()
-            .and_then(|d| d.decode_frame_f32(&alac_data))
+            .and_then(|d| d.decode_frame_pcm(&alac_data))
         else {
             continue;
         };
 
-        // Mix down + resample to the output format.
-        #[cfg(feature = "resample")]
-        {
-            samples = crate::codec::resample::mixdown_and_resample(
-                samples,
-                src_ch,
-                out_ch,
-                &mut resampler,
-            );
-        }
+        // Mix down + resample, only if the output needs it.
+        let pcm = crate::codec::shape(
+            pcm,
+            src_ch,
+            out_ch,
+            #[cfg(feature = "resample")]
+            &mut resampler,
+        );
 
         // Deliver immediately (realtime = no playout buffer)
         if let Some(ref mut sess) = session {
-            sess.audio_process(&samples);
+            pcm.deliver(sess.as_mut(), output_config.format);
         }
     }
 
@@ -158,6 +158,7 @@ mod tests {
             bit_depth: 16,
             sample_rate: None,
             max_channels: None,
+            format: crate::raop::SampleFormat::F32,
         });
 
         assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);

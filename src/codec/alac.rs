@@ -1,5 +1,7 @@
 //! Apple Lossless Audio Codec (ALAC) decoder.
 
+use crate::codec::Pcm;
+
 /// ALAC decoder configuration, parsed from the fmtp SDP attribute.
 #[derive(Debug, Clone)]
 pub(crate) struct AlacConfig {
@@ -576,11 +578,10 @@ impl AlacDecoder {
         output_size
     }
 
-    /// Decode an ALAC frame and return F32LE interleaved samples.
-    // Consumed by the AP2 realtime audio path (and the unit tests). Dead in the
-    // default `--lib` build where neither is compiled.
+    /// Decode an ALAC frame into interleaved PCM: 16-bit streams as [`Pcm::S16`] (no float on the
+    /// way), 24-bit ones as [`Pcm::F32`] (full precision).
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
-    pub(crate) fn decode_frame_f32(&mut self, input: &[u8]) -> Option<Vec<f32>> {
+    pub(crate) fn decode_frame_pcm(&mut self, input: &[u8]) -> Option<Pcm> {
         if self.max_samples_per_frame == 0 || self.bytes_per_sample <= 0 {
             return None;
         }
@@ -596,15 +597,8 @@ impl AlacDecoder {
         }
 
         match self.sample_size_config {
-            16 => Some(
-                pcm_buf[..len]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-                    .collect(),
-            ),
-            24 => Some(
+            16 => Some(Pcm::from_s16le(&pcm_buf[..len])),
+            24 => Some(Pcm::F32(
                 pcm_buf[..len]
                     .as_chunks::<3>()
                     .0
@@ -615,9 +609,15 @@ impl AlacDecoder {
                         sample as f32 / 8_388_608.0
                     })
                     .collect(),
-            ),
+            )),
             _ => None,
         }
+    }
+
+    /// Decode an ALAC frame and return F32LE interleaved samples.
+    #[allow(dead_code)] // the unit tests' entry point; the pipelines use decode_frame_pcm
+    pub(crate) fn decode_frame_f32(&mut self, input: &[u8]) -> Option<Vec<f32>> {
+        self.decode_frame_pcm(input).map(Pcm::into_f32)
     }
 
     /// Rice-decode then FIR-predict one channel into the A (`false`) or B
