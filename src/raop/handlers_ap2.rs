@@ -403,14 +403,17 @@ fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<
         }
     }
 
-    // Control port (shared across streams)
-    let ctrl_sock = std::net::UdpSocket::bind(bind_addr_for(conn)).ok()?;
-    let ctrl_port = ctrl_sock.local_addr().ok()?.port();
-    drop(ctrl_sock);
-    stream_resp.insert(
-        "controlPort".into(),
-        plist::Value::Integer(ctrl_port.into()),
-    );
+    // Control port: streams that use one (realtime: retransmits) put their own; the others get a port nobody listens
+    // on, as the sender expects the key
+    if !stream_resp.contains_key("controlPort") {
+        let ctrl_sock = std::net::UdpSocket::bind(bind_addr_for(conn)).ok()?;
+        let ctrl_port = ctrl_sock.local_addr().ok()?.port();
+        drop(ctrl_sock);
+        stream_resp.insert(
+            "controlPort".into(),
+            plist::Value::Integer(ctrl_port.into()),
+        );
+    }
 
     let mut resp_dict = plist::Dictionary::new();
     resp_dict.insert(
@@ -676,6 +679,20 @@ fn setup_stream_realtime(
 
         let socket = bind_udp(bind_addr_for(conn))?;
         let audio_port = socket.local_addr().ok()?.port();
+        // Our control port, kept open: the sender answers retransmit requests there. Its own is where they go.
+        let ctrl = bind_udp(bind_addr_for(conn))?;
+        stream_resp.insert(
+            "controlPort".into(),
+            plist::Value::Integer(ctrl.local_addr().ok()?.port().into()),
+        );
+        let retransmit = stream0
+            .get("controlPort")
+            .and_then(|v| v.as_unsigned_integer())
+            .filter(|&p| p > 0 && u16::try_from(p).is_ok())
+            .map(|p| crate::raop::realtime_audio::Retransmit {
+                socket: ctrl,
+                sender: std::net::SocketAddr::new(conn.remote_socket.ip(), p as u16),
+            });
 
         let handler = conn.shared.handler.clone();
         let output_config = crate::raop::realtime_audio::OutputConfig {
@@ -691,6 +708,7 @@ fn setup_stream_realtime(
 
         let handle = tokio::spawn(crate::raop::realtime_audio::run(
             socket,
+            retransmit,
             shk_arr,
             handler,
             output_config,
