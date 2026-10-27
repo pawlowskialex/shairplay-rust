@@ -528,7 +528,7 @@ mod hex {
     }
 }
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(all(test, feature = "ap2-core"))]
 mod ap2_tests {
     // --- C-verified: per-packet audio decryption ---
     // Generated from libsodium crypto_aead_chacha20poly1305_ietf_encrypt
@@ -721,7 +721,7 @@ mod ap2_tests {
 
 // --- NetworkTimeFrac edge cases ---
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(all(test, feature = "ap2-core"))]
 mod frac_edge_tests {
     #[test]
     fn frac_zero() {
@@ -749,7 +749,7 @@ mod frac_edge_tests {
 
 // --- Playout buffer logic ---
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(all(test, feature = "ap2-core"))]
 mod playout_tests {
     use shairplay::raop::buffered_audio::PlayoutCommand;
 
@@ -773,7 +773,7 @@ mod playout_tests {
 // Q1: accessory identity key — random, persisted, not device-derived
 // ============================================================
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[test]
 fn identity_key_has_entropy_and_is_not_device_derived() {
     use shairplay::crypto::pairing_homekit::{
@@ -788,7 +788,7 @@ fn identity_key_has_entropy_and_is_not_device_derived() {
     assert_ne!(vk_random.as_bytes(), vk_derived.as_bytes());
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[test]
 fn pairing_store_identity_methods_default_and_roundtrip() {
     use shairplay::{MemoryPairingStore, PairingStore};
@@ -820,7 +820,7 @@ fn pairing_store_identity_methods_default_and_roundtrip() {
     assert_eq!(s.load_identity(), Some([7u8; 32]));
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[test]
 fn server_build_generates_and_persists_random_identity() {
     use shairplay::{AudioFormat, AudioHandler, AudioSession, PairingStore, RaopServer};

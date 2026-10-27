@@ -20,7 +20,7 @@ struct Observations {
 #[derive(Default)]
 struct BoundedHandler {
     observed: Arc<Observations>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     channel: Option<crate::crypto::chacha_transport::EncryptedChannel>,
 }
 
@@ -54,12 +54,12 @@ impl ConnectionHandler for BoundedHandler {
         response
     }
 
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     fn is_encrypted(&self) -> bool {
         self.channel.is_some()
     }
 
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
         self.channel.as_mut().map_or_else(
             || Some((data.to_vec(), data.len())),
@@ -67,7 +67,7 @@ impl ConnectionHandler for BoundedHandler {
         )
     }
 
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
         self.channel.as_mut().map_or_else(
             || data.to_vec(),
@@ -218,7 +218,7 @@ impl HttpdCallbacks for BoundedCallbacks {
     ) -> Option<Box<dyn ConnectionHandler>> {
         Some(Box::new(BoundedHandler {
             observed: self.0.clone(),
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             channel: None,
         }))
     }
@@ -280,7 +280,7 @@ async fn encrypted_buffer_limit_is_checked_before_copying() {
     assert_eq!(raw.len(), MAX_ENCRYPTED_BUFFER_LEN);
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 fn encrypted_pair() -> (
     BoundedHandler,
     crate::crypto::chacha_transport::EncryptedChannel,
@@ -302,7 +302,7 @@ fn encrypted_pair() -> (
     (handler, client)
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[tokio::test]
 async fn encrypted_fragments_and_pipeline_use_identical_policy() {
     let (mut handler, mut peer) = encrypted_pair();
@@ -348,7 +348,7 @@ async fn encrypted_fragments_and_pipeline_use_identical_policy() {
     assert_eq!(handler.observed.dispatches.load(Ordering::SeqCst), 2);
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[tokio::test(start_paused = true)]
 async fn encrypted_partial_frame_cannot_extend_body_deadline() {
     let (handler, mut peer) = encrypted_pair();

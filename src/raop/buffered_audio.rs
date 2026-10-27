@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use crate::codec::aac::{AacDecoder, AudioSsrc};
+use crate::codec::aac::{AacBackend, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
@@ -261,7 +261,7 @@ async fn receive_loop(
 /// The decoder and output shaping for the current stream format.
 struct Stream {
     ssrc: AudioSsrc,
-    decoder: Option<AacDecoder>,
+    decoder: Option<Box<dyn AacBackend>>,
     #[cfg(feature = "resample")]
     resampler: Option<crate::codec::resample::StreamResampler>,
     src_channels: u8,
@@ -276,7 +276,7 @@ impl Stream {
     ) -> (Self, AudioFormat) {
         let src_sr = ssrc.sample_rate();
         let src_ch = ssrc.channels();
-        let decoder = match AacDecoder::new(src_sr, src_ch) {
+        let decoder = match crate::codec::aac::new_decoder(src_sr, src_ch) {
             Ok(d) => Some(d),
             Err(e) => {
                 warn!("Failed to create AAC decoder for {:?}: {e}", ssrc);
@@ -294,6 +294,17 @@ impl Stream {
         #[cfg(feature = "resample")]
         let resampler =
             crate::codec::resample::StreamResampler::new(src_sr, target_sr, target_ch as usize);
+        #[cfg(not(feature = "resample"))]
+        let target_sr = {
+            if target_sr != src_sr {
+                warn!(
+                    from = src_sr,
+                    to = target_sr,
+                    "Resampling needs the resample feature; playing at the stream's rate"
+                );
+            }
+            src_sr
+        };
         let format = AudioFormat {
             codec: AudioCodec::Pcm,
             bits: output_config.format.bits(),
@@ -312,15 +323,7 @@ impl Stream {
     }
 
     fn decode(&mut self, aac: &[u8]) -> Option<crate::codec::Pcm> {
-        let bytes = self.decoder.as_mut()?.decode(aac)?;
-        let pcm = crate::codec::Pcm::F32(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect(),
-        );
+        let pcm = self.decoder.as_mut()?.decode(aac)?;
         Some(crate::codec::shape(
             pcm,
             self.src_channels,

@@ -12,7 +12,7 @@ use crate::raop::handlers_ap1::{self as handlers, RaopConnection};
 const DIGEST_REALM: &str = "airplay";
 /// Server identity advertised on every routed RTSP response.
 const RTSP_SERVER_HEADER_VALUE: &str = "AirTunes/105.1";
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 use crate::raop::handlers_ap2;
 #[cfg(feature = "hls")]
 use crate::raop::handlers_hls;
@@ -52,7 +52,7 @@ fn pipewire_auth_setup_route(
     if !conn.shared.pipewire_auth_setup_compat {
         return None;
     }
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     if conn.is_ap2 {
         return None;
     }
@@ -77,31 +77,31 @@ pub(super) fn request_body_policy(
 /// Feature-gated routes are included/excluded at compile time.
 const ROUTES: &[Route] = &[
     // --- Authentication & DRM ---
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/pair-setup",
         handler: handlers_ap2::handle_pair_setup,
     },
-    #[cfg(not(feature = "ap2"))]
+    #[cfg(not(feature = "ap2-core"))]
     Route {
         method: "POST",
         path: "/pair-setup",
         handler: handlers::handle_pair_setup,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/pair-verify",
         handler: handlers_ap2::handle_pair_verify,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/pair-pin-start",
         handler: handlers_ap2::handle_pair_pin_start,
     },
-    #[cfg(not(feature = "ap2"))]
+    #[cfg(not(feature = "ap2-core"))]
     Route {
         method: "POST",
         path: "/pair-verify",
@@ -113,19 +113,19 @@ const ROUTES: &[Route] = &[
         handler: handlers::handle_fp_setup,
     },
     // --- AP2 POST endpoints ---
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/feedback",
         handler: handlers_ap2::handle_feedback,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/command",
         handler: handlers_ap2::handle_command,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
         path: "/audioMode",
@@ -153,32 +153,32 @@ const ROUTES: &[Route] = &[
         handler: handlers::handle_set_parameter,
     },
     // --- AP2 RTSP methods ---
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "SETRATEANCHORTIME",
         path: "*",
         handler: handlers_ap2::handle_set_rate_anchor_time,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "SETPEERS",
         path: "*",
         handler: handlers_ap2::handle_set_peers,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "SETPEERSX",
         path: "*",
         handler: handlers_ap2::handle_set_peers,
     },
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "FLUSHBUFFERED",
         path: "*",
         handler: handlers_ap2::handle_flush_buffered,
     },
     // --- Info ---
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     Route {
         method: "GET",
         path: "/info",
@@ -325,7 +325,7 @@ fn resolve_handler(
 
 /// SETUP routing: AP1 (Transport header) vs AP2 (binary plist body).
 fn resolve_setup(conn: &RaopConnection, request: &HttpRequest) -> Option<Handler> {
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     {
         let is_plist = request
             .data()
@@ -341,7 +341,7 @@ fn resolve_setup(conn: &RaopConnection, request: &HttpRequest) -> Option<Handler
 
 /// RECORD routing: AP2 has its own handler.
 fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     if conn.is_ap2 {
         return Some(handlers_ap2::handle_record);
     }
@@ -368,16 +368,16 @@ fn handle_teardown(
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     let streams_only = _request
         .data()
         .and_then(|d| plist::from_bytes::<plist::Value>(d).ok())
         .is_some_and(|v| v.as_dictionary().is_some_and(|d| d.contains_key("streams")));
-    #[cfg(not(feature = "ap2"))]
+    #[cfg(not(feature = "ap2-core"))]
     let streams_only = false;
     tracing::info!(streams_only, "TEARDOWN");
     if streams_only {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if let Some(stop) = conn
             .shared
             .active_audio
@@ -394,7 +394,7 @@ fn handle_teardown(
     if let Some(mut rtp) = conn.raop_rtp.take() {
         rtp.stop();
     }
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     if let Some(cmd) = &conn.playout_cmd {
         let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
     }
