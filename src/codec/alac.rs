@@ -673,8 +673,18 @@ impl AlacDecoder {
             output_size,
             self.bytes_per_sample as usize,
         );
-        if *output_samples == 0 {
+        if *output_samples == 0 || *output_samples > self.max_samples_per_frame as usize {
+            // a frame header may carry its own sample count: one larger than the stream's frame length would run
+            // past the decode buffers (sized from the SETUP's fmtp), so the frame is dropped
+            if *output_samples != 0 {
+                tracing::warn!(
+                    samples = *output_samples,
+                    max = self.max_samples_per_frame,
+                    "ALAC frame larger than the stream's frame length: dropped"
+                );
+            }
             *output_size = 0;
+            *output_samples = 0;
             return;
         }
 
@@ -750,8 +760,18 @@ impl AlacDecoder {
             output_size,
             self.bytes_per_sample as usize,
         );
-        if *output_samples == 0 {
+        if *output_samples == 0 || *output_samples > self.max_samples_per_frame as usize {
+            // a frame header may carry its own sample count: one larger than the stream's frame length would run
+            // past the decode buffers (sized from the SETUP's fmtp), so the frame is dropped
+            if *output_samples != 0 {
+                tracing::warn!(
+                    samples = *output_samples,
+                    max = self.max_samples_per_frame,
+                    "ALAC frame larger than the stream's frame length: dropped"
+                );
+            }
             *output_size = 0;
+            *output_samples = 0;
             return;
         }
 
