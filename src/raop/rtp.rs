@@ -102,6 +102,8 @@ pub(crate) struct RtpConfig {
     pub(crate) encryption: Option<RtpEncryption>,
     /// If set, resample decoded audio to this rate.
     pub(crate) output_sample_rate: Option<u32>,
+    /// Sample format of the PCM handed to the session.
+    pub(crate) output_format: crate::raop::SampleFormat,
     /// Full socket address of the remote peer (preserves scope_id for link-local IPv6).
     pub(crate) remote_socket: std::net::SocketAddr,
 }
@@ -128,6 +130,8 @@ pub(crate) struct RaopRtp {
     local_addr: IpAddr,
     /// If set, resample decoded audio to this rate before delivery.
     output_sample_rate: Option<u32>,
+    /// Sample format of the PCM handed to the session.
+    output_format: crate::raop::SampleFormat,
     /// Decoded output stream format (channels + source sample rate).
     format: StreamFormat,
     /// Shared packet buffer (decrypt + decode on queue, dequeue in order).
@@ -165,6 +169,37 @@ fn make_resampler(
     }
 }
 
+/// Dequeue the next frame and deliver it in the session's format: s16 straight from the buffer
+/// slot, f32 converted, or through the resampler (f32) when one is configured. False when nothing
+/// was ready.
+fn deliver_next(
+    buf: &mut RaopBuffer,
+    session: &mut dyn crate::raop::AudioSession,
+    format: crate::raop::SampleFormat,
+    no_resend: bool,
+    #[cfg(feature = "resample")] resampler: &mut Option<crate::codec::resample::StreamResampler>,
+) -> bool {
+    #[cfg(feature = "resample")]
+    if let Some(rs) = resampler {
+        let Some(samples) = buf.dequeue(no_resend) else {
+            return false;
+        };
+        crate::codec::Pcm::F32(rs.process(samples)).deliver(session, format);
+        return true;
+    }
+    match format {
+        crate::raop::SampleFormat::S16 => match buf.dequeue_s16(no_resend) {
+            Some(samples) => session.audio_process_s16(samples),
+            None => return false,
+        },
+        crate::raop::SampleFormat::F32 => match buf.dequeue(no_resend) {
+            Some(samples) => session.audio_process(samples),
+            None => return false,
+        },
+    }
+    true
+}
+
 impl RaopRtp {
     /// Create a new RTP session from SDP parameters and AES session keys.
     /// Does not bind sockets or start receiving — call [`start`](Self::start) for that.
@@ -184,6 +219,7 @@ impl RaopRtp {
             remote: config.remote,
             local_addr: config.local_addr,
             output_sample_rate: config.output_sample_rate,
+            output_format: config.output_format,
             remote_socket: config.remote_socket,
             format,
             buffer: Arc::new(Mutex::new(buffer)),
@@ -234,9 +270,10 @@ impl RaopRtp {
             super::ntp::spawn_ntp_responder(tsock, timing_addr);
 
             let format = self.format;
+            let output_format = self.output_format;
             let mut session = self.handler.audio_init(AudioFormat {
                 codec: AudioCodec::Pcm,
-                bits: 32,
+                bits: output_format.bits(),
                 channels: format.num_channels,
                 // When resampling is enabled the audio delivered downstream is at
                 // the output rate, so announce that (matching the non-UDP path);
@@ -279,19 +316,14 @@ impl RaopRtp {
                                 && len >= 12 {
                                     let mut buf = buffer.lock().await;
                                     buf.queue(&data_packet[..len], true);
-                                    while let Some(samples) = buf.dequeue(no_resend) {
-                                        {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
-                                        }
-                                    }
+                                    while deliver_next(
+                                        &mut buf,
+                                        session.as_mut(),
+                                        output_format,
+                                        no_resend,
+                                        #[cfg(feature = "resample")]
+                                        &mut resampler,
+                                    ) {}
                                 }
                         }
                         // Control channel: retransmit responses (payload type 0x56).
@@ -314,9 +346,10 @@ impl RaopRtp {
             self.data_lport = listener.local_addr().map_err(NetworkError::Io)?.port();
 
             let format = self.format;
+            let output_format = self.output_format;
             let mut session = self.handler.audio_init(AudioFormat {
                 codec: AudioCodec::Pcm,
-                bits: 32,
+                bits: output_format.bits(),
                 channels: format.num_channels,
                 sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
             });
@@ -385,19 +418,14 @@ impl RaopRtp {
                                 if packet_buf.len() < 4 + rtp_len { break; }
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
-                                if let Some(samples) = buf.dequeue(true) {
-                                    {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
-                                        }
-                                }
+                                deliver_next(
+                                    &mut buf,
+                                    session.as_mut(),
+                                    output_format,
+                                    true,
+                                    #[cfg(feature = "resample")]
+                                    &mut resampler,
+                                );
                                 drop(buf);
                                 packet_buf.drain(..4 + rtp_len);
                             }

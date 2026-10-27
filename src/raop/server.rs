@@ -77,6 +77,7 @@ pub struct RaopServerBuilder {
     mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
+    output_format: crate::raop::SampleFormat,
     audio_buffer_size: u32,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
@@ -113,6 +114,7 @@ impl RaopServerBuilder {
             mode: AirPlayMode::default(),
             output_sample_rate: None,
             output_max_channels: None,
+            output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
             ap1_codecs: None,
             ap1_encryption: None,
@@ -212,6 +214,14 @@ impl RaopServerBuilder {
     /// Default: pass through native channel count.
     pub fn output_max_channels(mut self, channels: u8) -> Self {
         self.output_max_channels = Some(channels);
+        self
+    }
+
+    /// Set the sample format sessions receive: [`SampleFormat::F32`](crate::SampleFormat::F32) through
+    /// `audio_process` (default) or [`SampleFormat::S16`](crate::SampleFormat::S16) through
+    /// `audio_process_s16`, which keeps integer decoders' output integer end to end.
+    pub fn sample_format(mut self, format: crate::raop::SampleFormat) -> Self {
+        self.output_format = format;
         self
     }
 
@@ -352,6 +362,7 @@ impl RaopServerBuilder {
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
+            output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
             #[cfg(feature = "ap2")]
             srp_spare: {

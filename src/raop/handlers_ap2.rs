@@ -685,6 +685,7 @@ fn setup_stream_realtime(
             bit_depth: alac_format.bit_depth,
             sample_rate: conn.shared.output_sample_rate,
             max_channels: conn.shared.output_max_channels,
+            format: conn.shared.output_format,
         };
 
         let handle = tokio::spawn(crate::raop::realtime_audio::run(
@@ -722,6 +723,7 @@ fn setup_stream_realtime(
                         iv: aes_iv,
                     }),
                     output_sample_rate: conn.shared.output_sample_rate,
+                    output_format: conn.shared.output_format,
                     remote_socket: conn.remote_socket,
                 },
             );
@@ -790,6 +792,7 @@ fn setup_stream_buffered(
     let output_config = crate::raop::buffered_audio::OutputConfig {
         sample_rate: conn.shared.output_sample_rate,
         max_channels: conn.shared.output_max_channels,
+        format: conn.shared.output_format,
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };

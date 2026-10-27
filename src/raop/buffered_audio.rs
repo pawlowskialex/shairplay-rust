@@ -28,6 +28,8 @@ pub(crate) struct OutputConfig {
     pub(crate) sample_rate: Option<u32>,
     /// Maximum output channels, or None to pass through.
     pub(crate) max_channels: Option<u8>,
+    /// Sample format of the PCM handed to the session.
+    pub(crate) format: crate::raop::SampleFormat,
 }
 
 #[derive(Debug)]
@@ -319,7 +321,7 @@ async fn receive_loop(
 fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: Arc<dyn AudioHandler>,
-    _output_config: OutputConfig,
+    output_config: OutputConfig,
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
@@ -339,7 +341,7 @@ fn delivery_loop(
             s.format_changed = false;
             let format = AudioFormat {
                 codec: AudioCodec::Pcm,
-                bits: 32,
+                bits: output_config.format.bits(),
                 channels: s.channels,
                 sample_rate: s.sample_rate,
             };
@@ -364,13 +366,14 @@ fn delivery_loop(
         }
         drop(s);
 
+        let idle = ready.is_empty();
         if let Some(ref mut sess) = session {
-            for (_, frame) in &ready {
-                sess.audio_process(frame);
+            for (_, frame) in ready {
+                crate::codec::Pcm::F32(frame).deliver(sess.as_mut(), output_config.format);
             }
         }
 
-        if ready.is_empty() {
+        if idle {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
