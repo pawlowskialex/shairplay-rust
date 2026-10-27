@@ -57,6 +57,8 @@ pub enum PlayoutCommand {
         anchor_rtp: u32,
         /// Network time at the anchor point (ns).
         anchor_time_ns: u64,
+        /// The PTP clock that network time is on (`networkTimeTimelineID`; 0: the master heard last).
+        timeline: u64,
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
@@ -75,6 +77,11 @@ struct PlayoutState {
     buffer: BTreeMap<u32, (AudioSsrc, Vec<u8>)>, // rtp_timestamp → decrypted (compressed) AAC frame
     anchor_rtp: u32,
     anchor_local_ns: u64,
+    /// On the network timeline: the followed clock, the anchor's network time and RTP time (the sender's); frames
+    /// then go out [`TIMED_LEAD_NS`] ahead with the local time they should play (`audio_process_timed_s16`), once
+    /// the clock is followed (`timed_anchored`: the delivery schedule moved onto the timeline).
+    timed: Option<(u64, u64, u32)>,
+    timed_anchored: bool,
     rate: u32,
     /// The RTP clock: the stream's sample rate (timestamps count source frames).
     sample_rate: u32,
@@ -105,6 +112,8 @@ impl BufferedAudioProcessor {
                 buffer: BTreeMap::new(),
                 anchor_rtp: 0,
                 anchor_local_ns: 0,
+                timed: None,
+                timed_anchored: false,
                 rate: 0,
                 sample_rate: 44100,
                 stopped: false,
@@ -132,15 +141,50 @@ impl BufferedAudioProcessor {
                 match cmd {
                     PlayoutCommand::SetRate {
                         anchor_rtp,
-                        anchor_time_ns: _,
+                        anchor_time_ns,
+                        timeline,
                         rate,
                     } => {
                         s.anchor_rtp = anchor_rtp;
                         s.epoch += 1;
                         let was_paused = s.rate == 0;
                         s.rate = rate;
+                        let ptp = crate::net::ptp::follower();
+                        let clock = if timeline != 0 {
+                            Some(timeline)
+                        } else {
+                            ptp.latest()
+                        };
+                        let anchor_local = clock.filter(|_| anchor_time_ns != 0).and_then(|c| {
+                            ptp.to_local(c, anchor_time_ns + buffered_latency_ns())
+                                .map(|t| (c, t))
+                        });
+                        // on the network timeline if the sender gave one: play times once the clock is followed
+                        s.timed = clock
+                            .filter(|_| anchor_time_ns != 0 && rate != 0)
+                            .map(|c| (c, anchor_time_ns, anchor_rtp));
+                        s.timed_anchored = anchor_local.is_some();
                         if rate == 0 {
                             info!("Playout paused");
+                        } else if let Some((clock, local)) = anchor_local {
+                            // On the network timeline: frames due TIMED_LEAD_NS before they should play
+                            s.anchor_local_ns = local.saturating_sub(TIMED_LEAD_NS);
+                            let anchor = s.anchor_rtp;
+                            let stale: Vec<u32> = s
+                                .buffer
+                                .keys()
+                                .filter(|&&ts| (anchor.wrapping_sub(ts) as i32) > 0)
+                                .copied()
+                                .collect();
+                            for k in stale {
+                                s.buffer.remove(&k);
+                            }
+                            info!(
+                                clock = format!("{clock:016x}"),
+                                in_ms = (local as i64 - now_ns() as i64) / 1_000_000,
+                                anchor_rtp,
+                                "Playout on the network timeline"
+                            );
                         } else {
                             // Set anchor so the earliest buffered frame is deliverable
                             // with a small lead time for smooth playback
@@ -162,7 +206,11 @@ impl BufferedAudioProcessor {
                                 s.buffer.remove(&k);
                             }
                             if was_paused {
-                                info!(anchor_rtp, "Playout started");
+                                info!(
+                                    anchor_rtp,
+                                    clock_pending = s.timed.is_some(),
+                                    "Playout started"
+                                );
                             }
                         }
                         cvar.notify_all();
@@ -408,6 +456,23 @@ enum Decoding {
     Done(Option<crate::codec::Pcm>),
 }
 
+/// On the network timeline, frames go to the session this long before they should play (the session schedules
+/// them: queue, device buffer).
+const TIMED_LEAD_NS: u64 = 500_000_000;
+
+/// A buffered stream's frame plays this long after the network time its anchor gives it: the anchor arrives
+/// stamped "now", and Apple's own receivers play behind it. Measured against macOS Music's "This Computer" in a
+/// group with this receiver: 699.5 ms. SHAIRPLAY_BUFFERED_LATENCY_MS overrides.
+fn buffered_latency_ns() -> u64 {
+    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("SHAIRPLAY_BUFFERED_LATENCY_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(699_500_000, |ms| (ms * 1e6) as u64)
+    })
+}
+
 /// How far ahead of its time a frame goes to an asynchronous decoder, and how many at most.
 const LOOKAHEAD_NS: u64 = 80_000_000;
 const AHEAD_MAX: usize = 6;
@@ -426,20 +491,51 @@ fn delivery_loop(
     let (mut decoded, mut decode_ns) = (0u64, 0u64);
     let mut ahead: VecDeque<Ahead> = VecDeque::new();
     let (mut next_tag, mut epoch, mut asynchronous) = (0u32, 0u64, true);
+    let mut paused = false;
 
     loop {
         let mut s = lock.lock().unwrap();
 
+        // Paused: what the session still holds stops too (it holds up to TIMED_LEAD_NS ahead, or its prebuffer)
+        if s.rate == 0 && !paused && session.is_some() {
+            paused = true;
+            drop(s);
+            if let Some(sess) = session.as_mut() {
+                sess.audio_flush();
+            }
+            continue;
+        }
         while !s.stopped && (s.rate == 0 || (s.buffer.is_empty() && ahead.is_empty())) {
             s = cvar.wait(s).unwrap();
         }
+        paused = s.rate == 0;
         if s.stopped {
             break;
+        }
+        // the clock followed after playout started: move the delivery schedule onto the network timeline
+        if let Some((clock, net, rtp)) = s.timed
+            && !s.timed_anchored
+            && let Some(local) =
+                crate::net::ptp::follower().to_local(clock, net + buffered_latency_ns())
+        {
+            s.anchor_rtp = rtp;
+            s.anchor_local_ns = local.saturating_sub(TIMED_LEAD_NS);
+            s.timed_anchored = true;
+            info!(
+                clock = format!("{clock:016x}"),
+                "Playout moved onto the network timeline"
+            );
         }
         if s.epoch != epoch {
             // flushed or re-anchored: drop the same frames from what went ahead (late results are ignored)
             epoch = s.epoch;
             let flushed = std::mem::take(&mut s.flushed);
+            if !flushed.is_empty()
+                && let Some(sess) = session.as_mut()
+            {
+                // a flush (seek, skip): the session's queue goes too
+                sess.audio_flush();
+            }
             let anchor = s.anchor_rtp;
             let rate = s.rate;
             ahead.retain(|e| {
@@ -489,7 +585,7 @@ fn delivery_loop(
         // Due frames, oldest first: the map is ordered, so stop at the first one not due yet. Around the RTP
         // timestamp wrap (every ~27 h at 44.1 kHz) the oldest frames sort last: then scan everything. Only
         // when nothing decoded ahead is older.
-        let mut ready: Vec<(AudioSsrc, Vec<u8>)> = Vec::new();
+        let mut ready: Vec<(u32, AudioSsrc, Vec<u8>)> = Vec::new();
         if ahead.is_empty() && to_submit.is_empty() {
             let mut due: Vec<u32> = s
                 .buffer
@@ -500,10 +596,23 @@ fn delivery_loop(
             if due.is_empty() && s.buffer.keys().next_back().is_some_and(|&ts| is_due(ts)) {
                 due = s.buffer.keys().copied().filter(|&ts| is_due(ts)).collect();
             }
-            ready = due.iter().filter_map(|ts| s.buffer.remove(ts)).collect();
+            ready = due
+                .iter()
+                .filter_map(|&ts| s.buffer.remove(&ts).map(|(ssrc, aac)| (ts, ssrc, aac)))
+                .collect();
         }
         let next_ts = s.buffer.keys().next().copied();
         let sample_rate = i64::from(s.sample_rate.max(1));
+        // where each frame belongs on the network timeline, in local time (None: untimed)
+        let (timed, sr_now) = (s.timed.filter(|_| s.timed_anchored), s.sample_rate.max(1));
+        let play_at = move |ts: u32| -> Option<u64> {
+            let (clock, anchor_net, anchor_rtp) = timed?;
+            let frames = ts.wrapping_sub(anchor_rtp) as i32 as i64;
+            let net = anchor_net as i64
+                + buffered_latency_ns() as i64
+                + frames * 1_000_000_000 / sr_now as i64;
+            crate::net::ptp::follower().to_local(clock, net.max(0) as u64)
+        };
         drop(s);
 
         let mut progress = !to_submit.is_empty() || !ready.is_empty();
@@ -549,12 +658,12 @@ fn delivery_loop(
             let e = ahead.pop_front().unwrap();
             decoded += 1;
             if let (Decoding::Done(Some(pcm)), Some(sess)) = (e.pcm, session.as_mut()) {
-                pcm.deliver(sess.as_mut(), output_config.format);
+                pcm.deliver_timed(sess.as_mut(), output_config.format, play_at(e.ts));
             }
             progress = true;
         }
 
-        for (ssrc, aac) in ready {
+        for (ts, ssrc, aac) in ready {
             if stream.as_ref().is_none_or(|st| st.ssrc != ssrc) {
                 let (st, format) = Stream::new(ssrc, &output_config, &handler);
                 info!(?format, "Audio session initialized");
@@ -566,7 +675,7 @@ fn delivery_loop(
             decode_ns += now_ns().saturating_sub(t);
             decoded += 1;
             if let (Some(pcm), Some(sess)) = (pcm, session.as_mut()) {
-                pcm.deliver(sess.as_mut(), output_config.format);
+                pcm.deliver_timed(sess.as_mut(), output_config.format, play_at(ts));
             }
         }
 
@@ -675,6 +784,8 @@ mod decode_ahead_tests {
                 buffer,
                 anchor_rtp: 0u32.wrapping_sub(441),
                 anchor_local_ns: now_ns(),
+                timed: None,
+                timed_anchored: false,
                 rate: 1,
                 sample_rate: 44100,
                 stopped: false,

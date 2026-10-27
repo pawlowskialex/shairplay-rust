@@ -249,6 +249,14 @@ pub trait AudioSession: Send + Sync {
         let f: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
         self.audio_process(&f);
     }
+    /// 16-bit PCM like [`audio_process_s16`](Self::audio_process_s16), with the time its first frame should
+    /// leave the speaker: local wall-clock nanoseconds since the epoch (`SystemTime`), from the stream's network
+    /// timeline (AirPlay 2 buffered audio with a PTP clock followed). Sessions that can schedule their output play it
+    /// then (multi-room sync); the default ignores the time.
+    fn audio_process_timed_s16(&mut self, samples: &[i16], play_at_ns: u64) {
+        let _ = play_at_ns;
+        self.audio_process_s16(samples);
+    }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
 }
