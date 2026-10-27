@@ -360,14 +360,37 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     }
 }
 
-/// TEARDOWN: stop RTP, stop buffered audio, close connection.
+/// TEARDOWN: stop RTP, stop buffered audio, close connection. An AirPlay 2 TEARDOWN whose plist lists `streams`
+/// removes only those streams (iOS sends it when a realtime stream is paused, and SETs UP a new one on resume): the
+/// audio stops, the session and its connection stay (closing it made the sender drop the speaker).
 fn handle_teardown(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    response.add_header("Connection", "close");
-    response.set_disconnect(true);
+    #[cfg(feature = "ap2")]
+    let streams_only = _request
+        .data()
+        .and_then(|d| plist::from_bytes::<plist::Value>(d).ok())
+        .is_some_and(|v| v.as_dictionary().is_some_and(|d| d.contains_key("streams")));
+    #[cfg(not(feature = "ap2"))]
+    let streams_only = false;
+    tracing::info!(streams_only, "TEARDOWN");
+    if streams_only {
+        #[cfg(feature = "ap2")]
+        if let Some(stop) = conn
+            .shared
+            .active_audio
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            stop();
+        }
+    } else {
+        response.add_header("Connection", "close");
+        response.set_disconnect(true);
+    }
     if let Some(mut rtp) = conn.raop_rtp.take() {
         rtp.stop();
     }
