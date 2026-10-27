@@ -4,12 +4,12 @@ pub(crate) mod alac;
 #[cfg(feature = "resample")]
 pub(crate) mod resample;
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) mod aac;
 
 use crate::raop::{AudioSession, SampleFormat};
 
-#[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+#[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
 /// Decoded interleaved PCM in whichever format the decoder produced. The pipelines carry it as is
 /// and convert once, at delivery, to the session's [`SampleFormat`] (or to f32 where mixdown or
 /// resampling needs it), so an integer decoder feeding an S16 session never touches floating point.
@@ -19,7 +19,7 @@ pub(crate) enum Pcm {
     S16(Vec<i16>),
 }
 
-#[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+#[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
 impl Pcm {
     pub(crate) fn into_f32(self) -> Vec<f32> {
         match self {
@@ -61,7 +61,7 @@ impl Pcm {
     }
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 /// Mixdown and resampling for the AP2 pipelines, applied only when the output needs them; otherwise
 /// the samples pass through untouched (and stay integer).
 pub(crate) fn shape(
@@ -88,16 +88,20 @@ pub(crate) fn shape(
     }
     #[cfg(not(feature = "resample"))]
     {
-        pcm
+        Pcm::F32(mixdown(
+            &pcm.into_f32(),
+            src_channels as usize,
+            out_channels as usize,
+        ))
     }
 }
 
-#[cfg(any(feature = "ap2", feature = "resample"))]
+#[cfg(any(feature = "ap2-core", feature = "resample"))]
 /// ITU-R BS.775 downmix coefficient (−3 dB) applied to centre and surround
 /// channels when folding 5.1/7.1 into stereo.
 const DOWNMIX_3DB: f32 = 0.707;
 
-#[cfg(any(feature = "ap2", feature = "resample"))]
+#[cfg(any(feature = "ap2-core", feature = "resample"))]
 /// Mix down multi-channel F32 audio to fewer channels.
 /// Uses ITU-R BS.775 downmix coefficients for 5.1 and 7.1.
 pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) -> Vec<f32> {

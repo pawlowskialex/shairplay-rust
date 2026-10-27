@@ -3,7 +3,7 @@
 
 use serial_test::serial;
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 use tokio::io::BufReader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -102,7 +102,7 @@ fn empty_handler() -> Arc<TestHandler> {
     })
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
     RaopServer::builder()
         .name(name)
@@ -110,7 +110,7 @@ fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
         .mode(shairplay::AirPlayMode::AirPlay1)
 }
 
-#[cfg(not(feature = "ap2"))]
+#[cfg(not(feature = "ap2-core"))]
 fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
     RaopServer::builder().name(name).port(0)
 }
@@ -214,7 +214,7 @@ fn ap1_advertisement_rejects_empty_and_duplicate_values() {
     );
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[test]
 fn ap2_rejects_ap1_advertisement_options_and_keeps_its_fixed_profile() {
     use shairplay::Ap1Codec;
@@ -590,7 +590,7 @@ async fn teardown_closes_connection() {
 
 // --- AirPlay 2 integration tests ---
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 mod ap2_tests {
     use super::*;
     use shairplay::crypto::tlv::{TlvType, TlvValues};
@@ -1272,7 +1272,7 @@ async fn mdns_scope_on_loopback_starts() {
 }
 
 /// A buffered-audio SETUP advertises the builder's compressed-audio window, 1 MiB unless set.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[tokio::test]
 #[serial]
 async fn buffered_setup_advertises_the_audio_buffer_size() {

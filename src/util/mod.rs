@@ -6,7 +6,7 @@ use std::fmt::Write;
 ///
 /// Saturates to 0 if the clock is before the epoch. Used by the AP2 audio
 /// playout scheduler and PTP timing code.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -102,12 +102,23 @@ pub(crate) async fn run(
             if target_sr != src_sr {
                 resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
             }
+            #[cfg(not(feature = "resample"))]
+            let target_sr = {
+                if target_sr != src_sr {
+                    warn!(
+                        from = src_sr,
+                        to = target_sr,
+                        "Resampling needs the resample feature; playing at the stream's rate"
+                    );
+                }
+                src_sr
+            };
 
             let format = AudioFormat {
                 codec: AudioCodec::Pcm,
                 bits: output_config.format.bits(),
                 channels: out_ch,
-                sample_rate: output_config.sample_rate.unwrap_or(src_sr),
+                sample_rate: target_sr,
             };
             info!(?format, "Realtime audio session initialized");
             session = Some(handler.audio_init(format));

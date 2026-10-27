@@ -299,7 +299,7 @@ impl HttpResponse {
     }
 
     /// Set a binary property list body, automatically adding the Content-Type header.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) fn set_plist_body(&mut self, plist_dict: &plist::Dictionary) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
         plist::to_writer_binary(&mut buf, plist_dict).ok()?;

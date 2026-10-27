@@ -34,7 +34,7 @@ fn random_hwaddr() -> Vec<u8> {
     hwaddr.to_vec()
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -73,9 +73,9 @@ pub struct RaopServerBuilder {
     mdns_scope: MdnsScope,
     #[cfg(feature = "diagnostic-headers")]
     header_diagnostics: HeaderDiagnostics,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pairing_store: Option<Arc<dyn PairingStore>>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
@@ -83,7 +83,7 @@ pub struct RaopServerBuilder {
     audio_buffer_size: u32,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pin: Option<String>,
     #[cfg(feature = "video")]
     video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
@@ -111,9 +111,9 @@ impl RaopServerBuilder {
             mdns_scope: MdnsScope::default(),
             #[cfg(feature = "diagnostic-headers")]
             header_diagnostics: HeaderDiagnostics::default(),
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pairing_store: None,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             mode: AirPlayMode::default(),
             output_sample_rate: None,
             output_max_channels: None,
@@ -121,7 +121,7 @@ impl RaopServerBuilder {
             audio_buffer_size: 0x10_0000,
             ap1_codecs: None,
             ap1_encryption: None,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pin: None,
             #[cfg(feature = "video")]
             video_handler: None,
@@ -208,7 +208,7 @@ impl RaopServerBuilder {
 
     /// Set a pairing store for persisting device keys across restarts.
     /// Without this, iPhones must re-pair on every server restart.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub fn pairing_store(mut self, store: Arc<dyn PairingStore>) -> Self {
         self.pairing_store = Some(store);
         self
@@ -218,7 +218,7 @@ impl RaopServerBuilder {
     ///
     /// Use [`AirPlayMode::AirPlay1`] to advertise as a classic receiver even
     /// when the `ap2` feature is compiled in.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub fn mode(mut self, mode: AirPlayMode) -> Self {
         self.mode = mode;
         self
@@ -287,7 +287,7 @@ impl RaopServerBuilder {
         self
     }
 
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     /// Require normal HomeKit pair-setup with this one-time PIN.
     ///
     /// Without a PIN, AP2 uses the shairport-sync-style transient pairing
@@ -324,7 +324,7 @@ impl RaopServerBuilder {
         {
             return Err(ServerError::InvalidPassword(password.len()).into());
         }
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if self.mode == AirPlayMode::AirPlay2
             && (self.ap1_codecs.is_some() || self.ap1_encryption.is_some())
         {
@@ -333,7 +333,7 @@ impl RaopServerBuilder {
             )
             .into());
         }
-        #[cfg(all(feature = "ap2", feature = "pipewire-auth-setup-compat"))]
+        #[cfg(all(feature = "ap2-core", feature = "pipewire-auth-setup-compat"))]
         if self.pipewire_auth_setup_compat && self.mode != AirPlayMode::AirPlay1 {
             return Err(ServerError::InvalidConfiguration(
                 "PipeWire auth-setup compatibility requires AirPlayMode::AirPlay1",
@@ -349,14 +349,14 @@ impl RaopServerBuilder {
             None => random_hwaddr(),
         };
 
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         let pairing_id = derive_pi_from_hwaddr(&hwaddr);
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         let device_id = crate::util::hwaddr_airplay(&hwaddr);
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         let airplay_name = self.name.clone();
 
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         let pairing_store: Arc<dyn PairingStore> = self
             .pairing_store
             .unwrap_or_else(|| Arc::new(MemoryPairingStore::default()));
@@ -365,7 +365,7 @@ impl RaopServerBuilder {
         // for persistence. (A store with no identity persistence — e.g. the default
         // in-memory one — yields a fresh identity each start; persist it via
         // `PairingStore::load_identity`/`save_identity` to avoid re-pairing.)
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         let identity_seed = pairing_store.load_identity().unwrap_or_else(|| {
             let seed = crate::crypto::pairing_homekit::generate_identity_seed();
             pairing_store.save_identity(seed);
@@ -380,21 +380,21 @@ impl RaopServerBuilder {
             #[cfg(feature = "pipewire-auth-setup-compat")]
             pipewire_auth_setup_compat: self.pipewire_auth_setup_compat,
             handler,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pairing_store,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             srp_spare: {
                 let spare = crate::crypto::pairing_homekit::SrpSpare::new(self.pin.clone());
                 spare.refill(std::time::Duration::ZERO);
                 spare
             },
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pin: self.pin,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,
@@ -402,13 +402,13 @@ impl RaopServerBuilder {
             video_ekey: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "video")]
             video_eiv: Arc::new(std::sync::RwLock::new(None)),
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pairing_id,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             device_id,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             airplay_name,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             active_audio: std::sync::Mutex::new(None),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
@@ -428,7 +428,7 @@ impl RaopServerBuilder {
             name: self.name,
             hwaddr,
             ap1_advertisement,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             mode: self.mode,
         })
     }
@@ -448,7 +448,7 @@ pub struct RaopServer {
     name: String,
     hwaddr: Vec<u8>,
     ap1_advertisement: Ap1Advertisement,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     mode: AirPlayMode,
 }
 
@@ -475,7 +475,7 @@ impl RaopServer {
 
         // AirPlay 2 PTP sink: accept the sender's clock on 319/320 so it doesn't
         // stall the buffered-audio start. No-op if the ports can't be bound.
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if self.mode == AirPlayMode::AirPlay2 {
             crate::net::ptp::spawn_ptp_sink().await;
         }
@@ -484,7 +484,7 @@ impl RaopServer {
             let info = self.service_info();
             let mut mdns = MdnsService::new(scope_plan.as_ref())?;
             mdns.register_raop(&info)?;
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             if self.mode == AirPlayMode::AirPlay2 {
                 mdns.register_airplay(&info)?;
             }
@@ -516,7 +516,7 @@ impl RaopServer {
 
     /// Get the mDNS service info for this server.
     pub fn service_info(&self) -> AirPlayServiceInfo {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         {
             if self.mode == AirPlayMode::AirPlay2 {
                 let (_, vk) =
@@ -561,7 +561,7 @@ mod primitive_tests {
         assert_ne!(a, b);
     }
 
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     #[test]
     fn pairing_id_known_answer() {
         use sha2::{Digest, Sha256};

@@ -3,6 +3,8 @@
 //! Raw AAC packets from the buffered audio stream need ADTS headers
 //! prepended before they can be decoded. Ported from ap2_buffered_audio_processor.c.
 
+use super::Pcm;
+
 /// SSRC values identifying the audio format (from shairport-sync player.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -136,11 +138,46 @@ pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
     out
 }
 
-/// Persistent AAC decoder using symphonia. Decodes ADTS-wrapped AAC to F32LE PCM.
+/// An AAC-LC decoder: raw frames (no ADTS) in, interleaved PCM out, in the decoder's native format.
+pub(crate) trait AacBackend {
+    fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm>;
+}
+
+/// The AAC decoder compiled in: symphonia's with `aac-symphonia`.
+pub(crate) fn new_decoder(sample_rate: u32, channels: u8) -> Result<Box<dyn AacBackend>, String> {
+    #[cfg(feature = "aac-symphonia")]
+    {
+        Ok(Box::new(AacDecoder::new(sample_rate, channels)?))
+    }
+    #[cfg(not(feature = "aac-symphonia"))]
+    {
+        let _ = (sample_rate, channels);
+        Err("no AAC decoder compiled in (enable aac-symphonia)".into())
+    }
+}
+
+/// symphonia's AAC decoder (floating point).
+#[cfg(feature = "aac-symphonia")]
 pub(crate) struct AacDecoder {
     decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
 }
 
+#[cfg(feature = "aac-symphonia")]
+impl AacBackend for AacDecoder {
+    fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm> {
+        let bytes = self.decode_bytes(raw_aac)?;
+        Some(Pcm::F32(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+        ))
+    }
+}
+
+#[cfg(feature = "aac-symphonia")]
 impl AacDecoder {
     /// Create a new decoder for the given format.
     pub(crate) fn new(sample_rate: u32, channels: u8) -> Result<Self, String> {
@@ -185,7 +222,7 @@ impl AacDecoder {
     }
 
     /// Decode a raw AAC frame (without ADTS header) to interleaved F32 PCM.
-    pub(crate) fn decode(&mut self, raw_aac: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn decode_bytes(&mut self, raw_aac: &[u8]) -> Option<Vec<u8>> {
         use symphonia::core::packet::PacketRef;
         use symphonia::core::units::{Duration, Timestamp};
 
