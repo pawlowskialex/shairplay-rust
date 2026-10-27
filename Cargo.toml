@@ -78,6 +78,10 @@ astro-dnssd = "0.3"
 mdns-sd = "0.21"
 gethostname = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# kernel receive timestamps for PTP Sync messages (feature ptp-timestamps)
+nix = { version = "0.29", features = ["socket", "uio", "time", "net"], optional = true }
+
 [features]
 default = []
 pipewire-auth-setup-compat = []
@@ -91,6 +95,8 @@ ap2-core = ["dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid"]
 aac-symphonia = ["dep:symphonia"]
 video = ["ap2"]
 hls = ["video"]
+# PTP Sync messages timestamped by the kernel on receipt (SO_TIMESTAMPNS, Linux) rather than when the task wakes
+ptp-timestamps = ["dep:nix"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
