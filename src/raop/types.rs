@@ -77,12 +77,35 @@ impl Ap1Encryption {
     }
 }
 
+/// Sample format of the decoded PCM handed to [`AudioSession`]
+/// ([`RaopServerBuilder::sample_format`](crate::RaopServerBuilder::sample_format)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SampleFormat {
+    /// 32-bit float, through [`AudioSession::audio_process`]. The default.
+    #[default]
+    F32,
+    /// Signed 16-bit, through [`AudioSession::audio_process_s16`]. On CPUs without an FPU this
+    /// keeps the whole path integer: ALAC and raw L16 produce 16-bit samples, and
+    /// float conversion happens only where mixdown or resampling needs it.
+    S16,
+}
+
+impl SampleFormat {
+    /// Bits per sample.
+    pub const fn bits(self) -> u8 {
+        match self {
+            SampleFormat::F32 => 32,
+            SampleFormat::S16 => 16,
+        }
+    }
+}
+
 /// Audio format descriptor passed to [`AudioHandler::audio_init`].
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFormat {
     /// Audio codec (always PCM for decoded output).
     pub codec: AudioCodec,
-    /// Bits per sample (always 32 — samples are delivered as `&[f32]`).
+    /// Bits per sample: 32 for [`SampleFormat::F32`] (`&[f32]`), 16 for [`SampleFormat::S16`] (`&[i16]`).
     pub bits: u8,
     /// Number of channels.
     pub channels: u8,
@@ -219,6 +242,13 @@ impl PairingStore for MemoryPairingStore {
 pub trait AudioSession: Send + Sync {
     /// Receive decoded f32 interleaved PCM audio samples.
     fn audio_process(&mut self, samples: &[f32]);
+    /// Receive decoded signed 16-bit interleaved PCM. Called instead of
+    /// [`audio_process`](Self::audio_process) when the server was built with [`SampleFormat::S16`]; the
+    /// default converts to f32 and calls `audio_process`.
+    fn audio_process_s16(&mut self, samples: &[i16]) {
+        let f: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+        self.audio_process(&f);
+    }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
 }

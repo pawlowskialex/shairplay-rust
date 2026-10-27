@@ -31,6 +31,8 @@ pub(crate) struct RaopShared {
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
+    /// Sample format of the PCM handed to the sessions.
+    pub(crate) output_format: crate::raop::SampleFormat,
     /// AP2 buffered audio: the buffer size advertised to the sender (how far ahead it may send).
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
     pub(crate) audio_buffer_size: u32,
