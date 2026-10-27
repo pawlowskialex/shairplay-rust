@@ -86,51 +86,7 @@ impl StreamResampler {
     }
 }
 
-/// ITU-R BS.775 downmix coefficient (−3 dB) applied to centre and surround
-/// channels when folding 5.1/7.1 into stereo.
-const DOWNMIX_3DB: f32 = 0.707;
-
-/// Mix down multi-channel F32 audio to fewer channels.
-/// Uses ITU-R BS.775 downmix coefficients for 5.1 and 7.1.
-pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) -> Vec<f32> {
-    if in_channels == out_channels {
-        return input.to_vec();
-    }
-    if out_channels != 2 {
-        return input.to_vec();
-    }
-
-    let frames = input.len() / in_channels;
-    let mut output = Vec::with_capacity(frames * 2);
-    let k: f32 = DOWNMIX_3DB;
-
-    for frame in input.chunks_exact(in_channels) {
-        let (l, r) = match in_channels {
-            6 => {
-                let fl = frame[0];
-                let fr = frame[1];
-                let fc = frame[2];
-                let rl = frame[4];
-                let rr = frame[5];
-                (fl + k * fc + k * rl, fr + k * fc + k * rr)
-            }
-            8 => {
-                let fl = frame[0];
-                let fr = frame[1];
-                let fc = frame[2];
-                let sl = frame[4];
-                let sr = frame[5];
-                let rl = frame[6];
-                let rr = frame[7];
-                (fl + k * fc + k * sl + k * rl, fr + k * fc + k * sr + k * rr)
-            }
-            _ => (frame[0], frame.get(1).copied().unwrap_or(frame[0])),
-        };
-        output.push(l.clamp(-1.0, 1.0));
-        output.push(r.clamp(-1.0, 1.0));
-    }
-    output
-}
+pub(crate) use super::mixdown;
 
 /// Mix `samples` down to `out_channels` (if `src_channels` is larger) and then
 /// resample through `resampler` (if present). This is the shared tail of the AP2
