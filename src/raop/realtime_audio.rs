@@ -32,6 +32,8 @@ pub(crate) struct OutputConfig {
     pub(crate) max_channels: Option<u8>,
     /// Sample format of the PCM handed to the session.
     pub(crate) format: crate::raop::SampleFormat,
+    /// Coprocessor decrypt + decode.
+    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -65,10 +67,68 @@ pub(crate) async fn run(
     let mut src_ch: u8 = 2;
     let mut out_ch: u8 = 2;
 
-    info!("Realtime ALAC receiver started");
+    let mut offload = output_config.offload.as_ref().and_then(|f| {
+        f(&crate::raop::offload::OffloadStream {
+            cipher: crate::raop::offload::OffloadCipher::ChaCha20Poly1305 { key: shk },
+            alac: Some(crate::raop::offload::OffloadAlac {
+                frame_length: output_config.samples_per_frame,
+                bit_depth: output_config.bit_depth,
+                pb: 40,
+                mb: 10,
+                kb: 14,
+                channels: output_config.channels,
+            }),
+        })
+    });
+
+    info!(
+        offload = offload.is_some(),
+        "Realtime ALAC receiver started"
+    );
+
+    // Finished offload packets, in order: decode a plaintext one here if need be, then shape and deliver.
+    macro_rules! drain_offload {
+        () => {
+            if let Some(off) = offload.as_mut() {
+                off.collect(&mut |_, out| {
+                    let pcm = match out {
+                        crate::raop::offload::OffloadOutput::Pcm(s) => {
+                            crate::codec::Pcm::S16(s.to_vec())
+                        }
+                        crate::raop::offload::OffloadOutput::Plain(p) => {
+                            match decoder.as_mut().and_then(|d| d.decode_frame_pcm(p)) {
+                                Some(pcm) => pcm,
+                                None => return,
+                            }
+                        }
+                        crate::raop::offload::OffloadOutput::Failed => return,
+                    };
+                    let pcm = crate::codec::shape(
+                        pcm,
+                        src_ch,
+                        out_ch,
+                        #[cfg(feature = "resample")]
+                        &mut resampler,
+                    );
+                    if let Some(ref mut sess) = session {
+                        pcm.deliver(sess.as_mut(), output_config.format);
+                    }
+                });
+            }
+        };
+    }
 
     loop {
-        let n = match socket.recv(&mut buf).await {
+        let offloading = offload.as_ref().is_some_and(|o| o.in_flight() > 0);
+        let received = tokio::select! {
+            r = socket.recv(&mut buf) => Some(r),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if offloading => None,
+        };
+        let Some(received) = received else {
+            drain_offload!();
+            continue;
+        };
+        let n = match received {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -124,6 +184,18 @@ pub(crate) async fn run(
             session = Some(handler.audio_init(format));
         }
 
+        if let Some(off) = offload.as_mut() {
+            if off.submit(0, packet) {
+                drain_offload!();
+                continue;
+            }
+            // Processed here instead: let the packets before it out first, so the order holds.
+            while offload.as_ref().is_some_and(|o| o.in_flight() > 0) {
+                drain_offload!();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
         // Decrypt the ChaCha20-Poly1305 RTP frame.
         let Some(alac_data) = decrypt_rtp_chacha(&cipher, packet) else {
             debug!("Realtime audio decrypt failed");
@@ -170,6 +242,7 @@ mod tests {
             sample_rate: None,
             max_channels: None,
             format: crate::raop::SampleFormat::F32,
+            offload: None,
         });
 
         assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);

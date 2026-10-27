@@ -106,6 +106,8 @@ pub(crate) struct RtpConfig {
     pub(crate) output_format: crate::raop::SampleFormat,
     /// Full socket address of the remote peer (preserves scope_id for link-local IPv6).
     pub(crate) remote_socket: std::net::SocketAddr,
+    /// Coprocessor decrypt + decode (UDP streams only).
+    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
 }
 
 /// Validated AES-CBC parameters for an encrypted RTP session.
@@ -150,6 +152,7 @@ pub(crate) struct RaopRtp {
     pub(crate) data_lport: u16,
     /// Full socket address of the remote peer.
     remote_socket: std::net::SocketAddr,
+    offload: Option<crate::raop::offload::OffloadFactory>,
 }
 
 /// Build a resampler for the AP1 RTP path: `Some` when an explicit output rate
@@ -221,6 +224,7 @@ impl RaopRtp {
             output_sample_rate: config.output_sample_rate,
             output_format: config.output_format,
             remote_socket: config.remote_socket,
+            offload: config.offload,
             format,
             buffer: Arc::new(Mutex::new(buffer)),
             state: Arc::new(Mutex::new(RtpState { flush: NO_FLUSH })),
@@ -289,6 +293,9 @@ impl RaopRtp {
             );
 
             let buffer = self.buffer.clone();
+            if let Ok(mut b) = buffer.try_lock() {
+                b.set_offload(self.offload.as_ref());
+            }
             let state = self.state.clone();
             // If control_rport is 0, the iPhone doesn't support retransmits.
             let no_resend = control_rport == 0;
@@ -309,7 +316,20 @@ impl RaopRtp {
                         }
                     }
 
+                    // Packets with the offload: look again shortly even if nothing arrives (the stream's end).
+                    let offloading = buffer.lock().await.in_flight() > 0;
                     tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if offloading => {
+                            let mut buf = buffer.lock().await;
+                            while deliver_next(
+                                &mut buf,
+                                session.as_mut(),
+                                output_format,
+                                no_resend,
+                                #[cfg(feature = "resample")]
+                                &mut resampler,
+                            ) {}
+                        }
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
                             if let Ok((len, _)) = result

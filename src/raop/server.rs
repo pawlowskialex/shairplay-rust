@@ -79,6 +79,7 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     output_format: crate::raop::SampleFormat,
     audio_buffer_size: u32,
+    packet_offload: Option<crate::raop::offload::OffloadFactory>,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2-core")]
@@ -116,6 +117,7 @@ impl RaopServerBuilder {
             output_max_channels: None,
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
+            packet_offload: None,
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2-core")]
@@ -230,6 +232,13 @@ impl RaopServerBuilder {
     /// receiver holds that much compressed audio; lower it on small-memory devices.
     pub fn audio_buffer_size(mut self, bytes: u32) -> Self {
         self.audio_buffer_size = bytes;
+        self
+    }
+
+    /// Decrypt and decode realtime audio packets (AirPlay 1, AirPlay 2 realtime) on a coprocessor: `factory`
+    /// is asked once per stream and may decline ([`PacketOffload`](crate::PacketOffload)).
+    pub fn packet_offload(mut self, factory: crate::raop::offload::OffloadFactory) -> Self {
+        self.packet_offload = Some(factory);
         self
     }
 
@@ -364,6 +373,7 @@ impl RaopServerBuilder {
             output_max_channels: self.output_max_channels,
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
+            packet_offload: self.packet_offload.clone(),
             #[cfg(feature = "ap2-core")]
             srp_spare: {
                 let spare = crate::crypto::pairing_homekit::SrpSpare::new(self.pin.clone());
