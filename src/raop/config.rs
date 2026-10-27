@@ -101,25 +101,25 @@ fn encode_txt_values<T: Copy>(values: &[T], encode: fn(T) -> &'static str) -> St
 }
 
 /// RTSP/mDNS protocol version for AirPlay 2.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_PROTOVERS: &str = "1.1";
 
 /// Software build/source version reported in GET /info and mDNS.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_SRCVERS: &str = "366.0";
 
 /// AP2 status flag: audio output is available.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_STATUS_AUDIO_ATTACHED: u32 = 1 << 2;
 
 /// AP2 status flag (bit 9): one-time HomeKit pairing (a PIN) is required. A PIN
 /// accessory advertises this whether paired or not — matches real Apple TVs.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_STATUS_ONE_TIME_PAIRING_REQUIRED: u32 = 1 << 9;
 
 /// AP2 status flag (bit 10): the accessory has completed HomeKit access-control
 /// setup (i.e. it is paired). Advertised alongside bit 9 once paired.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_STATUS_DEVICE_SETUP_FOR_HK_ACCESS_CONTROL: u32 = 1 << 10;
 
 /// Build AP2 statusFlags for the selected pairing mode.
@@ -134,7 +134,7 @@ pub(crate) const AP2_STATUS_DEVICE_SETUP_FOR_HK_ACCESS_CONTROL: u32 = 1 << 10;
 /// transient pair-setup we must reject (stalling the connection). And bit 10
 /// *without* bit 9 (`0x404`) makes the sender attempt transient on every
 /// connection. Bit 9 says "I'm a PIN device"; bit 10 says "already set up".
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) fn ap2_status_flags(requires_pin_pairing: bool, already_paired: bool) -> u32 {
     let mut flags = AP2_STATUS_AUDIO_ATTACHED;
     if requires_pin_pairing {
@@ -146,7 +146,7 @@ pub(crate) fn ap2_status_flags(requires_pin_pairing: bool, already_paired: bool)
     flags
 }
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(all(test, feature = "ap2-core"))]
 mod status_flag_tests {
     use super::*;
 

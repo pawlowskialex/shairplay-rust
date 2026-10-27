@@ -4,7 +4,7 @@ use shairplay::{RaopServer, RaopServerBuilder};
 #[path = "enabled/playback.rs"]
 mod playback;
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[path = "enabled/ap2.rs"]
 mod ap2;
 
@@ -70,7 +70,7 @@ fn opt_in_does_not_change_ap1_discovery() {
     assert_eq!(raop_txt(&enabled.service_info(), "et"), "0");
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[test]
 fn enabling_in_ap2_mode_is_rejected_without_changing_defaults() {
     let result = RaopServer::builder()

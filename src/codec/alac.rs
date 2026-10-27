@@ -32,7 +32,7 @@ pub(crate) struct AlacConfig {
 /// ALAC format selected in an AirPlay 2 `audioFormat` SETUP field.
 // Consumed by the AP2 RTSP SETUP handler (and the unit tests). Dead in the
 // default `--lib` build where neither is compiled.
-#[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+#[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AlacFormat {
     pub(crate) sample_rate: u32,
@@ -45,7 +45,7 @@ impl AlacFormat {
     ///
     /// These are format-capability bit values, not RTP SSRC values. For example,
     /// `0x00040000` is ALAC/44100/16/2.
-    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) fn from_audio_format(v: u32) -> Option<Self> {
         match v {
             0x0004_0000 => Some(Self {
@@ -580,7 +580,7 @@ impl AlacDecoder {
 
     /// Decode an ALAC frame into interleaved PCM: 16-bit streams as [`Pcm::S16`] (no float on the
     /// way), 24-bit ones as [`Pcm::F32`] (full precision).
-    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) fn decode_frame_pcm(&mut self, input: &[u8]) -> Option<Pcm> {
         if self.max_samples_per_frame == 0 || self.bytes_per_sample <= 0 {
             return None;

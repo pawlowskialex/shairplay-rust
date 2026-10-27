@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// advertises itself as an AirPlay 1 (classic) or AirPlay 2 receiver.
 /// Both modes share the same RTSP listener — the difference is in mDNS
 /// advertisement and feature negotiation.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AirPlayMode {
     /// Classic AirPlay 1: ALAC/AAC over RTP, RSA encryption, NTP timing.
@@ -164,7 +164,7 @@ pub trait AudioHandler: Send + Sync + 'static {
 ///
 /// Without persistence, iPhones that previously paired will send encrypted data
 /// on connect and fail because the server has no cached keys.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub trait PairingStore: Send + Sync + 'static {
     /// Look up a paired device's Ed25519 public key by device ID.
     fn get(&self, device_id: &str) -> Option<[u8; 32]>;
@@ -208,13 +208,13 @@ pub trait PairingStore: Send + Sync + 'static {
 }
 
 /// In-memory pairing store (lost on restart). Use for testing or wrap with file I/O.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 #[derive(Default)]
 pub struct MemoryPairingStore {
     keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 impl PairingStore for MemoryPairingStore {
     fn get(&self, device_id: &str) -> Option<[u8; 32]> {
         self.keys.lock().ok()?.get(device_id).copied()

@@ -9,7 +9,7 @@ use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::proto::sdp::Sdp;
 use crate::raop::rtp::{RaopRtp, RtpEncryption};
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 
 /// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
@@ -28,21 +28,21 @@ pub(crate) struct RaopConnection {
     /// Replaces the ~17 fields that were previously deep-copied into every connection.
     pub(crate) shared: Arc<crate::raop::connection::RaopShared>,
     // AirPlay 2 state
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) srp_server: Option<SrpServer>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) pair_verify: Option<PairVerifyServer>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) ap2_shared_secret: Option<Vec<u8>>,
     /// X25519 shared secret from pair-verify (32 bytes). Used for video key derivation.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) pair_verify_secret: Option<[u8; 32]>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) is_ap2: bool,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) playout_cmd:
         Option<tokio::sync::mpsc::UnboundedSender<crate::raop::buffered_audio::PlayoutCommand>>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) event_sender: Option<crate::raop::event_channel::EventSender>,
     #[cfg(feature = "video")]
     pub(crate) ekey: Option<[u8; 16]>,
@@ -70,7 +70,7 @@ pub(crate) fn ip_from_bytes(bytes: &[u8]) -> std::net::IpAddr {
 /// Returns a bind address for sub-listeners (buffered audio, event channel, etc.).
 /// Uses the specific local IP for routable addresses (respects BindConfig).
 /// Falls back to unspecified for link-local IPv6.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) fn bind_addr_for(conn: &RaopConnection) -> std::net::SocketAddr {
     let ip = local_ip_from(conn);
     let bind_ip = match ip {
@@ -182,12 +182,12 @@ pub(crate) fn handle_options(
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     response.add_header(
         "Public",
         "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, PUT",
     );
-    #[cfg(not(feature = "ap2"))]
+    #[cfg(not(feature = "ap2-core"))]
     response.add_header(
         "Public",
         "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER",
@@ -479,7 +479,7 @@ pub(crate) fn handle_set_parameter(
 // Verifies that handler-facing error notification (`AudioHandler::on_error`) is
 // actually wired to a representative failure path. Gated to AP1-only builds so the
 // `RaopShared`/`RaopConnection` literals below need only the base (non-AP2) fields.
-#[cfg(all(test, not(feature = "ap2")))]
+#[cfg(all(test, not(feature = "ap2-core")))]
 mod tests {
     use super::*;
     use crate::crypto::pairing::Pairing;

@@ -79,7 +79,7 @@ pub use net::server::BindConfig;
 pub use raop::hls::{HlsHandler, HlsSession};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub use raop::{AirPlayMode, MemoryPairingStore, PairingStore};
 pub use raop::{
     Ap1Codec, Ap1Encryption, AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer,

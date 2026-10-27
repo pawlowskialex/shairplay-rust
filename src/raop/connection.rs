@@ -22,24 +22,24 @@ pub(crate) struct RaopShared {
     #[cfg(feature = "pipewire-auth-setup-compat")]
     pub(crate) pipewire_auth_setup_compat: bool,
     pub(crate) handler: Arc<dyn AudioHandler>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) pairing_store: Arc<dyn PairingStore>,
     /// Accessory's long-term Ed25519 identity seed (random, persisted via the store).
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) identity_seed: [u8; 32],
     pub(crate) output_sample_rate: Option<u32>,
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
-    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
     /// Sample format of the PCM handed to the sessions.
     pub(crate) output_format: crate::raop::SampleFormat,
     /// AP2 buffered audio: the buffer size advertised to the sender (how far ahead it may send).
-    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) audio_buffer_size: u32,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) pin: Option<String>,
     /// The next pair-setup's SRP state, made ahead of time.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) srp_spare: std::sync::Arc<crate::crypto::pairing_homekit::SrpSpare>,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
@@ -48,24 +48,24 @@ pub(crate) struct RaopShared {
     pub(crate) video_ekey: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
     #[cfg(feature = "video")]
     pub(crate) video_eiv: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) pairing_id: String,
     /// Accessory device id (`hwaddr_airplay(hwaddr)`), computed once at build.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) device_id: String,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) airplay_name: String,
     /// Stop-handle for the currently-active audio session. iOS opens parallel
     /// connections (Happy Eyeballs) and switches between them; registering each
     /// new session here — and stopping the previous — keeps only the newest
     /// playout feeding the output (avoids overlapping / post-disconnect audio).
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) active_audio: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "hls")]
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
 }
 
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 impl RaopShared {
     /// Register a newly-started audio session, stopping the previous one so only
     /// the latest connection's playout feeds the audio output.
@@ -102,19 +102,19 @@ fn new_raop_connection(
         remote_socket: remote,
         session: false,
         nonce: digest::generate_nonce(MAX_NONCE_LEN),
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         srp_server: None,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         pair_verify: None,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         ap2_shared_secret: None,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         pair_verify_secret: None,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         is_ap2: false,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         playout_cmd: None,
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         event_sender: None,
         #[cfg(feature = "video")]
         ekey: None,
@@ -138,9 +138,9 @@ impl HttpdCallbacks for RaopShared {
             conn: new_raop_connection(self, local, remote),
             remote_addr: remote_str,
             connected_at: std::time::Instant::now(),
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             cipher: None,
-            #[cfg(feature = "ap2")]
+            #[cfg(feature = "ap2-core")]
             pending_secret: None,
         }))
     }
@@ -152,9 +152,9 @@ struct RaopConnectionHandler {
     /// Connection-start instant, used to log per-request elapsed time for
     /// connect-latency diagnostics (AP2 PTP-sync wait vs AP1 fast path).
     connected_at: std::time::Instant,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     cipher: Option<crate::crypto::chacha_transport::EncryptedChannel>,
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pending_secret: Option<Vec<u8>>,
 }
 
@@ -168,7 +168,7 @@ impl Drop for RaopConnectionHandler {
             .handler
             .on_client_disconnected(&self.remote_addr);
         // a sender has left and its audio stopped: the CPU is free to make the next pair-setup's SRP state
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         self.conn
             .shared
             .srp_spare
@@ -200,7 +200,7 @@ impl ConnectionHandler for RaopConnectionHandler {
         let resp = rtsp::dispatch(&mut self.conn, request);
 
         // Queue encryption activation for AFTER this response is sent
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if self.cipher.is_none()
             && let Some(secret) = &self.conn.ap2_shared_secret
         {
@@ -211,18 +211,18 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn is_encrypted(&self) -> bool {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         {
             self.cipher.is_some()
         }
-        #[cfg(not(feature = "ap2"))]
+        #[cfg(not(feature = "ap2-core"))]
         {
             false
         }
     }
 
     fn after_response(&mut self) {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if self.cipher.is_none()
             && let Some(secret) = self.pending_secret.take()
         {
@@ -241,7 +241,7 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if let Some(ch) = &mut self.cipher {
             return ch.decrypt_ctx.decrypt(data).ok();
         }
@@ -249,7 +249,7 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
-        #[cfg(feature = "ap2")]
+        #[cfg(feature = "ap2-core")]
         if let Some(ch) = &mut self.cipher {
             // Once the channel is encrypted the peer expects ciphertext; never
             // fall back to emitting plaintext (which would leak the response and

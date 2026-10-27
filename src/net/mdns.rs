@@ -32,14 +32,14 @@ pub(crate) const RAOP_SM: &str = "false";
 /// Encryption key type.
 pub(crate) const RAOP_EK: &str = "1";
 /// AP2 codecs advertised in `_raop` TXT (0=PCM, 1=ALAC) — AP2 supports both.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const RAOP_AP2_CN: &str = "0,1";
 /// AP2 encryption types advertised in `_raop` TXT
 /// (0=none, 3=FairPlay, 5=FairPlay SAP 2.5; 4=MFi-SAP is not advertised).
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const RAOP_AP2_ET: &str = "0,3,5";
 /// AP2 `_raop` protocol version (65537 = 0x10001).
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const RAOP_AP2_VN: &str = "65537";
 
 /// Global feature bitmask for AP1 discovery.
@@ -52,16 +52,16 @@ pub(crate) const GLOBAL_VERSION: &str = "130.14";
 // --- AP2 mDNS TXT record constants ---
 
 /// Source version string.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_SRCVERS: &str = crate::raop::config::AP2_SRCVERS;
 /// OS version string.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_OSVERS: &str = "15.6";
 /// Firmware version string.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_FW_VERSION: &str = "77.40.00";
 /// Protocol version string.
-#[cfg(feature = "ap2")]
+#[cfg(feature = "ap2-core")]
 pub(crate) const AP2_PROTOVERS: &str = crate::raop::config::AP2_PROTOVERS;
 
 /// mDNS service information for AirPlay network discovery.
@@ -135,7 +135,7 @@ impl AirPlayServiceInfo {
 
     /// Create AP2 service info with full AirPlay 2 feature flags.
     /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID).
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     #[allow(clippy::too_many_arguments)]
     pub fn new_airplay2(
         name: &str,
@@ -249,7 +249,7 @@ impl MdnsService {
     }
 
     /// Register the _airplay._tcp mDNS service.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) fn register_airplay(
         &mut self,
         info: &AirPlayServiceInfo,
@@ -326,7 +326,7 @@ impl MdnsService {
     }
 
     /// Register the _airplay._tcp mDNS service.
-    #[cfg(feature = "ap2")]
+    #[cfg(feature = "ap2-core")]
     pub(crate) fn register_airplay(
         &mut self,
         info: &AirPlayServiceInfo,
@@ -373,7 +373,7 @@ impl Drop for MdnsService {
     }
 }
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(all(test, feature = "ap2-core"))]
 mod tests {
     use super::*;
 

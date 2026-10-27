@@ -84,7 +84,11 @@ pipewire-auth-setup-compat = []
 diagnostic-headers = []
 dangerous-raw-headers = ["diagnostic-headers"]
 resample = ["dep:rubato"]
-ap2 = ["resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:symphonia"]
+# AirPlay 2 with symphonia's AAC decoder and resampling, as before
+ap2 = ["ap2-core", "resample", "aac-symphonia"]
+# AirPlay 2 protocol support without pulling in an AAC decoder or the resampler
+ap2-core = ["dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid"]
+aac-symphonia = ["dep:symphonia"]
 video = ["ap2"]
 hls = ["video"]
 
