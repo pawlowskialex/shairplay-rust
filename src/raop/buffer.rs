@@ -1,4 +1,4 @@
-//! AP1 RTP packet buffer with AES-CBC decryption and codec decode to f32.
+//! AP1 RTP packet buffer with AES-CBC decryption and codec decode to signed 16-bit PCM.
 //!
 //! Incoming RTP packets are queued by sequence number into a fixed-size circular
 //! buffer. Each packet is decrypted (AES-128-CBC) and decoded on arrival — either
@@ -82,8 +82,8 @@ struct BufferEntry {
     timestamp: u32,
     /// RTP synchronization source identifier.
     ssrc: u32,
-    /// Decoded F32 audio samples. Pre-allocated to the per-entry capacity.
-    audio_buffer: Vec<f32>,
+    /// Decoded S16 audio samples (both codecs are 16-bit). Pre-allocated to the per-entry capacity.
+    audio_buffer: Vec<i16>,
     /// Actual number of valid samples in `audio_buffer`.
     audio_buffer_len: usize,
 }
@@ -210,6 +210,10 @@ pub struct RaopBuffer {
     /// Number of f32 samples to emit when substituting silence for a lost frame.
     /// Constant for ALAC (fixed frame size); tracks the last real frame for PCM.
     silence_samples: usize,
+    /// ALAC output bytes, reused for every packet.
+    decode_scratch: Vec<u8>,
+    /// What [`dequeue`](Self::dequeue) returns: the dequeued frame as f32.
+    f32_scratch: Vec<f32>,
 }
 
 impl RaopBuffer {
@@ -274,7 +278,7 @@ impl RaopBuffer {
                 seqnum: 0,
                 timestamp: 0,
                 ssrc: 0,
-                audio_buffer: vec![0.0f32; frame_capacity],
+                audio_buffer: vec![0i16; frame_capacity],
                 audio_buffer_len: 0,
             })
             .collect();
@@ -288,6 +292,8 @@ impl RaopBuffer {
             entries,
             frame_capacity,
             silence_samples,
+            decode_scratch: Vec::new(),
+            f32_scratch: Vec::new(),
         })
     }
 
@@ -364,14 +370,15 @@ impl RaopBuffer {
             Cow::Borrowed(payload)
         };
 
-        // Decode into the slot's f32 buffer.
+        // Decode into the slot's s16 buffer.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
             Codec::Alac { decoder, .. } => {
-                // ALAC decode → S16LE, then convert to f32 samples.
-                let mut s16_buf = vec![0u8; capacity * 2];
+                // ALAC decode → S16LE bytes → samples.
+                let s16_buf = &mut self.decode_scratch;
+                s16_buf.resize(capacity * 2, 0);
                 let output_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decoder.decode_frame(&packet_buf, &mut s16_buf)
+                    decoder.decode_frame(&packet_buf, s16_buf)
                 }))
                 .unwrap_or(0);
                 if output_size == 0 {
@@ -386,13 +393,13 @@ impl RaopBuffer {
                     .iter()
                     .zip(out.iter_mut())
                 {
-                    *out_sample = i16::from_le_bytes(*chunk) as f32 / 32768.0;
+                    *out_sample = i16::from_le_bytes(*chunk);
                     n += 1;
                 }
                 n
             }
             Codec::Pcm { config } => {
-                // Raw L16: big-endian (network order) interleaved S16 → f32.
+                // Raw L16: big-endian (network order) interleaved S16.
                 let frame_width = usize::from(config.num_channels) * size_of::<i16>();
                 if packet_buf.is_empty() || !packet_buf.len().is_multiple_of(frame_width) {
                     return -1;
@@ -401,7 +408,7 @@ impl RaopBuffer {
                 let mut n = 0;
                 for (chunk, out_sample) in packet_buf.as_chunks::<2>().0.iter().zip(out.iter_mut())
                 {
-                    *out_sample = i16::from_be_bytes(*chunk) as f32 / 32768.0;
+                    *out_sample = i16::from_be_bytes(*chunk);
                     n += 1;
                 }
                 if n == 0 {
@@ -435,13 +442,27 @@ impl RaopBuffer {
         1
     }
 
+    /// Dequeue the next frame in sequence order, as f32 (a conversion of
+    /// [`dequeue_s16`](Self::dequeue_s16)'s samples).
+    pub fn dequeue(&mut self, no_resend: bool) -> Option<&[f32]> {
+        let len = self.dequeue_s16(no_resend)?.len();
+        let idx = self.first_seqnum.wrapping_sub(1) as usize % RAOP_BUFFER_LENGTH;
+        self.f32_scratch.clear();
+        self.f32_scratch.extend(
+            self.entries[idx].audio_buffer[..len]
+                .iter()
+                .map(|&s| s as f32 / 32768.0),
+        );
+        Some(&self.f32_scratch)
+    }
+
     /// Dequeue the next frame in sequence order.
     ///
-    /// Returns the decoded f32 audio samples, or `None` if the buffer is empty.
+    /// Returns the decoded signed 16-bit samples, or `None` if the buffer is empty.
     /// If the next frame is missing and `no_resend` is false, returns `None`
     /// to allow time for a retransmit. If `no_resend` is true (or the buffer
     /// is full), substitutes silence for the missing frame.
-    pub fn dequeue(&mut self, no_resend: bool) -> Option<&[f32]> {
+    pub fn dequeue_s16(&mut self, no_resend: bool) -> Option<&[i16]> {
         let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
         if self.is_empty || buflen <= 0 {
             return None;
@@ -458,7 +479,7 @@ impl RaopBuffer {
         // Substitute silence for missing frames.
         if !self.entries[idx].available {
             let size = self.silence_samples.min(self.frame_capacity);
-            self.entries[idx].audio_buffer[..size].fill(0.0);
+            self.entries[idx].audio_buffer[..size].fill(0);
             self.entries[idx].audio_buffer_len = size;
         }
         self.entries[idx].available = false;
