@@ -158,6 +158,7 @@ pub(crate) async fn spawn_ptp_sink() {
         return;
     }
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let samples = Arc::new(SyncSamples::new(std::env::var("SHAIRPLAY_PTP_LOG").ok()));
     let mut bound = 0u8;
     for port in [319u16, 320u16] {
         let bind = match tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await
@@ -171,11 +172,24 @@ pub(crate) async fn spawn_ptp_sink() {
             Ok(sock) => {
                 bound += 1;
                 let seen = seen.clone();
+                let samples = samples.clone();
+                #[cfg(all(target_os = "linux", feature = "ptp-timestamps"))]
+                if let Err(e) = nix::sys::socket::setsockopt(
+                    &sock,
+                    nix::sys::socket::sockopt::ReceiveTimestampns,
+                    &true,
+                ) {
+                    tracing::warn!(port, "PTP: no kernel receive timestamps: {e}");
+                }
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     loop {
-                        match sock.recv_from(&mut buf).await {
-                            Ok((n, from)) => log_ptp_packet(port, from, &buf[..n], &seen),
+                        match recv_stamped(&sock, &mut buf).await {
+                            Ok((n, from, kernel_ns)) => {
+                                let user_ns = now_ns();
+                                log_ptp_packet(port, from, &buf[..n], &seen);
+                                samples.packet(&buf[..n], kernel_ns.unwrap_or(user_ns), user_ns);
+                            }
                             Err(e) => {
                                 tracing::warn!(port, "PTP sink recv error: {e}");
                                 break;
@@ -196,6 +210,162 @@ pub(crate) async fn spawn_ptp_sink() {
             ports = bound,
             "PTP sink active on 319/320 — accepting sender clock (keeps AP2 connect fast)"
         );
+    }
+}
+
+/// One datagram, with the kernel's receive time (SO_TIMESTAMPNS, wall clock ns) where the build has it.
+async fn recv_stamped(
+    sock: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr, Option<u64>)> {
+    #[cfg(all(target_os = "linux", feature = "ptp-timestamps"))]
+    {
+        use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+        use std::os::fd::AsRawFd;
+        loop {
+            sock.readable().await?;
+            let r = sock.try_io(tokio::io::Interest::READABLE, || {
+                let mut iov = [std::io::IoSliceMut::new(buf)];
+                // room for two: musl (time64) appends its own 64-bit copy after the kernel's record
+                let mut cmsg = Vec::with_capacity(128);
+                let m = recvmsg::<SockaddrStorage>(
+                    sock.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut cmsg),
+                    MsgFlags::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut stamp = None;
+                if let Ok(cmsgs) = m.cmsgs() {
+                    for c in cmsgs {
+                        if let ControlMessageOwned::ScmTimestampns(t) = c {
+                            stamp = Some(t.tv_sec() as u64 * 1_000_000_000 + t.tv_nsec() as u64);
+                        }
+                    }
+                }
+                let from = m
+                    .address
+                    .and_then(|a: SockaddrStorage| {
+                        a.as_sockaddr_in()
+                            .map(|v| std::net::SocketAddr::from(std::net::SocketAddrV4::from(*v)))
+                            .or_else(|| {
+                                a.as_sockaddr_in6().map(|v| {
+                                    std::net::SocketAddr::from(std::net::SocketAddrV6::from(*v))
+                                })
+                            })
+                    })
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                // a timestamp not within a second of now is a misread (time_t width): ignore it
+                let user = now_ns();
+                let stamp = stamp.filter(|&t| t.abs_diff(user) < 1_000_000_000);
+                Ok((m.bytes, from, stamp))
+            });
+            match r {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                r => return r,
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "ptp-timestamps")))]
+    {
+        let (n, from) = sock.recv_from(buf).await?;
+        Ok((n, from, None))
+    }
+}
+
+/// Clock samples: each Sync's receive time paired with its Follow_Up's preciseOriginTimestamp (the master's send
+/// time), by clock identity and sequence number, for the [`follower`]. With SHAIRPLAY_PTP_LOG set, also appended
+/// there as CSV (clock_id, seq, master_ns, local_ns: kernel receive time or our own, user_ns: when the task saw it).
+struct SyncSamples {
+    // (clock id, sequence) -> the Sync's (local, user) receive times or the Follow_Up's master time, whichever came
+    // first: the two arrive on different sockets, handled by different tasks
+    syncs: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64, u64)>>,
+    follow_ups: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64)>>,
+    log: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+impl SyncSamples {
+    fn new(path: Option<String>) -> Self {
+        let log = path.and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .map_err(|e| {
+                    tracing::warn!(path = p, "PTP sample log: {e}");
+                })
+                .ok()
+        });
+        if log.is_some() {
+            tracing::info!("PTP: logging Sync / Follow_Up samples");
+        }
+        SyncSamples {
+            syncs: std::sync::Mutex::default(),
+            follow_ups: std::sync::Mutex::default(),
+            log: log.map(std::sync::Mutex::new),
+        }
+    }
+
+    fn packet(&self, buf: &[u8], local_ns: u64, user_ns: u64) {
+        if buf.len() < 34 {
+            return;
+        }
+        let clock_id = u64::from_be_bytes(buf[20..28].try_into().unwrap());
+        let seq = u16::from_be_bytes([buf[30], buf[31]]);
+        let sample = match buf[0] & 0x0f {
+            0 => {
+                let fu = {
+                    let mut f = self.follow_ups.lock().unwrap();
+                    f.iter()
+                        .position(|e| e.0 == clock_id && e.1 == seq)
+                        .map(|i| f.remove(i).unwrap())
+                };
+                match fu {
+                    Some((_, _, master)) => Some((master, local_ns, user_ns)),
+                    None => {
+                        let mut p = self.syncs.lock().unwrap();
+                        p.push_back((clock_id, seq, local_ns, user_ns));
+                        while p.len() > 16 {
+                            p.pop_front();
+                        }
+                        None
+                    }
+                }
+            }
+            8 => {
+                let Some((id, master_ns, _)) = parse_follow_up(buf) else {
+                    return;
+                };
+                let sync = {
+                    let mut p = self.syncs.lock().unwrap();
+                    p.iter()
+                        .position(|e| e.0 == id && e.1 == seq)
+                        .map(|i| p.remove(i).unwrap())
+                };
+                match sync {
+                    Some((_, _, local, user)) => Some((master_ns, local, user)),
+                    None => {
+                        let mut f = self.follow_ups.lock().unwrap();
+                        f.push_back((id, seq, master_ns));
+                        while f.len() > 16 {
+                            f.pop_front();
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some((master, local, user)) = sample {
+            follower().sample(clock_id, master, local);
+            if let Some(log) = &self.log {
+                use std::io::Write;
+                let _ = writeln!(
+                    log.lock().unwrap(),
+                    "{clock_id:016x},{seq},{master},{local},{user}"
+                );
+            }
+        }
     }
 }
 
@@ -456,5 +626,267 @@ mod anchor_tests {
         // frac = 0x8000000000000000 means 0.5 seconds
         let anchor = PtpAnchor::new(1, 0, 1, 0x8000_0000_0000_0000, 44100);
         assert_eq!(anchor.anchor_network_time_ns, 1_500_000_000);
+    }
+}
+
+/// Follows PTP masters' clocks from Sync / Follow_Up samples: per clock, the fastest sample of every
+/// [`FOLLOW_WINDOW_NS`] (the least delayed: queueing on the way only ever adds), a least-squares line through the
+/// last [`FOLLOW_WINDOWS`] of them (the clocks' drift), refitted without minima that sit more than 1 ms above it.
+/// Over Wi-Fi this holds a master to ~0.3 ms rms. The path's minimum delay is
+/// not measured: a constant bias (~2.6 ms over Wi-Fi), which output calibration absorbs.
+pub struct Follower {
+    clocks: std::sync::Mutex<std::collections::HashMap<u64, ClockTrack>>,
+}
+
+pub const FOLLOW_WINDOW_NS: u64 = 2_000_000_000;
+pub const FOLLOW_WINDOWS: usize = 32;
+pub const LOCK_SAMPLES: u32 = 8;
+
+#[derive(Default)]
+struct ClockTrack {
+    minima: std::collections::VecDeque<(u64, i64)>, // (local ns, local - master ns) per window
+    window: u64,
+    fit: Option<(f64, f64, u64)>, // d = a + b * (local - t0) ns, t0
+    samples: u32,                 // since the track (re)started
+}
+
+impl ClockTrack {
+    fn sample(&mut self, master: u64, local: u64) {
+        let d = local as i64 - master as i64;
+        // a master that stepped (or restarted on another timescale under the same identity): start over. Below the
+        // line by more than jitter can explain, or seconds above it (stalls stay well under)
+        if self
+            .d_at(local)
+            .is_some_and(|p| (d as f64) < p - 20e6 || d as f64 > p + 5e9)
+        {
+            self.minima.clear();
+            self.fit = None;
+            self.samples = 0;
+        }
+        self.samples = self.samples.saturating_add(1);
+        // windows older than the span (a master heard again after a pause)
+        while self
+            .minima
+            .front()
+            .is_some_and(|m| m.0 + FOLLOW_WINDOW_NS * FOLLOW_WINDOWS as u64 <= local)
+        {
+            self.minima.pop_front();
+        }
+        let w = local / FOLLOW_WINDOW_NS;
+        match self.minima.back_mut() {
+            Some(last) if self.window == w => {
+                if d < last.1 {
+                    *last = (local, d);
+                }
+            }
+            _ => {
+                self.window = w;
+                self.minima.push_back((local, d));
+                while self.minima.len() > FOLLOW_WINDOWS {
+                    self.minima.pop_front();
+                }
+            }
+        }
+        self.refit();
+    }
+
+    fn refit(&mut self) {
+        if self.minima.is_empty() {
+            self.fit = None;
+            return;
+        }
+        let pts: Vec<(f64, f64)> = {
+            let t0 = self.minima.front().map_or(0, |m| m.0);
+            let base = self.minima.front().map_or(0, |m| m.1);
+            self.minima
+                .iter()
+                .map(|&(t, d)| ((t - t0) as f64, (d - base) as f64))
+                .collect()
+        };
+        let (t0, base) = (
+            self.minima.front().unwrap().0,
+            self.minima.front().unwrap().1,
+        );
+        let line = |pts: &[(f64, f64)]| -> (f64, f64) {
+            let n = pts.len() as f64;
+            if pts.len() < 4 {
+                // too few for a slope: the lowest
+                let lo = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                return (lo, 0.0);
+            }
+            let (mx, my) = (
+                pts.iter().map(|p| p.0).sum::<f64>() / n,
+                pts.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+            let b = if sxx > 0.0 {
+                pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx
+            } else {
+                0.0
+            };
+            (my - b * mx, b)
+        };
+        let (a, b) = line(&pts);
+        let kept: Vec<(f64, f64)> = pts
+            .iter()
+            .copied()
+            .filter(|p| p.1 - (a + b * p.0) < 1e6)
+            .collect();
+        let (a, b) = if kept.len() >= 4 && kept.len() < pts.len() {
+            line(&kept)
+        } else {
+            (a, b)
+        };
+        // a drift only from a span long enough to mean one, and within what crystals do
+        let span = pts.last().map_or(0.0, |p| p.0);
+        let (a, b) = if span < 8e9 {
+            (pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min), 0.0)
+        } else {
+            (a, b.clamp(-200e-6, 200e-6))
+        };
+        self.fit = Some((a + base as f64, b, t0));
+    }
+
+    /// local - master at local time `local`
+    fn d_at(&self, local: u64) -> Option<f64> {
+        let (a, b, t0) = self.fit?;
+        Some(a + b * (local as f64 - t0 as f64))
+    }
+}
+
+impl Follower {
+    fn new() -> Self {
+        Follower {
+            clocks: std::sync::Mutex::default(),
+        }
+    }
+
+    /// A Sync's receive time (local wall clock, ns) and its Follow_Up's send time (the master's clock).
+    pub fn sample(&self, clock_id: u64, master_ns: u64, local_ns: u64) {
+        self.clocks
+            .lock()
+            .unwrap()
+            .entry(clock_id)
+            .or_default()
+            .sample(master_ns, local_ns);
+    }
+
+    /// Whether `clock_id` has been followed long enough to use: [`LOCK_SAMPLES`] (a second at Apple's 8 Hz; the
+    /// lowest so far until there are windows enough for a drift fit).
+    pub fn locked(&self, clock_id: u64) -> bool {
+        self.clocks
+            .lock()
+            .unwrap()
+            .get(&clock_id)
+            .is_some_and(|c| c.samples >= LOCK_SAMPLES)
+    }
+
+    /// The clock most recently heard from, if any (for senders that don't name their timeline).
+    pub fn latest(&self) -> Option<u64> {
+        self.clocks
+            .lock()
+            .unwrap()
+            .iter()
+            .max_by_key(|(_, c)| c.minima.back().map(|m| m.0))
+            .map(|(&id, _)| id)
+    }
+
+    /// Local wall-clock time (ns, `now_ns`'s clock) at which `clock_id` reads `master_ns`.
+    pub fn to_local(&self, clock_id: u64, master_ns: u64) -> Option<u64> {
+        let clocks = self.clocks.lock().unwrap();
+        let c = clocks.get(&clock_id)?;
+        if c.samples < LOCK_SAMPLES {
+            return None;
+        }
+        // local = master + d(local), d = a + b (local - t0): solved for local. (Evaluating d at the master's time
+        // instead would multiply the slope by the clocks' distance: days, between a Mac's uptime and ours.)
+        let (a, b, t0) = c.fit?;
+        let local = (master_ns as f64 + a - b * t0 as f64) / (1.0 - b);
+        Some(local.max(0.0) as u64)
+    }
+}
+
+/// The process's clock follower (fed by the PTP sink).
+pub fn follower() -> &'static Follower {
+    static F: std::sync::OnceLock<Follower> = std::sync::OnceLock::new();
+    F.get_or_init(Follower::new)
+}
+
+#[cfg(test)]
+mod follower_tests {
+    use super::*;
+
+    #[test]
+    fn follows_offset_and_drift_through_jitter() {
+        let mut c = ClockTrack::default();
+        // local = master * (1 - 22e-6) + 5 s offset; delay 1 ms + jitter, every 125 ms over 60 s
+        let mut x: u64 = 12345;
+        for i in 0..480u64 {
+            let master = 1_000_000_000_000 + i * 125_000_000;
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let jitter = (x >> 40) % 20_000_000; // 0..20 ms
+            let jitter = if i % 7 == 0 { 0 } else { jitter }; // some fast packets
+            let local = (master as f64 * (1.0 - 22e-6)) as u64 + 5_000_000_000 + 1_000_000 + jitter;
+            c.sample(master, local);
+        }
+        let f = Follower::new();
+        f.clocks.lock().unwrap().insert(7, c);
+        let m = 1_000_000_000_000 + 60_000_000_000;
+        let expect = (m as f64 * (1.0 - 22e-6)) as u64 + 5_000_000_000 + 1_000_000;
+        let got = f.to_local(7, m).unwrap();
+        assert!(got.abs_diff(expect) < 200_000, "{} vs {}", got, expect);
+    }
+
+    #[test]
+    fn converts_between_clocks_days_apart() {
+        // a Mac's uptime (23 days) against ours (4 h), 22 ppm apart, 64 s of samples
+        let mut c = ClockTrack::default();
+        let (m0, l0) = (2_048_000_000_000_000u64, 15_000_000_000_000u64);
+        for i in 0..512u64 {
+            let m = m0 + i * 125_000_000;
+            let l = l0
+                + ((i * 125_000_000) as f64 * (1.0 - 22e-6)) as u64
+                + 1_000_000
+                + (i % 5) * 300_000;
+            c.sample(m, l);
+        }
+        let f = Follower::new();
+        f.clocks.lock().unwrap().insert(9, c);
+        let m = m0 + 65_000_000_000;
+        let expect = l0 + (65_000_000_000f64 * (1.0 - 22e-6)) as u64 + 1_000_000;
+        let got = f.to_local(9, m).unwrap();
+        assert!(got.abs_diff(expect) < 100_000, "{} vs {}", got, expect);
+    }
+
+    #[test]
+    fn a_master_on_another_timescale_starts_over() {
+        let mut c = ClockTrack::default();
+        for i in 0..80u64 {
+            c.sample(
+                1_000_000_000_000 + i * 125_000_000,
+                5_000_000_000 + i * 125_000_000,
+            );
+        }
+        // the same identity, now a clock 8 days behind
+        let back = 700 * 1_000_000_000u64;
+        for i in 80..120u64 {
+            c.sample(
+                1_000_000_000_000 - back + i * 125_000_000,
+                5_000_000_000 + i * 125_000_000,
+            );
+        }
+        // local - master: 5 s - (1000 s - 700 s)
+        let d = c.d_at(5_000_000_000 + 119 * 125_000_000).unwrap();
+        assert!((d - (5e9 - 1e12 + back as f64)).abs() < 1e6, "{d}");
+    }
+
+    #[test]
+    fn not_locked_without_enough_samples() {
+        let f = Follower::new();
+        f.sample(1, 1_000, 2_000);
+        assert!(!f.locked(1));
+        assert!(f.to_local(1, 5_000).is_none());
     }
 }
