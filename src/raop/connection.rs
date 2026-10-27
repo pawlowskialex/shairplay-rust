@@ -36,6 +36,8 @@ pub(crate) struct RaopShared {
     /// AP2 buffered audio: the buffer size advertised to the sender (how far ahead it may send).
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) audio_buffer_size: u32,
+    /// Realtime packets' decrypt + decode on a coprocessor, if one was installed.
+    pub(crate) packet_offload: Option<crate::raop::offload::OffloadFactory>,
     #[cfg(feature = "ap2-core")]
     pub(crate) pin: Option<String>,
     /// The next pair-setup's SRP state, made ahead of time.

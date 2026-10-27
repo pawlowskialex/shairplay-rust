@@ -77,6 +77,9 @@ pub use net::protocol_diagnostics::HeaderDiagnostics;
 pub use net::server::BindConfig;
 #[cfg(feature = "hls")]
 pub use raop::hls::{HlsHandler, HlsSession};
+pub use raop::offload::{
+    OffloadAlac, OffloadCipher, OffloadFactory, OffloadOutput, OffloadStream, PacketOffload,
+};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 #[cfg(feature = "ap2-core")]

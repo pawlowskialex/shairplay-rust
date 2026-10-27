@@ -686,6 +686,7 @@ fn setup_stream_realtime(
             sample_rate: conn.shared.output_sample_rate,
             max_channels: conn.shared.output_max_channels,
             format: conn.shared.output_format,
+            offload: conn.shared.packet_offload.clone(),
         };
 
         let handle = tokio::spawn(crate::raop::realtime_audio::run(

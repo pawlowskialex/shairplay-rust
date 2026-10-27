@@ -7,6 +7,9 @@
 //! packets and optional retransmit requests for gaps.
 
 use crate::codec::alac::{AlacConfig, AlacDecoder};
+use crate::raop::offload::{
+    OffloadAlac, OffloadCipher, OffloadFactory, OffloadOutput, OffloadStream, PacketOffload,
+};
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use std::borrow::Cow;
 
@@ -86,6 +89,9 @@ struct BufferEntry {
     audio_buffer: Vec<i16>,
     /// Actual number of valid samples in `audio_buffer`.
     audio_buffer_len: usize,
+    /// Submitted to the offload and not back yet (under `offload_tag`).
+    pending: bool,
+    offload_tag: u32,
 }
 
 /// Compare two RTP sequence numbers with wrapping (handles 16-bit overflow).
@@ -214,6 +220,11 @@ pub struct RaopBuffer {
     decode_scratch: Vec<u8>,
     /// What [`dequeue`](Self::dequeue) returns: the dequeued frame as f32.
     f32_scratch: Vec<f32>,
+    /// A coprocessor decrypting and decoding packets ([`set_offload`](Self::set_offload)).
+    offload: Option<Box<dyn PacketOffload>>,
+    /// Counts flushes: offload tags are `generation << 16 | seqnum`, so a result for a packet from before a flush
+    /// never fills a slot reused after it.
+    generation: u16,
 }
 
 impl RaopBuffer {
@@ -280,6 +291,8 @@ impl RaopBuffer {
                 ssrc: 0,
                 audio_buffer: vec![0i16; frame_capacity],
                 audio_buffer_len: 0,
+                pending: false,
+                offload_tag: 0,
             })
             .collect();
 
@@ -294,7 +307,68 @@ impl RaopBuffer {
             silence_samples,
             decode_scratch: Vec::new(),
             f32_scratch: Vec::new(),
+            offload: None,
+            generation: 0,
         })
+    }
+
+    /// Ask `factory` for an offload for this stream (ALAC streams only); without one, or if it declines, every
+    /// packet is decrypted and decoded here.
+    pub(crate) fn set_offload(&mut self, factory: Option<&OffloadFactory>) {
+        self.offload = None;
+        let (Some(factory), Codec::Alac { config, .. }) = (factory, &self.codec) else {
+            return;
+        };
+        let stream = OffloadStream {
+            cipher: match self.aes {
+                Some(a) => OffloadCipher::Aes128Cbc {
+                    key: a.key,
+                    iv: a.iv,
+                },
+                None => OffloadCipher::None,
+            },
+            alac: Some(OffloadAlac {
+                frame_length: config.frame_length,
+                bit_depth: config.bit_depth,
+                pb: config.pb,
+                mb: config.mb,
+                kb: config.kb,
+                channels: config.num_channels,
+            }),
+        };
+        self.offload = factory(&stream);
+    }
+
+    /// Packets with the offload.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.offload.as_ref().map_or(0, |o| o.in_flight())
+    }
+
+    /// Move finished offload results into their slots.
+    fn collect_offload(&mut self) {
+        let Some(mut off) = self.offload.take() else {
+            return;
+        };
+        off.collect(&mut |tag, out| {
+            let idx = (tag & 0xFFFF) as usize % RAOP_BUFFER_LENGTH;
+            if !self.entries[idx].pending || self.entries[idx].offload_tag != tag {
+                return;
+            }
+            self.entries[idx].pending = false;
+            let n = match out {
+                OffloadOutput::Pcm(pcm) => {
+                    let e = &mut self.entries[idx];
+                    let n = pcm.len().min(e.audio_buffer.len());
+                    e.audio_buffer[..n].copy_from_slice(&pcm[..n]);
+                    n
+                }
+                OffloadOutput::Plain(payload) => self.decode_into(idx, payload).max(0) as usize,
+                OffloadOutput::Failed => 0,
+            };
+            self.entries[idx].audio_buffer_len = n;
+            self.entries[idx].available = n > 0;
+        });
+        self.offload = Some(off);
     }
 
     /// Returns the output stream format (channels + source sample rate).
@@ -348,9 +422,24 @@ impl RaopBuffer {
             return 0;
         }
 
+        if self.entries[idx].pending && seqnum_cmp(self.entries[idx].seqnum, seqnum) == 0 {
+            return 0;
+        }
+
         // A failed replacement must not leave stale data available in this slot.
         self.entries[idx].available = false;
+        self.entries[idx].pending = false;
         self.entries[idx].audio_buffer_len = 0;
+
+        let tag = (self.generation as u32) << 16 | seqnum as u32;
+        if let Some(off) = self.offload.as_mut()
+            && off.submit(tag, data)
+        {
+            self.entries[idx].pending = true;
+            self.entries[idx].offload_tag = tag;
+            self.mark(idx, data, seqnum, 0);
+            return 1;
+        }
 
         // AES-128-CBC decrypt: only full 16-byte blocks are encrypted,
         // trailing bytes (< 16) are sent in the clear.
@@ -370,6 +459,39 @@ impl RaopBuffer {
             Cow::Borrowed(payload)
         };
 
+        let num_samples = self.decode_into(idx, &packet_buf);
+        if num_samples <= 0 {
+            return num_samples;
+        }
+        self.mark(idx, data, seqnum, num_samples as usize);
+        self.entries[idx].available = true;
+        1
+    }
+
+    /// Record a slot's RTP header and length and move the buffer window.
+    fn mark(&mut self, idx: usize, data: &[u8], seqnum: u16, num_samples: usize) {
+        let entry = &mut self.entries[idx];
+        entry.flags = data[0];
+        entry.entry_type = data[1];
+        entry.seqnum = seqnum;
+        entry.timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        entry.ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        entry.audio_buffer_len = num_samples;
+
+        // Update buffer window.
+        if self.is_empty {
+            self.first_seqnum = seqnum;
+            self.last_seqnum = seqnum;
+            self.is_empty = false;
+        }
+        if seqnum_cmp(seqnum, self.last_seqnum) > 0 {
+            self.last_seqnum = seqnum;
+        }
+    }
+
+    /// Decode a decrypted payload into slot `idx`: the number of samples, 0 for an undecodable frame, -1 for a
+    /// malformed L16 payload.
+    fn decode_into(&mut self, idx: usize, packet_buf: &[u8]) -> i32 {
         // Decode into the slot's s16 buffer.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
@@ -378,7 +500,7 @@ impl RaopBuffer {
                 let s16_buf = &mut self.decode_scratch;
                 s16_buf.resize(capacity * 2, 0);
                 let output_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decoder.decode_frame(&packet_buf, s16_buf)
+                    decoder.decode_frame(packet_buf, s16_buf)
                 }))
                 .unwrap_or(0);
                 if output_size == 0 {
@@ -421,25 +543,7 @@ impl RaopBuffer {
             }
         };
 
-        let entry = &mut self.entries[idx];
-        entry.flags = data[0];
-        entry.entry_type = data[1];
-        entry.seqnum = seqnum;
-        entry.timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        entry.ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        entry.audio_buffer_len = num_samples;
-        entry.available = true;
-
-        // Update buffer window.
-        if self.is_empty {
-            self.first_seqnum = seqnum;
-            self.last_seqnum = seqnum;
-            self.is_empty = false;
-        }
-        if seqnum_cmp(seqnum, self.last_seqnum) > 0 {
-            self.last_seqnum = seqnum;
-        }
-        1
+        num_samples as i32
     }
 
     /// Dequeue the next frame in sequence order, as f32 (a conversion of
@@ -463,12 +567,17 @@ impl RaopBuffer {
     /// to allow time for a retransmit. If `no_resend` is true (or the buffer
     /// is full), substitutes silence for the missing frame.
     pub fn dequeue_s16(&mut self, no_resend: bool) -> Option<&[i16]> {
+        self.collect_offload();
         let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
         if self.is_empty || buflen <= 0 {
             return None;
         }
 
         let idx = self.first_seqnum as usize % RAOP_BUFFER_LENGTH;
+        // The next frame is still with the offload: wait for it (the offload fails it if it hangs).
+        if self.entries[idx].pending {
+            return None;
+        }
         // Wait for retransmit unless buffer is full or retransmits are disabled.
         if !no_resend && !self.entries[idx].available && (buflen as usize) < RAOP_BUFFER_LENGTH {
             return None;
@@ -495,13 +604,113 @@ impl RaopBuffer {
     pub fn flush(&mut self, next_seq: i32) {
         for entry in &mut self.entries {
             entry.available = false;
+            entry.pending = false;
             entry.audio_buffer_len = 0;
         }
+        self.generation = self.generation.wrapping_add(1);
         if !(0..=0xffff).contains(&next_seq) {
             self.is_empty = true;
         } else {
             self.first_seqnum = next_seq as u16;
             self.last_seqnum = (next_seq as u16).wrapping_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod offload_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Finishes packets only when told to; "decodes" a packet to samples equal to its sequence number.
+    struct Mock {
+        queue: Arc<Mutex<Vec<(u32, bool)>>>, // (tag, finished)
+    }
+
+    impl PacketOffload for Mock {
+        fn submit(&mut self, tag: u32, _packet: &[u8]) -> bool {
+            self.queue.lock().unwrap().push((tag, false));
+            true
+        }
+        fn collect(&mut self, done: &mut dyn FnMut(u32, OffloadOutput<'_>)) {
+            let mut q = self.queue.lock().unwrap();
+            while let Some(&(tag, true)) = q.first() {
+                let pcm = vec![(tag & 0xFFFF) as i16; 4];
+                done(tag, OffloadOutput::Pcm(&pcm));
+                q.remove(0);
+            }
+        }
+        fn in_flight(&self) -> usize {
+            self.queue.lock().unwrap().len()
+        }
+    }
+
+    fn packet(seq: u16) -> Vec<u8> {
+        let mut p = vec![0u8; 12 + 32];
+        p[2..4].copy_from_slice(&seq.to_be_bytes());
+        p
+    }
+
+    /// What the mock offload was handed: (sequence number, decline).
+    type Submitted = Arc<Mutex<Vec<(u32, bool)>>>;
+
+    fn buffer() -> (RaopBuffer, Submitted) {
+        let mut b =
+            RaopBuffer::new_unencrypted("96 AppleLossless", "96 352 0 16 40 10 14 2 255 0 0 44100")
+                .unwrap();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let q2 = queue.clone();
+        let factory: OffloadFactory = Arc::new(move |s: &OffloadStream| {
+            assert!(matches!(s.cipher, OffloadCipher::None));
+            assert_eq!(s.alac.unwrap().frame_length, 352);
+            Some(Box::new(Mock { queue: q2.clone() }) as Box<dyn PacketOffload>)
+        });
+        b.set_offload(Some(&factory));
+        (b, queue)
+    }
+
+    fn finish(q: &Arc<Mutex<Vec<(u32, bool)>>>, n: usize) {
+        for e in q.lock().unwrap().iter_mut().take(n) {
+            e.1 = true;
+        }
+    }
+
+    #[test]
+    fn pending_packets_are_waited_for_then_delivered_in_order() {
+        let (mut b, q) = buffer();
+        for seq in 10..13 {
+            assert_eq!(b.queue(&packet(seq), true), 1);
+        }
+        assert_eq!(b.in_flight(), 3);
+        // nothing finished: the head is pending, so no silence is substituted even without resends
+        assert!(b.dequeue_s16(true).is_none());
+        finish(&q, 2);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[10; 4]);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[11; 4]);
+        assert!(b.dequeue_s16(true).is_none());
+        finish(&q, 1);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[12; 4]);
+        assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn results_from_before_a_flush_are_ignored() {
+        let (mut b, q) = buffer();
+        assert_eq!(b.queue(&packet(20), true), 1);
+        b.flush(20);
+        // the same sequence number again after the flush: a new tag (generation)
+        assert_eq!(b.queue(&packet(20), true), 1);
+        finish(&q, 1); // the stale one finishes first: dropped
+        assert!(b.dequeue_s16(true).is_none());
+        finish(&q, 2);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[20; 4]);
+    }
+
+    #[test]
+    fn a_duplicate_of_a_pending_packet_is_not_resubmitted() {
+        let (mut b, q) = buffer();
+        assert_eq!(b.queue(&packet(5), true), 1);
+        assert_eq!(b.queue(&packet(5), true), 0);
+        assert_eq!(q.lock().unwrap().len(), 1);
     }
 }
