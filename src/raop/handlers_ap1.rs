@@ -335,6 +335,7 @@ pub(crate) fn handle_announce(
             output_sample_rate: conn.shared.output_sample_rate,
             output_format: conn.shared.output_format,
             remote_socket: conn.remote_socket,
+            offload: conn.shared.packet_offload.clone(),
         },
     );
 
@@ -534,6 +535,7 @@ mod tests {
             output_max_channels: None,
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
+            packet_offload: None,
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {
