@@ -1,13 +1,16 @@
 //! AirPlay 2 buffered audio processor (stream type 103).
 //!
-//! Receives encrypted AAC packets over TCP, decrypts with ChaCha20-Poly1305,
-//! decodes via symphonia, resamples/mixes down, and delivers F32LE PCM through
-//! a timed playout buffer.
+//! Receives encrypted AAC packets over TCP, decrypts them with ChaCha20-Poly1305 and keeps them
+//! compressed in a timed playout buffer; frames are decoded (AAC backend: `codec::aac`), mixed down or
+//! resampled if the output asks for it, and delivered in the session's sample format as they fall due.
+//! Senders stream far ahead (up to the advertised `audioBufferSize`), so holding compressed audio
+//! instead of decoded PCM keeps the buffer ~5x (s16) to ~11x (f32) smaller, and decoding is spread
+//! evenly over playback instead of in bursts as packets arrive.
 //!
 //! Three concurrent tasks:
-//! - **Receiver** (tokio): accepts TCP, decrypts, decodes, buffers by RTP timestamp
+//! - **Receiver** (tokio): accepts TCP, decrypts, buffers compressed frames by RTP timestamp
 //! - **Command handler** (tokio): processes SetRate/Flush/Stop from RTSP thread
-//! - **Delivery** (std::thread): timed playout using anchor-based scheduling
+//! - **Delivery** (std::thread): timed playout using anchor-based scheduling; decodes and delivers
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -56,14 +59,13 @@ pub enum PlayoutCommand {
 }
 
 struct PlayoutState {
-    buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
+    buffer: BTreeMap<u32, (AudioSsrc, Vec<u8>)>, // rtp_timestamp → decrypted (compressed) AAC frame
     anchor_rtp: u32,
     anchor_local_ns: u64,
     rate: u32,
+    /// The RTP clock: the stream's sample rate (timestamps count source frames).
     sample_rate: u32,
-    channels: u8,
     stopped: bool,
-    format_changed: bool,
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -81,18 +83,14 @@ impl BufferedAudioProcessor {
         handler: Arc<dyn AudioHandler>,
     ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let default_sr = output_config.sample_rate.unwrap_or(44100);
-
         let state = Arc::new((
             Mutex::new(PlayoutState {
                 buffer: BTreeMap::new(),
                 anchor_rtp: 0,
                 anchor_local_ns: 0,
                 rate: 0,
-                sample_rate: default_sr,
-                channels: 2,
+                sample_rate: 44100,
                 stopped: false,
-                format_changed: false,
             }),
             Condvar::new(),
         ));
@@ -194,23 +192,19 @@ impl BufferedAudioProcessor {
     }
 }
 
-/// TCP receive loop: reads length-prefixed packets, decrypts, decodes, buffers.
+/// TCP receive loop: reads length-prefixed packets, decrypts, buffers the compressed frames.
 async fn receive_loop(
     mut stream: TcpStream,
     shk: &[u8; 32],
-    output_config: OutputConfig,
+    _output_config: OutputConfig,
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
-    handler: &Arc<dyn AudioHandler>,
+    _handler: &Arc<dyn AudioHandler>,
 ) {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
     let cipher = ChaCha20Poly1305::new(shk.into());
     let mut len_buf = [0u8; 2];
-    let mut decoder: Option<AacDecoder> = None;
     let mut current_ssrc = AudioSsrc::None;
-    let mut stream_resampler: Option<crate::codec::resample::StreamResampler> = None;
-    let mut source_channels: u8 = 2;
-    let mut output_channels: u8 = 2;
 
     loop {
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -232,44 +226,16 @@ async fn receive_loop(
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
+        if ssrc == AudioSsrc::None {
+            continue;
+        }
 
-        // Detect format change
-        if ssrc != AudioSsrc::None && ssrc != current_ssrc {
+        // The RTP clock follows the stream's rate; the delivery thread sets up the decoder.
+        if ssrc != current_ssrc {
             current_ssrc = ssrc;
-            let src_sr = ssrc.sample_rate();
-            let src_ch = ssrc.channels();
-            info!(ssrc = ?ssrc, src_sr, src_ch, "Audio format detected");
-
-            decoder = AacDecoder::new(src_sr, src_ch).ok();
-            if decoder.is_none() {
-                warn!("Failed to create AAC decoder for {:?}", ssrc);
-                handler.on_error(&ShairplayError::Codec(CodecError::UnsupportedFormat(format!(
-                    "AAC decoder init failed (ssrc={ssrc:?}, sample_rate={src_sr}, channels={src_ch})"
-                ))));
-            }
-
-            let target_sr = output_config.sample_rate.unwrap_or(src_sr);
-            let target_ch = output_config
-                .max_channels
-                .map(|max| src_ch.min(max))
-                .unwrap_or(src_ch);
-
-            stream_resampler =
-                crate::codec::resample::StreamResampler::new(src_sr, target_sr, target_ch as usize);
-            if stream_resampler.is_some() {
-                debug!(from = src_sr, to = target_sr, "Resampler initialized");
-            }
-
-            source_channels = src_ch;
-            output_channels = target_ch;
-
-            // Signal format change to delivery thread
-            let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
-            s.sample_rate = target_sr;
-            s.channels = target_ch;
-            s.format_changed = true;
-            cvar.notify_all();
+            info!(ssrc = ?ssrc, src_sr = ssrc.sample_rate(), src_ch = ssrc.channels(), "Audio format detected");
+            let (lock, _) = &*state;
+            lock.lock().unwrap().sample_rate = ssrc.sample_rate();
         }
 
         // Decrypt the ChaCha20-Poly1305 RTP frame.
@@ -278,35 +244,10 @@ async fn receive_loop(
             continue;
         };
 
-        // Decode
-        let pcm = if let Some(dec) = &mut decoder {
-            dec.decode(&plaintext)
-        } else {
-            None
-        };
-
-        if let Some(pcm_data) = pcm {
-            // Convert bytes to f32 samples for processing
-            let samples: Vec<f32> = pcm_data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-
-            // Mix down + resample to the output format.
-            let samples = crate::codec::resample::mixdown_and_resample(
-                samples,
-                source_channels,
-                output_channels,
-                &mut stream_resampler,
-            );
-
-            let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
-            s.buffer.insert(timestamp, samples);
-            cvar.notify_all();
-        }
+        let (lock, cvar) = &*state;
+        let mut s = lock.lock().unwrap();
+        s.buffer.insert(timestamp, (ssrc, plaintext));
+        cvar.notify_all();
     }
     debug!("Buffered audio receive loop ended");
     let (lock, cvar) = &*state;
@@ -317,7 +258,81 @@ async fn receive_loop(
     }
 }
 
-/// Timed playout delivery thread. Wakes on condvar, delivers due frames to AudioSession.
+/// The decoder and output shaping for the current stream format.
+struct Stream {
+    ssrc: AudioSsrc,
+    decoder: Option<AacDecoder>,
+    #[cfg(feature = "resample")]
+    resampler: Option<crate::codec::resample::StreamResampler>,
+    src_channels: u8,
+    out_channels: u8,
+}
+
+impl Stream {
+    fn new(
+        ssrc: AudioSsrc,
+        output_config: &OutputConfig,
+        handler: &Arc<dyn AudioHandler>,
+    ) -> (Self, AudioFormat) {
+        let src_sr = ssrc.sample_rate();
+        let src_ch = ssrc.channels();
+        let decoder = match AacDecoder::new(src_sr, src_ch) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!("Failed to create AAC decoder for {:?}: {e}", ssrc);
+                handler.on_error(&ShairplayError::Codec(CodecError::UnsupportedFormat(format!(
+                    "AAC decoder init failed (ssrc={ssrc:?}, sample_rate={src_sr}, channels={src_ch}): {e}"
+                ))));
+                None
+            }
+        };
+        let target_sr = output_config.sample_rate.unwrap_or(src_sr);
+        let target_ch = output_config
+            .max_channels
+            .map(|max| src_ch.min(max))
+            .unwrap_or(src_ch);
+        #[cfg(feature = "resample")]
+        let resampler =
+            crate::codec::resample::StreamResampler::new(src_sr, target_sr, target_ch as usize);
+        let format = AudioFormat {
+            codec: AudioCodec::Pcm,
+            bits: output_config.format.bits(),
+            channels: target_ch,
+            sample_rate: target_sr,
+        };
+        let stream = Self {
+            ssrc,
+            decoder,
+            #[cfg(feature = "resample")]
+            resampler,
+            src_channels: src_ch,
+            out_channels: target_ch,
+        };
+        (stream, format)
+    }
+
+    fn decode(&mut self, aac: &[u8]) -> Option<crate::codec::Pcm> {
+        let bytes = self.decoder.as_mut()?.decode(aac)?;
+        let pcm = crate::codec::Pcm::F32(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+        );
+        Some(crate::codec::shape(
+            pcm,
+            self.src_channels,
+            self.out_channels,
+            #[cfg(feature = "resample")]
+            &mut self.resampler,
+        ))
+    }
+}
+
+/// Timed playout delivery thread. Wakes on condvar, decodes due frames and delivers them to the
+/// AudioSession, which is (re)created when the stream format changes.
 fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: Arc<dyn AudioHandler>,
@@ -325,6 +340,8 @@ fn delivery_loop(
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
+    let mut stream: Option<Stream> = None;
+    let (mut decoded, mut decode_ns) = (0u64, 0u64);
 
     loop {
         let mut s = lock.lock().unwrap();
@@ -336,46 +353,59 @@ fn delivery_loop(
             break;
         }
 
-        // Lazy init or reinit session on format change
-        if session.is_none() || s.format_changed {
-            s.format_changed = false;
-            let format = AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: output_config.format.bits(),
-                channels: s.channels,
-                sample_rate: s.sample_rate,
-            };
-            info!(?format, "Audio session initialized");
-            session = Some(handler.audio_init(format));
-        }
-
         let now = now_ns();
         let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
         let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready: Vec<(u32, Vec<f32>)> = s
+        // Due frames, oldest first: the map is ordered, so stop at the first one not due yet. Around the RTP
+        // timestamp wrap (every ~27 h at 44.1 kHz) the oldest frames sort last: then scan everything.
+        let is_due = |ts: u32| (target_rtp.wrapping_sub(ts) as i32) >= 0;
+        let mut due: Vec<u32> = s
             .buffer
-            .iter()
-            .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
+            .keys()
+            .copied()
+            .take_while(|&ts| is_due(ts))
             .collect();
-
-        for (ts, _) in &ready {
-            s.buffer.remove(ts);
+        if due.is_empty() && s.buffer.keys().next_back().is_some_and(|&ts| is_due(ts)) {
+            due = s.buffer.keys().copied().filter(|&ts| is_due(ts)).collect();
+        }
+        let ready: Vec<(AudioSsrc, Vec<u8>)> =
+            due.iter().filter_map(|ts| s.buffer.remove(ts)).collect();
+        if ready.is_empty() {
+            // nothing due: sleep until the next frame is (at most 20 ms; new data or a command wakes us)
+            let wait_ns = s.buffer.keys().next().map_or(20_000_000, |&ts| {
+                let frames = ts.wrapping_sub(target_rtp) as i32 as i64;
+                (frames.max(0) * 1_000_000_000 / i64::from(s.sample_rate.max(1))).min(20_000_000)
+                    as u64
+            });
+            drop(
+                cvar.wait_timeout(s, std::time::Duration::from_nanos(wait_ns.max(1_000_000)))
+                    .unwrap(),
+            );
+            continue;
         }
         drop(s);
 
-        let idle = ready.is_empty();
-        if let Some(ref mut sess) = session {
-            for (_, frame) in ready {
-                crate::codec::Pcm::F32(frame).deliver(sess.as_mut(), output_config.format);
+        for (ssrc, aac) in ready {
+            if stream.as_ref().is_none_or(|st| st.ssrc != ssrc) {
+                let (st, format) = Stream::new(ssrc, &output_config, &handler);
+                info!(?format, "Audio session initialized");
+                session = Some(handler.audio_init(format));
+                stream = Some(st);
+            }
+            let t = now_ns();
+            let pcm = stream.as_mut().and_then(|st| st.decode(&aac));
+            decode_ns += now_ns().saturating_sub(t);
+            decoded += 1;
+            if let (Some(pcm), Some(sess)) = (pcm, session.as_mut()) {
+                pcm.deliver(sess.as_mut(), output_config.format);
             }
         }
-
-        if idle {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
     }
-    info!("Delivery loop ended");
+    info!(
+        frames = decoded,
+        decode_ms = decode_ns / 1_000_000,
+        "Delivery loop ended"
+    );
 }
