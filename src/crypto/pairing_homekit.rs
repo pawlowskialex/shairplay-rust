@@ -40,6 +40,59 @@ D120A93AD2CAFFFFFFFFFFFFFFFF";
 const G_3072: u32 = 5;
 const N_3072_LEN: usize = 384; // bytes
 
+/// SRP server states made ahead of time. [`SrpServer::new`] costs two 3072-bit modular exponentiations (the
+/// verifier and the server's public key: over a second on a slow CPU) before the client's first message can be
+/// answered, and none of it depends on the client; so one state is kept ready, made in the background when the
+/// server starts and again when a sender's connection closes (its audio has stopped, the CPU is free).
+pub(crate) struct SrpSpare {
+    pin: Option<String>,
+    ready: std::sync::Mutex<Option<SrpServer>>,
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl SrpSpare {
+    pub(crate) fn new(pin: Option<String>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pin,
+            ready: std::sync::Mutex::new(None),
+            busy: false.into(),
+        })
+    }
+
+    /// Make a spare in the background after `delay`, unless one is ready or being made.
+    pub(crate) fn refill(self: &std::sync::Arc<Self>, delay: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        if self.ready.lock().map(|r| r.is_some()).unwrap_or(true)
+            || self.busy.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("srp-spare".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                if let Ok(server) = SrpServer::new(me.pin.as_deref())
+                    && let Ok(mut r) = me.ready.lock()
+                {
+                    *r = Some(server);
+                }
+                me.busy.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
+    }
+
+    /// A fresh server state: the spare if one is ready, else made now. Each is used once.
+    pub(crate) fn take(&self) -> Result<SrpServer, CryptoError> {
+        match self.ready.lock().ok().and_then(|mut r| r.take()) {
+            Some(server) => Ok(server),
+            None => SrpServer::new(self.pin.as_deref()),
+        }
+    }
+}
+
 /// SRP-6a server state for HomeKit pairing.
 pub(crate) struct SrpServer {
     n: BigUint,
