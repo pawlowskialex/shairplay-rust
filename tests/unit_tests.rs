@@ -759,6 +759,7 @@ mod playout_tests {
         let _ = PlayoutCommand::SetRate {
             anchor_rtp: 0,
             anchor_time_ns: 0,
+            timeline: 0,
             rate: 1,
         };
         let _ = PlayoutCommand::Flush {
