@@ -37,6 +37,7 @@ impl RaopConnection {
         tokio::spawn(async move {
             if let Ok((stream, addr)) = event_listener.accept().await {
                 tracing::info!(%addr, "RC event channel client connected");
+                crate::net::keepalive(&stream);
                 crate::raop::event_channel::EventChannel::handle_stream(
                     stream,
                     event_channel_cipher,
@@ -609,6 +610,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             tokio::spawn(async move {
                 if let Ok((stream, addr)) = event_listener.accept().await {
                     tracing::info!(%addr, "Event channel client connected");
+                    crate::net::keepalive(&stream);
                     crate::raop::event_channel::EventChannel::handle_stream(
                         stream,
                         event_channel_cipher,
