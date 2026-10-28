@@ -464,6 +464,9 @@ pub(crate) fn handle_info(
         ),
     );
     dict.insert("pk".into(), plist::Value::String(pk_hex));
+    if let Some(volume) = conn.shared.handler.volume() {
+        dict.insert("initialVolume".into(), plist::Value::Real(volume.into()));
+    }
 
     // Video: advertise a display so the iPhone offers screen mirroring
     #[cfg(feature = "video")]

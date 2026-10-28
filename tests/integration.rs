@@ -28,6 +28,9 @@ impl AudioHandler for TestHandler {
     fn on_volume(&self, volume: f32) {
         self.volumes.lock().unwrap().push(volume);
     }
+    fn volume(&self) -> Option<f32> {
+        self.volumes.lock().unwrap().last().copied()
+    }
     fn on_metadata(&self, metadata: &TrackMetadata) {
         self.metadata.lock().unwrap().push(metadata.clone());
     }
@@ -1117,6 +1120,54 @@ mod ap2_tests {
 
         server.stop().await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn senders_are_told_the_receivers_volume() {
+    let (mut server, port, _) = start_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let get = |cseq: u32| {
+        format!(
+            "GET_PARAMETER rtsp://127.0.0.1/{port} RTSP/1.0\r\nCSeq: {cseq}\r\nContent-Type: text/parameters\r\nContent-Length: 8\r\n\r\nvolume\r\n"
+        )
+    };
+    let resp = send_rtsp(&mut stream, &get(1)).await;
+    assert!(
+        resp.ends_with("volume: 0.000000\r\n"),
+        "no volume yet: {resp}"
+    );
+
+    let body = "volume: -20.000000\r\n";
+    let set = format!(
+        "SET_PARAMETER rtsp://127.0.0.1/{port} RTSP/1.0\r\nCSeq: 2\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    assert!(send_rtsp(&mut stream, &set).await.contains("200 OK"));
+    let resp = send_rtsp(&mut stream, &get(3)).await;
+    assert!(resp.ends_with("volume: -20.000000\r\n"), "{resp}");
+
+    #[cfg(feature = "ap2-core")]
+    {
+        stream
+            .write_all(b"GET /info RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 16384];
+        let n = stream.read(&mut buf).await.unwrap();
+        let start = buf[..n].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let info = plist::Value::from_reader(std::io::Cursor::new(&buf[start..n])).unwrap();
+        let v = info
+            .as_dictionary()
+            .unwrap()
+            .get("initialVolume")
+            .and_then(|v| v.as_real());
+        assert_eq!(v, Some(-20.0));
+    }
+
+    server.stop().await;
 }
 
 #[tokio::test]

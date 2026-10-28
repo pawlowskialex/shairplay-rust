@@ -426,7 +426,7 @@ pub(crate) fn handle_record(
 
 /// RTSP GET_PARAMETER: return volume or other parameters.
 pub(crate) fn handle_get_parameter(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
@@ -439,7 +439,8 @@ pub(crate) fn handle_get_parameter(
     let text = std::str::from_utf8(data).ok()?;
     if text.contains("volume") {
         response.add_header("Content-Type", "text/parameters");
-        return Some(b"volume: 0.000000\r\n".to_vec());
+        let volume = conn.shared.handler.volume().unwrap_or(0.0);
+        return Some(format!("volume: {volume:.6}\r\n").into_bytes());
     }
     None
 }
