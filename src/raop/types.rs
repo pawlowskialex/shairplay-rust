@@ -141,7 +141,7 @@ pub trait AudioHandler: Send + Sync + 'static {
     fn on_coverart(&self, _coverart: &[u8]) {}
     /// Playback progress (start, current, end in RTP timestamps at 44100 Hz).
     fn on_progress(&self, _start: u32, _current: u32, _end: u32) {}
-    /// A remote control interface is available (AP1 DACP).
+    /// A remote control interface is available: AP1 DACP, AP2 commands on the session's event channel.
     fn on_remote_control(&self, _remote: Arc<dyn RemoteControl>) {}
 
     // --- Connection lifecycle ---

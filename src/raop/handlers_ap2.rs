@@ -552,16 +552,7 @@ fn build_update_info_message(requires_pin_pairing: bool, already_paired: bool) -
         plist::Value::String(config::AP2_PROTOVERS.into()),
     );
     update_info.insert("value".into(), plist::Value::Dictionary(value));
-
-    let mut body = Vec::new();
-    plist::to_writer_binary(&mut body, &update_info).ok()?;
-    let rtsp = format!(
-        "POST /command RTSP/1.0\r\nContent-Length: {}\r\nContent-Type: application/x-apple-binary-plist\r\nCSeq: 0\r\n\r\n",
-        body.len()
-    );
-    let mut msg = rtsp.into_bytes();
-    msg.extend_from_slice(&body);
-    Some(msg)
+    crate::raop::event_channel::command_message(&update_info, 0)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -839,6 +830,16 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             }
 
             let sender = crate::raop::event_channel::EventSender::from_tx(tx);
+            // the session's remote control: commands go back on this channel (not on a remote-control-only
+            // connection's: senders drop them there)
+            let group = dict
+                .get("groupUUID")
+                .and_then(|v| v.as_string())
+                .map(str::to_string);
+            tracing::debug!(?group, "AP2 remote control on the event channel");
+            conn.shared.handler.on_remote_control(std::sync::Arc::new(
+                crate::raop::Ap2RemoteControl::new(sender.clone(), group),
+            ));
             tokio::spawn(async move {
                 if let Ok((stream, addr)) = event_listener.accept().await {
                     tracing::info!(%addr, "Event channel client connected");
