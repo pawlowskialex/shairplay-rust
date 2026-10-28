@@ -53,6 +53,9 @@ pub(crate) struct RaopConnection {
         Option<tokio::sync::mpsc::UnboundedSender<crate::raop::buffered_audio::PlayoutCommand>>,
     #[cfg(feature = "ap2-core")]
     pub(crate) event_sender: Option<crate::raop::event_channel::EventSender>,
+    #[cfg(feature = "ap2-core")]
+    pub(crate) realtime_cmd:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::raop::realtime_audio::RealtimeCommand>>,
     #[cfg(feature = "video")]
     pub(crate) ekey: Option<[u8; 16]>,
     #[cfg(feature = "video")]

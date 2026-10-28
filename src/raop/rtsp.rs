@@ -357,6 +357,17 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
 
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
+    // AirPlay 2 realtime: RTP-Info `seq=N;rtptime=T` (a Mac's: 0.3 s after each stream's SETUP, at its first frame)
+    #[cfg(feature = "ap2-core")]
+    if let Some(tx) = &conn.realtime_cmd {
+        let before = request.header("RTP-Info").and_then(|i| {
+            i.split(';')
+                .find_map(|p| p.trim().strip_prefix("rtptime="))
+                .and_then(|t| t.parse::<u32>().ok())
+        });
+        let _ = tx.send(crate::raop::realtime_audio::RealtimeCommand::Flush { before });
+        return;
+    }
     if let Some(rtp_info) = request.header("RTP-Info")
         && let Some(seq_str) = rtp_info.strip_prefix("seq=")
         && let Ok(next_seq) = seq_str.parse::<i32>()
