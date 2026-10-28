@@ -139,6 +139,9 @@ struct PlayoutState {
     epoch: u64,
     /// The session's queue must go (a pause, an immediate flush): its frames would play late or not at all.
     flush_session: bool,
+    /// The last frame given to the session (its sequence number): a deferred flush from before it covers frames the
+    /// session already holds.
+    delivered: Option<u32>,
 }
 
 impl PlayoutState {
@@ -155,6 +158,7 @@ impl PlayoutState {
             stopped: false,
             epoch: 0,
             flush_session: false,
+            delivered: None,
         }
     }
 
@@ -326,6 +330,13 @@ impl BufferedAudioProcessor {
                             s.playing = false;
                             s.anchor = None;
                             s.timing = None;
+                            s.flush_session = true;
+                        } else if let (Some(from), Some(d)) = (f.from, s.delivered)
+                            && seq_diff(d, from) >= 0
+                        {
+                            // deferred, from a frame the session already has (it holds the last TIMED_LEAD_NS): what
+                            // it holds goes too, else the old position's last half second played before the new one
+                            // (a seek by Music) [HW 2026-10-28]
                             s.flush_session = true;
                         }
                         info!(from = ?f.from, until = f.until, dropped, queued = s.queue.len(), "Flushed");
@@ -743,6 +754,7 @@ fn delivery_loop(
             };
 
         let mut progress = !to_submit.is_empty() || !ready.is_empty();
+        let mut delivered = None;
         if let Some(st) = stream.as_mut() {
             for f in to_submit {
                 let tag = next_tag;
@@ -792,6 +804,7 @@ fn delivery_loop(
                 continue;
             }
             decoded += 1;
+            delivered = Some(e.seq);
             if let (Decoding::Done(Some(pcm)), Some(sess)) = (e.pcm, session.as_mut()) {
                 deliver(pcm, e.ts, sess);
             }
@@ -803,9 +816,13 @@ fn delivery_loop(
             let pcm = stream.as_mut().and_then(|st| st.decode(&f.data));
             decode_ns += now_ns().saturating_sub(t);
             decoded += 1;
+            delivered = Some(f.seq);
             if let (Some(pcm), Some(sess)) = (pcm, session.as_mut()) {
                 deliver(pcm, f.ts, sess);
             }
+        }
+        if delivered.is_some() {
+            lock.lock().unwrap().delivered = delivered;
         }
 
         if !progress {
