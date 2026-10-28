@@ -86,6 +86,6 @@ pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 #[cfg(feature = "ap2-core")]
 pub use raop::{AirPlayMode, MemoryPairingStore, PairingStore};
 pub use raop::{
-    Ap1Codec, Ap1Encryption, AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer,
-    RaopServerBuilder, RemoteCommand, RemoteControl, SampleFormat, TrackMetadata,
+    Ap1Codec, Ap1Encryption, AudioCodec, AudioFormat, AudioHandler, AudioSession, DeviceIdentity,
+    RaopServer, RaopServerBuilder, RemoteCommand, RemoteControl, SampleFormat, TrackMetadata,
 };
