@@ -369,6 +369,7 @@ pub(crate) fn handle_setup(
         timing,
         "SETUP plist"
     );
+    tracing::debug!(plist = plist_brief(&plist_val), "SETUP");
 
     let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
         setup_streams(conn, streams)?
@@ -377,6 +378,41 @@ pub(crate) fn handle_setup(
     };
 
     response.set_plist_body(&resp_dict)
+}
+
+#[cfg(feature = "ap2-core")]
+/// A plist integer as its 64 bits: Apple's plists carry unsigned 64-bit values (a fraction of a second, a clock
+/// identity) as signed integers when the top bit is set.
+pub(crate) fn plist_u64(v: &plist::Value) -> Option<u64> {
+    v.as_unsigned_integer()
+        .or_else(|| v.as_signed_integer().map(|i| i as u64))
+}
+
+#[cfg(feature = "ap2-core")]
+/// A plist in one line for the debug log: data as its length (keys and secrets never appear), long arrays cut.
+pub(crate) fn plist_brief(v: &plist::Value) -> String {
+    match v {
+        plist::Value::Dictionary(d) => format!(
+            "{{{}}}",
+            d.iter()
+                .map(|(k, v)| format!("{k}: {}", plist_brief(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        plist::Value::Array(a) => {
+            let mut items: Vec<String> = a.iter().take(8).map(plist_brief).collect();
+            if a.len() > 8 {
+                items.push(format!("... {} more", a.len() - 8));
+            }
+            format!("[{}]", items.join(", "))
+        }
+        plist::Value::Data(d) => format!("<{} bytes>", d.len()),
+        plist::Value::String(s) => format!("{s:?}"),
+        plist::Value::Integer(i) => i.to_string(),
+        plist::Value::Real(r) => r.to_string(),
+        plist::Value::Boolean(b) => b.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 #[cfg(feature = "ap2-core")]
@@ -950,14 +986,6 @@ pub(crate) fn handle_record(
 }
 
 #[cfg(feature = "ap2-core")]
-/// A plist integer as its 64 bits: Apple's plists carry unsigned 64-bit values (a fraction of a second, a clock
-/// identity) as signed integers when the top bit is set.
-pub(crate) fn plist_u64(v: &plist::Value) -> Option<u64> {
-    v.as_unsigned_integer()
-        .or_else(|| v.as_signed_integer().map(|i| i as u64))
-}
-
-#[cfg(feature = "ap2-core")]
 /// AP2 SETRATEANCHORTI: set PTP anchor for timed playout.
 pub(crate) fn handle_set_rate_anchor_time(
     conn: &mut RaopConnection,
@@ -967,6 +995,7 @@ pub(crate) fn handle_set_rate_anchor_time(
     let data = request.data()?;
     let plist_val: plist::Value = plist::from_bytes(data).ok()?;
     let dict = plist_val.as_dictionary()?;
+    tracing::debug!(plist = plist_brief(&plist_val), "SETRATEANCHORTIME");
 
     let rate = dict.get("rate").and_then(plist_u64).unwrap_or(0) as u32;
     let rtp_time = dict.get("rtpTime").and_then(plist_u64).unwrap_or(0) as u32;
@@ -1021,6 +1050,10 @@ pub(crate) fn handle_set_peers(
     {
         let peers: Vec<&str> = arr.iter().filter_map(|v| v.as_string()).collect();
         tracing::debug!(?peers, "SETPEERS");
+    } else if let Some(data) = request.data()
+        && let Ok(v) = plist::from_bytes::<plist::Value>(data)
+    {
+        tracing::debug!(plist = plist_brief(&v), "SETPEERSX");
     }
     None
 }
@@ -1036,15 +1069,11 @@ pub(crate) fn handle_flush_buffered(
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
     {
         let dict = plist_val.as_dictionary();
-        let from_seq = dict
-            .and_then(|d| d.get("flushFromSeq"))
-            .and_then(|v| v.as_unsigned_integer())
-            .unwrap_or(0) as u32;
-        let until_seq = dict
-            .and_then(|d| d.get("flushUntilSeq"))
-            .and_then(|v| v.as_unsigned_integer())
-            .unwrap_or(0) as u32;
-        tracing::debug!(from_seq, until_seq, "FLUSHBUFFERED");
+        let get = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist_u64);
+        // flushFromSeq absent: an immediate flush
+        let from_seq = get("flushFromSeq").map(|v| v as u32);
+        let until_seq = get("flushUntilSeq").unwrap_or(0) as u32;
+        tracing::debug!(plist = plist_brief(&plist_val), "FLUSHBUFFERED");
         if let Some(cmd) = &conn.playout_cmd {
             let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush {
                 from_seq,

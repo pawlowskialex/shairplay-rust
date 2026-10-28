@@ -12,7 +12,7 @@
 //! - **Command handler** (tokio): processes SetRate/Flush/Stop from RTSP thread
 //! - **Delivery** (std::thread): timed playout using anchor-based scheduling; decodes and delivers
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -62,34 +62,159 @@ pub enum PlayoutCommand {
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
-    /// Flush buffered frames in the given RTP timestamp range.
+    /// FLUSHBUFFERED: drop frames by sequence number (23 bits). Without `from_seq` an immediate flush: everything
+    /// before `until_seq`, and playing stops until the next anchor; with it a deferred one: the frames from
+    /// `from_seq` up to (not including) `until_seq`, wherever playout is (a skip while the sender is ahead).
     Flush {
-        /// First timestamp to flush.
-        from_seq: u32,
-        /// Last timestamp to flush.
+        /// First sequence number to drop (deferred flush), or none (immediate).
+        from_seq: Option<u32>,
+        /// The first sequence number that stays.
         until_seq: u32,
     },
     /// Stop playback and tear down.
     Stop,
 }
 
+/// Buffered packets' sequence numbers: 23 bits (the RTP header's marker bit is always set; with the 7 bits after it
+/// and the next two bytes they count the packets).
+const SEQ_MASK: u32 = 0x7F_FFFF;
+
+/// `a - b` modulo 2^23, as a signed distance.
+fn seq_diff(a: u32, b: u32) -> i32 {
+    let d = a.wrapping_sub(b) & SEQ_MASK;
+    if d & 0x40_0000 != 0 {
+        d as i32 - (SEQ_MASK as i32 + 1)
+    } else {
+        d as i32
+    }
+}
+
+/// One compressed frame, in the order the sender sent it.
+struct Frame {
+    seq: u32,
+    ts: u32,
+    ssrc: AudioSsrc,
+    data: Vec<u8>,
+}
+
+/// A flush still to apply to frames that have not arrived yet.
+#[derive(Clone, Copy, Debug)]
+struct PendingFlush {
+    from: Option<u32>,
+    until: u32,
+}
+
+impl PendingFlush {
+    fn drops(&self, seq: u32) -> bool {
+        seq_diff(seq, self.until) < 0 && self.from.is_none_or(|f| seq_diff(seq, f) >= 0)
+    }
+}
+
+/// Where frames go on the local clock.
+#[derive(Clone, Copy, Debug)]
+enum Timing {
+    /// On the network timeline: frame `rtp` plays at network time `net_ns` of PTP clock `clock`.
+    Network { clock: u64, net_ns: u64, rtp: u32 },
+    /// No followed clock (yet): frame `rtp` plays at local time `local_ns`.
+    Local { local_ns: u64, rtp: u32 },
+}
+
 struct PlayoutState {
-    buffer: BTreeMap<u32, (AudioSsrc, Vec<u8>)>, // rtp_timestamp → decrypted (compressed) AAC frame
-    anchor_rtp: u32,
-    anchor_local_ns: u64,
-    /// On the network timeline: the followed clock, the anchor's network time and RTP time (the sender's); frames
-    /// then go out [`TIMED_LEAD_NS`] ahead with the local time they should play (`audio_process_timed_s16`), once
-    /// the clock is followed (`timed_anchored`: the delivery schedule moved onto the timeline).
-    timed: Option<(u64, u64, u32)>,
-    timed_anchored: bool,
-    rate: u32,
+    /// Compressed frames in arrival order (the sender's sequence order: one TCP stream).
+    queue: VecDeque<Frame>,
+    queued_bytes: usize,
+    flushes: Vec<PendingFlush>,
+    /// Flushes since the delivery thread last looked: it drops the same frames from what it decoded ahead.
+    recent_flushes: Vec<PendingFlush>,
+    /// Playing (rate 1) and the anchor's network time and clock: what SETRATEANCHORTIME said.
+    playing: bool,
+    anchor: Option<(u64, u64, u32)>, // (clock, network ns, rtp)
+    /// How the delivery thread times frames now (set from `anchor` once the clock is followed).
+    timing: Option<Timing>,
     /// The RTP clock: the stream's sample rate (timestamps count source frames).
     sample_rate: u32,
     stopped: bool,
-    /// Counts flushes and re-anchors; `flushed` holds the timestamp ranges flushed since the delivery thread
-    /// last looked, so it can drop the same frames from what it decoded ahead.
+    /// Counts flushes, pauses and re-anchors: the delivery thread then drops what it decoded ahead and may not
+    /// play any more.
     epoch: u64,
-    flushed: Vec<(u32, u32)>,
+    /// The session's queue must go (a pause, an immediate flush): its frames would play late or not at all.
+    flush_session: bool,
+}
+
+impl PlayoutState {
+    fn new() -> Self {
+        PlayoutState {
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            flushes: Vec::new(),
+            recent_flushes: Vec::new(),
+            playing: false,
+            anchor: None,
+            timing: None,
+            sample_rate: 44100,
+            stopped: false,
+            epoch: 0,
+            flush_session: false,
+        }
+    }
+
+    /// Drop the queued frames a flush covers.
+    fn apply_flush(&mut self, f: PendingFlush) -> usize {
+        let before = self.queue.len();
+        self.queue.retain(|fr| !f.drops(fr.seq));
+        self.queued_bytes = self.queue.iter().map(|fr| fr.data.len()).sum();
+        before - self.queue.len()
+    }
+
+    /// A frame from the sender: queued unless a pending flush covers it. A flush is done once a frame at or after its
+    /// end has arrived (TCP keeps the order).
+    fn arrive(&mut self, frame: Frame) {
+        let seq = frame.seq;
+        let dropped = self.flushes.iter().any(|f| f.drops(seq));
+        self.flushes.retain(|f| seq_diff(seq, f.until) < 0);
+        if dropped {
+            return;
+        }
+        self.queued_bytes += frame.data.len();
+        self.queue.push_back(frame);
+        // a sender that sends further ahead than it was told it may: the oldest go (bounded memory)
+        while self.queued_bytes > MAX_QUEUED_BYTES {
+            let Some(old) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued_bytes -= old.data.len();
+        }
+    }
+
+    /// The anchor onto the local clock, if its PTP clock is followed.
+    fn time_anchor(&mut self) -> bool {
+        let Some((clock, net_ns, rtp)) = self.anchor else {
+            return false;
+        };
+        if !crate::net::ptp::follower().locked(clock) {
+            return false;
+        }
+        self.timing = Some(Timing::Network { clock, net_ns, rtp });
+        true
+    }
+}
+
+/// Local time (`now_ns`'s clock) at which frame `ts` should play, by `timing`.
+fn play_time(timing: Timing, ts: u32, sample_rate: u32) -> Option<u64> {
+    let rate = i128::from(sample_rate.max(1));
+    match timing {
+        Timing::Network { clock, net_ns, rtp } => {
+            let frames = i128::from(ts.wrapping_sub(rtp) as i32);
+            let net = i128::from(net_ns)
+                + i128::from(buffered_offset_ns())
+                + frames * 1_000_000_000 / rate;
+            crate::net::ptp::follower().to_local(clock, net.max(0) as u64)
+        }
+        Timing::Local { local_ns, rtp } => {
+            let frames = i128::from(ts.wrapping_sub(rtp) as i32);
+            Some((i128::from(local_ns) + frames * 1_000_000_000 / rate).max(0) as u64)
+        }
+    }
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -107,21 +232,7 @@ impl BufferedAudioProcessor {
         handler: Arc<dyn AudioHandler>,
     ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = Arc::new((
-            Mutex::new(PlayoutState {
-                buffer: BTreeMap::new(),
-                anchor_rtp: 0,
-                anchor_local_ns: 0,
-                timed: None,
-                timed_anchored: false,
-                rate: 0,
-                sample_rate: 44100,
-                stopped: false,
-                epoch: 0,
-                flushed: Vec::new(),
-            }),
-            Condvar::new(),
-        ));
+        let state = Arc::new((Mutex::new(PlayoutState::new()), Condvar::new()));
 
         // Delivery thread
         let state2 = state.clone();
@@ -145,71 +256,47 @@ impl BufferedAudioProcessor {
                         timeline,
                         rate,
                     } => {
-                        s.anchor_rtp = anchor_rtp;
                         s.epoch += 1;
-                        let was_paused = s.rate == 0;
-                        s.rate = rate;
-                        let ptp = crate::net::ptp::follower();
-                        let clock = if timeline != 0 {
-                            Some(timeline)
+                        let front = s.queue.front().map(|f| (f.seq, f.ts));
+                        if rate & 1 == 0 {
+                            s.playing = false;
+                            s.flush_session = true;
+                            info!(queued = s.queue.len(), "Playout paused");
                         } else {
-                            ptp.latest()
-                        };
-                        let anchor_local = clock.filter(|_| anchor_time_ns != 0).and_then(|c| {
-                            ptp.to_local(c, anchor_time_ns + buffered_latency_ns())
-                                .map(|t| (c, t))
-                        });
-                        // on the network timeline if the sender gave one: play times once the clock is followed
-                        s.timed = clock
-                            .filter(|_| anchor_time_ns != 0 && rate != 0)
-                            .map(|c| (c, anchor_time_ns, anchor_rtp));
-                        s.timed_anchored = anchor_local.is_some();
-                        if rate == 0 {
-                            info!("Playout paused");
-                        } else if let Some((clock, local)) = anchor_local {
-                            // On the network timeline: frames due TIMED_LEAD_NS before they should play
-                            s.anchor_local_ns = local.saturating_sub(TIMED_LEAD_NS);
-                            let anchor = s.anchor_rtp;
-                            let stale: Vec<u32> = s
-                                .buffer
-                                .keys()
-                                .filter(|&&ts| (anchor.wrapping_sub(ts) as i32) > 0)
-                                .copied()
-                                .collect();
-                            for k in stale {
-                                s.buffer.remove(&k);
-                            }
-                            info!(
-                                clock = format!("{clock:016x}"),
-                                in_ms = (local as i64 - now_ns() as i64) / 1_000_000,
-                                anchor_rtp,
-                                "Playout on the network timeline"
-                            );
-                        } else {
-                            // Set anchor so the earliest buffered frame is deliverable
-                            // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().next() {
-                                let lead_frames = s.sample_rate / 10; // 100ms lead
-                                s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
-                            }
-                            s.anchor_local_ns = now_ns();
-                            let stale: Vec<u32> = s
-                                .buffer
-                                .keys()
-                                .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
-                                .copied()
-                                .collect();
-                            if !stale.is_empty() {
-                                debug!(discarded = stale.len(), "Discarded stale frames");
-                            }
-                            for k in stale {
-                                s.buffer.remove(&k);
-                            }
-                            if was_paused {
+                            s.playing = true;
+                            let ptp = crate::net::ptp::follower();
+                            let clock = if timeline != 0 {
+                                Some(timeline)
+                            } else {
+                                ptp.latest()
+                            };
+                            s.anchor = clock
+                                .filter(|_| anchor_time_ns != 0)
+                                .map(|c| (c, anchor_time_ns, anchor_rtp));
+                            if s.time_anchor() {
+                                let in_ms = s
+                                    .timing
+                                    .and_then(|t| play_time(t, anchor_rtp, s.sample_rate))
+                                    .map_or(0, |t| (t as i64 - now_ns() as i64) / 1_000_000);
+                                info!(
+                                    clock = format!("{:016x}", clock.unwrap_or(0)),
+                                    anchor_in_ms = in_ms,
+                                    anchor_rtp,
+                                    ?front,
+                                    "Playout on the network timeline"
+                                );
+                            } else {
+                                // no followed clock (yet): from the first queued frame, a little ahead
+                                let rtp = front.map_or(anchor_rtp, |f| f.1);
+                                s.timing = Some(Timing::Local {
+                                    local_ns: now_ns() + UNTIMED_START_NS,
+                                    rtp,
+                                });
                                 info!(
                                     anchor_rtp,
-                                    clock_pending = s.timed.is_some(),
-                                    "Playout started"
+                                    clock_pending = s.anchor.is_some(),
+                                    ?front,
+                                    "Playout started on the local clock"
                                 );
                             }
                         }
@@ -219,22 +306,29 @@ impl BufferedAudioProcessor {
                         from_seq,
                         until_seq,
                     } => {
-                        let keys: Vec<u32> = s
-                            .buffer
-                            .keys()
-                            .filter(|&&ts| ts >= from_seq && ts <= until_seq)
-                            .copied()
-                            .collect();
-                        for k in &keys {
-                            s.buffer.remove(k);
-                        }
+                        let f = PendingFlush {
+                            from: from_seq.map(|v| v & SEQ_MASK),
+                            until: until_seq & SEQ_MASK,
+                        };
+                        let dropped = s.apply_flush(f);
+                        // frames still on the way may be covered too
+                        s.flushes.push(f);
+                        s.recent_flushes.push(f);
                         s.epoch += 1;
-                        s.flushed.push((from_seq, until_seq));
-                        debug!(flushed = keys.len(), "Flushed");
+                        if f.from.is_none() {
+                            // immediate: stop until the next anchor (a seek, a new track)
+                            s.playing = false;
+                            s.anchor = None;
+                            s.timing = None;
+                            s.flush_session = true;
+                        }
+                        info!(from = ?f.from, until = f.until, dropped, queued = s.queue.len(), "Flushed");
+                        cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
                         s.stopped = true;
-                        s.buffer.clear();
+                        s.queue.clear();
+                        s.queued_bytes = 0;
                         cvar.notify_all();
                         break;
                     }
@@ -262,7 +356,7 @@ impl BufferedAudioProcessor {
     }
 }
 
-/// TCP receive loop: reads length-prefixed packets, decrypts, buffers the compressed frames.
+/// TCP receive loop: reads length-prefixed packets, decrypts, queues the compressed frames.
 async fn receive_loop(
     mut stream: TcpStream,
     shk: &[u8; 32],
@@ -275,6 +369,7 @@ async fn receive_loop(
     let cipher = ChaCha20Poly1305::new(shk.into());
     let mut len_buf = [0u8; 2];
     let mut current_ssrc = AudioSsrc::None;
+    let mut failed = 0u32;
 
     loop {
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -293,6 +388,7 @@ async fn receive_loop(
             continue;
         }
 
+        let seq = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]) & SEQ_MASK;
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
@@ -310,20 +406,32 @@ async fn receive_loop(
 
         // Decrypt the ChaCha20-Poly1305 RTP frame.
         let Some(plaintext) = decrypt_rtp_chacha(&cipher, &packet) else {
-            debug!("Audio decrypt failed");
+            failed += 1;
+            if failed.is_power_of_two() {
+                warn!(failed, seq, "Buffered audio: frames that don't decrypt");
+            }
             continue;
         };
 
         let (lock, cvar) = &*state;
         let mut s = lock.lock().unwrap();
-        s.buffer.insert(timestamp, (ssrc, plaintext));
+        if s.queue.is_empty() {
+            debug!(seq, timestamp, "first frame into an empty queue");
+        }
+        s.arrive(Frame {
+            seq,
+            ts: timestamp,
+            ssrc,
+            data: plaintext,
+        });
         cvar.notify_all();
     }
     debug!("Buffered audio receive loop ended");
     let (lock, cvar) = &*state;
     if let Ok(mut s) = lock.lock() {
         s.stopped = true;
-        s.buffer.clear();
+        s.queue.clear();
+        s.queued_bytes = 0;
         cvar.notify_all();
     }
 }
@@ -443,6 +551,7 @@ impl Stream {
 
 /// A frame given to an asynchronous decoder ahead of its time.
 struct Ahead {
+    seq: u32,
     ts: u32,
     tag: u32,
     pcm: Decoding,
@@ -460,16 +569,25 @@ enum Decoding {
 /// them: queue, device buffer).
 const TIMED_LEAD_NS: u64 = 500_000_000;
 
-/// A buffered stream's frame plays this long after the network time its anchor gives it: the anchor arrives
-/// stamped "now", and Apple's own receivers play behind it. Measured against macOS Music's "This Computer" in a
-/// group with this receiver: 699.5 ms. SHAIRPLAY_BUFFERED_LATENCY_MS overrides.
-fn buffered_latency_ns() -> u64 {
-    static L: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// Without a followed clock, playout starts this long after the anchor arrived.
+const UNTIMED_START_NS: u64 = 100_000_000;
+
+/// A frame whose time has passed by more than this goes unplayed (a frame of AAC is 23 ms).
+const LATE_NS: u64 = 25_000_000;
+
+/// At most this much compressed audio is held (the sender is told `audioBufferSize`; this bounds one that sends
+/// more).
+const MAX_QUEUED_BYTES: usize = 4 << 20;
+
+/// A fixed offset added to every frame's network time (SHAIRPLAY_BUFFERED_LATENCY_MS, may be negative; default
+/// none): a frame plays at the network time its anchor gives it, as Apple's receivers do.
+fn buffered_offset_ns() -> i64 {
+    static L: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *L.get_or_init(|| {
         std::env::var("SHAIRPLAY_BUFFERED_LATENCY_MS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .map_or(699_500_000, |ms| (ms * 1e6) as u64)
+            .map_or(0, |ms| (ms * 1e6) as i64)
     })
 }
 
@@ -477,9 +595,11 @@ fn buffered_latency_ns() -> u64 {
 const LOOKAHEAD_NS: u64 = 80_000_000;
 const AHEAD_MAX: usize = 6;
 
-/// Timed playout delivery thread. Wakes on condvar, decodes due frames and delivers them to the
-/// AudioSession, which is (re)created when the stream format changes. With an asynchronous decoder
-/// (a coprocessor), frames go to it up to [`LOOKAHEAD_NS`] before they are due and come back in order.
+/// Timed playout delivery thread. Takes frames off the queue in the sender's order as they fall due (on the network
+/// timeline: [`TIMED_LEAD_NS`] before they play, with their play time), decodes and delivers them to the
+/// AudioSession, which is (re)created when the stream format changes. With an asynchronous decoder (a coprocessor),
+/// frames go to it up to [`LOOKAHEAD_NS`] earlier and come back in order. Frames already past their time are
+/// dropped undecoded.
 fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: Arc<dyn AudioHandler>,
@@ -488,69 +608,51 @@ fn delivery_loop(
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
     let mut stream: Option<Stream> = None;
-    let (mut decoded, mut decode_ns) = (0u64, 0u64);
+    let (mut decoded, mut decode_ns, mut late) = (0u64, 0u64, 0u64);
     let mut ahead: VecDeque<Ahead> = VecDeque::new();
     let (mut next_tag, mut epoch, mut asynchronous) = (0u32, 0u64, true);
-    let mut paused = false;
+    let mut late_logged = 0u64;
 
     loop {
         let mut s = lock.lock().unwrap();
 
-        // Paused: what the session still holds stops too (it holds up to TIMED_LEAD_NS ahead, or its prebuffer)
-        if s.rate == 0 && !paused && session.is_some() {
-            paused = true;
+        // A pause or an immediate flush: what the session still holds goes (up to TIMED_LEAD_NS, or its prebuffer)
+        if std::mem::take(&mut s.flush_session) {
             drop(s);
             if let Some(sess) = session.as_mut() {
                 sess.audio_flush();
             }
             continue;
         }
-        while !s.stopped && (s.rate == 0 || (s.buffer.is_empty() && ahead.is_empty())) {
+        while !s.stopped
+            && !s.flush_session
+            && (!s.playing || s.timing.is_none() || (s.queue.is_empty() && ahead.is_empty()))
+        {
             s = cvar.wait(s).unwrap();
         }
-        paused = s.rate == 0;
         if s.stopped {
             break;
         }
-        // the clock followed after playout started: move the delivery schedule onto the network timeline
-        if let Some((clock, net, rtp)) = s.timed
-            && !s.timed_anchored
-            && let Some(local) =
-                crate::net::ptp::follower().to_local(clock, net + buffered_latency_ns())
-        {
-            s.anchor_rtp = rtp;
-            s.anchor_local_ns = local.saturating_sub(TIMED_LEAD_NS);
-            s.timed_anchored = true;
-            info!(
-                clock = format!("{clock:016x}"),
-                "Playout moved onto the network timeline"
-            );
+        if s.flush_session {
+            continue;
+        }
+        // the clock followed after playout started: move onto the network timeline
+        if matches!(s.timing, Some(Timing::Local { .. })) && s.time_anchor() {
+            info!("Playout moved onto the network timeline");
         }
         if s.epoch != epoch {
-            // flushed or re-anchored: drop the same frames from what went ahead (late results are ignored)
+            // flushed: drop the same frames from what went ahead (results that come back late are ignored)
             epoch = s.epoch;
-            let flushed = std::mem::take(&mut s.flushed);
-            if !flushed.is_empty()
-                && let Some(sess) = session.as_mut()
-            {
-                // a flush (seek, skip): the session's queue goes too
-                sess.audio_flush();
-            }
-            let anchor = s.anchor_rtp;
-            let rate = s.rate;
-            ahead.retain(|e| {
-                let in_flush = flushed.iter().any(|&(a, b)| e.ts >= a && e.ts <= b);
-                let behind_anchor = rate != 0 && (anchor.wrapping_sub(e.ts) as i32) > 0;
-                !(in_flush || behind_anchor)
-            });
+            let recent = std::mem::take(&mut s.recent_flushes);
+            ahead.retain(|e| !recent.iter().any(|f| f.drops(e.seq)));
         }
 
         // A new stream format starts with the oldest frame, once everything before it is out.
         if ahead.is_empty()
-            && let Some((_, (ssrc, _))) = s.buffer.iter().next()
-            && stream.as_ref().is_none_or(|st| st.ssrc != *ssrc)
+            && let Some(f) = s.queue.front()
+            && stream.as_ref().is_none_or(|st| st.ssrc != f.ssrc)
         {
-            let ssrc = *ssrc;
+            let ssrc = f.ssrc;
             drop(s);
             let (st, format) = Stream::new(ssrc, &output_config, &handler);
             info!(?format, "Audio session initialized");
@@ -560,69 +662,80 @@ fn delivery_loop(
             continue;
         }
 
+        let Some(timing) = s.timing else { continue };
+        let sr = s.sample_rate;
         let now = now_ns();
-        let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
-        let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
-        let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
-        let is_due = |ts: u32| (target_rtp.wrapping_sub(ts) as i32) >= 0;
-        let lookahead = (LOOKAHEAD_NS as u128 * s.sample_rate as u128 / 1_000_000_000) as i32;
-
-        // Frames for the asynchronous decoder: oldest first, within the lookahead, this stream's.
-        let mut to_submit: Vec<(u32, Vec<u8>)> = Vec::new();
-        if asynchronous && let Some(st) = stream.as_ref() {
-            while ahead.len() + to_submit.len() < AHEAD_MAX {
-                let Some((&ts, (ssrc, _))) = s.buffer.iter().next() else {
-                    break;
-                };
-                if *ssrc != st.ssrc || (ts.wrapping_sub(target_rtp) as i32) > lookahead {
-                    break;
-                }
-                let (_, aac) = s.buffer.remove(&ts).unwrap();
-                to_submit.push((ts, aac));
-            }
-        }
-
-        // Due frames, oldest first: the map is ordered, so stop at the first one not due yet. Around the RTP
-        // timestamp wrap (every ~27 h at 44.1 kHz) the oldest frames sort last: then scan everything. Only
-        // when nothing decoded ahead is older.
-        let mut ready: Vec<(u32, AudioSsrc, Vec<u8>)> = Vec::new();
-        if ahead.is_empty() && to_submit.is_empty() {
-            let mut due: Vec<u32> = s
-                .buffer
-                .keys()
-                .copied()
-                .take_while(|&ts| is_due(ts))
-                .collect();
-            if due.is_empty() && s.buffer.keys().next_back().is_some_and(|&ts| is_due(ts)) {
-                due = s.buffer.keys().copied().filter(|&ts| is_due(ts)).collect();
-            }
-            ready = due
-                .iter()
-                .filter_map(|&ts| s.buffer.remove(&ts).map(|(ssrc, aac)| (ts, ssrc, aac)))
-                .collect();
-        }
-        let next_ts = s.buffer.keys().next().copied();
-        let sample_rate = i64::from(s.sample_rate.max(1));
-        // where each frame belongs on the network timeline, in local time (None: untimed)
-        let (timed, sr_now) = (s.timed.filter(|_| s.timed_anchored), s.sample_rate.max(1));
-        let play_at = move |ts: u32| -> Option<u64> {
-            let (clock, anchor_net, anchor_rtp) = timed?;
-            let frames = ts.wrapping_sub(anchor_rtp) as i32 as i64;
-            let net = anchor_net as i64
-                + buffered_latency_ns() as i64
-                + frames * 1_000_000_000 / sr_now as i64;
-            crate::net::ptp::follower().to_local(clock, net.max(0) as u64)
+        // on the network timeline the session gets frames ahead, with their time; else as they fall due
+        let lead = if matches!(timing, Timing::Network { .. }) {
+            TIMED_LEAD_NS
+        } else {
+            0
         };
+        let due_in = |ts: u32| play_time(timing, ts, sr).map(|t| t as i64 - now as i64);
+        let ssrc = stream.as_ref().map(|st| st.ssrc);
+
+        // frames whose time has passed (a late start, a resume): dropped undecoded
+        if ahead.is_empty() {
+            while let Some(f) = s.queue.front()
+                && due_in(f.ts).is_some_and(|d| d < -(LATE_NS as i64))
+            {
+                let f = s.queue.pop_front().unwrap();
+                s.queued_bytes -= f.data.len();
+                late += 1;
+            }
+        }
+
+        // Frames for the asynchronous decoder: in order, within the lookahead, this stream's.
+        let mut to_submit: Vec<Frame> = Vec::new();
+        if asynchronous && ssrc.is_some() {
+            while ahead.len() + to_submit.len() < AHEAD_MAX
+                && let Some(f) = s.queue.front()
+                && Some(f.ssrc) == ssrc
+                && due_in(f.ts).is_some_and(|d| d <= (lead + LOOKAHEAD_NS) as i64)
+            {
+                let f = s.queue.pop_front().unwrap();
+                s.queued_bytes -= f.data.len();
+                to_submit.push(f);
+            }
+        }
+
+        // Due frames, in order. Only when nothing decoded ahead is older.
+        let mut ready: Vec<Frame> = Vec::new();
+        if ahead.is_empty() && to_submit.is_empty() {
+            while let Some(f) = s.queue.front()
+                && Some(f.ssrc) == ssrc
+                && due_in(f.ts).is_some_and(|d| d <= lead as i64)
+            {
+                let f = s.queue.pop_front().unwrap();
+                s.queued_bytes -= f.data.len();
+                ready.push(f);
+            }
+        }
+        let next_in = s.queue.front().and_then(|f| due_in(f.ts));
         drop(s);
+        if late > late_logged {
+            debug!(late, "Frames past their time dropped");
+            late_logged = late;
+        }
+
+        let deliver =
+            |pcm: crate::codec::Pcm, ts: u32, sess: &mut Box<dyn crate::raop::AudioSession>| {
+                let at = match timing {
+                    Timing::Network { .. } => play_time(timing, ts, sr),
+                    Timing::Local { .. } => None,
+                };
+                pcm.deliver_timed(sess.as_mut(), output_config.format, at);
+            };
 
         let mut progress = !to_submit.is_empty() || !ready.is_empty();
         if let Some(st) = stream.as_mut() {
-            for (ts, aac) in to_submit {
+            for f in to_submit {
                 let tag = next_tag;
                 next_tag = next_tag.wrapping_add(1);
-                if st.submit(tag, &aac) {
+                if st.submit(tag, &f.data) {
                     ahead.push_back(Ahead {
-                        ts,
+                        seq: f.seq,
+                        ts: f.ts,
                         tag,
                         pcm: Decoding::Pending,
                     });
@@ -631,10 +744,11 @@ fn delivery_loop(
                         asynchronous = false; // the decoder never took one: decode when due from now on
                     }
                     let t = now_ns();
-                    let pcm = st.decode(&aac);
+                    let pcm = st.decode(&f.data);
                     decode_ns += now_ns().saturating_sub(t);
                     ahead.push_back(Ahead {
-                        ts,
+                        seq: f.seq,
+                        ts: f.ts,
                         tag,
                         pcm: Decoding::Done(pcm),
                     });
@@ -651,70 +765,67 @@ fn delivery_loop(
                 .count()
                 != before;
         }
-        while ahead
-            .front()
-            .is_some_and(|e| is_due(e.ts) && matches!(e.pcm, Decoding::Done(_)))
+        let now = now_ns();
+        let due_in = |ts: u32| play_time(timing, ts, sr).map(|t| t as i64 - now as i64);
+        while let Some(e) = ahead.front()
+            && matches!(e.pcm, Decoding::Done(_))
+            && due_in(e.ts).is_some_and(|d| d <= lead as i64)
         {
             let e = ahead.pop_front().unwrap();
+            if due_in(e.ts).is_some_and(|d| d < -(LATE_NS as i64)) {
+                late += 1;
+                continue;
+            }
             decoded += 1;
             if let (Decoding::Done(Some(pcm)), Some(sess)) = (e.pcm, session.as_mut()) {
-                pcm.deliver_timed(sess.as_mut(), output_config.format, play_at(e.ts));
+                deliver(pcm, e.ts, sess);
             }
             progress = true;
         }
 
-        for (ts, ssrc, aac) in ready {
-            if stream.as_ref().is_none_or(|st| st.ssrc != ssrc) {
-                let (st, format) = Stream::new(ssrc, &output_config, &handler);
-                info!(?format, "Audio session initialized");
-                session = Some(handler.audio_init(format));
-                stream = Some(st);
-            }
+        for f in ready {
             let t = now_ns();
-            let pcm = stream.as_mut().and_then(|st| st.decode(&aac));
+            let pcm = stream.as_mut().and_then(|st| st.decode(&f.data));
             decode_ns += now_ns().saturating_sub(t);
             decoded += 1;
             if let (Some(pcm), Some(sess)) = (pcm, session.as_mut()) {
-                pcm.deliver_timed(sess.as_mut(), output_config.format, play_at(ts));
+                deliver(pcm, f.ts, sess);
             }
         }
 
         if !progress {
             // Nothing to do: sleep until the next frame is due (or due to go ahead), or a decoder result may be
             // in: at most 20 ms; new data or a command wakes us.
-            let until = |ts: u32, early: i64| {
-                let frames = ts.wrapping_sub(target_rtp) as i32 as i64 - early;
-                (frames.max(0) * 1_000_000_000 / sample_rate) as u64
-            };
-            let mut wait_ns = 20_000_000u64;
+            let mut wait_ns = 20_000_000i64;
             if let Some(e) = ahead.front() {
-                wait_ns = wait_ns.min(if matches!(e.pcm, Decoding::Pending) {
-                    2_000_000
-                } else {
-                    until(e.ts, 0)
+                wait_ns = wait_ns.min(match e.pcm {
+                    Decoding::Pending => 2_000_000,
+                    Decoding::Done(_) => due_in(e.ts).map_or(wait_ns, |d| d - lead as i64),
                 });
             }
-            if let Some(ts) = next_ts {
-                wait_ns = wait_ns.min(until(
-                    ts,
-                    if asynchronous {
-                        i64::from(lookahead)
-                    } else {
-                        0
-                    },
-                ));
+            if let Some(d) = next_in {
+                let early = if asynchronous {
+                    lead + LOOKAHEAD_NS
+                } else {
+                    lead
+                };
+                wait_ns = wait_ns.min(d - early as i64);
             }
             let s = lock.lock().unwrap();
-            if s.epoch == epoch && !s.stopped {
+            if s.epoch == epoch && !s.stopped && !s.flush_session {
                 drop(
-                    cvar.wait_timeout(s, std::time::Duration::from_nanos(wait_ns.max(1_000_000)))
-                        .unwrap(),
+                    cvar.wait_timeout(
+                        s,
+                        std::time::Duration::from_nanos(wait_ns.max(1_000_000) as u64),
+                    )
+                    .unwrap(),
                 );
             }
         }
     }
     info!(
         frames = decoded,
+        late,
         decode_ms = decode_ns / 1_000_000,
         "Delivery loop ended"
     );
@@ -774,26 +885,23 @@ mod decode_ahead_tests {
     }
 
     /// Frames 0..n (one every 1024 samples, playing from now), the delivery loop with `mock`: what came out.
+    /// `flush_at`: k frames in, a deferred flush of frames k+4 .. k+7.
     fn play(n: u8, asynchronous: bool, flush_at: Option<u8>) -> Vec<i16> {
-        let mut buffer = BTreeMap::new();
+        let mut st = PlayoutState::new();
         for k in 0..n {
-            buffer.insert(u32::from(k) * 1024, (AudioSsrc::Aac44100F24Stereo, vec![k]));
+            st.arrive(Frame {
+                seq: u32::from(k),
+                ts: u32::from(k) * 1024,
+                ssrc: AudioSsrc::Aac44100F24Stereo,
+                data: vec![k],
+            });
         }
-        let state = Arc::new((
-            Mutex::new(PlayoutState {
-                buffer,
-                anchor_rtp: 0u32.wrapping_sub(441),
-                anchor_local_ns: now_ns(),
-                timed: None,
-                timed_anchored: false,
-                rate: 1,
-                sample_rate: 44100,
-                stopped: false,
-                epoch: 0,
-                flushed: Vec::new(),
-            }),
-            Condvar::new(),
-        ));
+        st.playing = true;
+        st.timing = Some(Timing::Local {
+            local_ns: now_ns() + 10_000_000,
+            rtp: 0,
+        });
+        let state = Arc::new((Mutex::new(st), Condvar::new()));
         let out = Arc::new(StdMutex::new(Vec::new()));
         let handler: Arc<dyn AudioHandler> = Arc::new(Handler(out.clone()));
         let factory: crate::raop::offload::AacDecoderFactory = Arc::new(move |_, _| {
@@ -815,17 +923,13 @@ mod decode_ahead_tests {
             std::thread::sleep(Duration::from_millis(u64::from(k) * 1024 * 1000 / 44100));
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
-            let keys: Vec<u32> = s
-                .buffer
-                .keys()
-                .copied()
-                .filter(|&ts| ts >= (u32::from(k) + 4) * 1024)
-                .collect();
-            for key in keys.iter().take(3) {
-                s.buffer.remove(key);
-            }
-            let range = (keys[0], keys[2]);
-            s.flushed.push(range);
+            let f = PendingFlush {
+                from: Some(u32::from(k) + 4),
+                until: u32::from(k) + 7,
+            };
+            s.apply_flush(f);
+            s.flushes.push(f);
+            s.recent_flushes.push(f);
             s.epoch += 1;
             cvar.notify_all();
         }
@@ -857,5 +961,76 @@ mod decode_ahead_tests {
         assert!(got.windows(2).all(|w| w[0] < w[1]), "order: {got:?}");
         let want: Vec<i16> = (0..24).filter(|&k| !(10..13).contains(&k)).collect();
         assert_eq!(got, want, "exactly the flushed frames are missing");
+    }
+
+    #[test]
+    fn sequence_numbers_compare_across_the_wrap() {
+        assert_eq!(seq_diff(5, 3), 2);
+        assert_eq!(seq_diff(3, 5), -2);
+        assert_eq!(seq_diff(1, SEQ_MASK), 2);
+        assert_eq!(seq_diff(SEQ_MASK, 1), -2);
+    }
+
+    #[test]
+    fn an_immediate_flush_drops_what_came_before_and_what_is_still_on_the_way() {
+        let mut st = PlayoutState::new();
+        let frame = |seq: u32| Frame {
+            seq,
+            ts: seq * 1024,
+            ssrc: AudioSsrc::Aac44100F24Stereo,
+            data: vec![0; 10],
+        };
+        for k in 100..110 {
+            st.arrive(frame(k));
+        }
+        let f = PendingFlush {
+            from: None,
+            until: 120,
+        };
+        assert_eq!(st.apply_flush(f), 10);
+        st.flushes.push(f);
+        // the rest of the old track, then the new one from 120
+        for k in 110..125 {
+            st.arrive(frame(k));
+        }
+        assert_eq!(
+            st.queue.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            (120..125).collect::<Vec<_>>()
+        );
+        assert!(
+            st.flushes.is_empty(),
+            "done once the first frame after it arrived"
+        );
+        assert_eq!(st.queued_bytes, 50);
+    }
+
+    #[test]
+    fn a_deferred_flush_keeps_both_sides() {
+        let mut st = PlayoutState::new();
+        for k in (SEQ_MASK - 3)..=SEQ_MASK {
+            st.arrive(Frame {
+                seq: k,
+                ts: 0,
+                ssrc: AudioSsrc::Aac44100F24Stereo,
+                data: vec![],
+            });
+        }
+        for k in 0..6 {
+            st.arrive(Frame {
+                seq: k,
+                ts: 0,
+                ssrc: AudioSsrc::Aac44100F24Stereo,
+                data: vec![],
+            });
+        }
+        // across the sequence wrap: SEQ_MASK-1 .. 2 go
+        st.apply_flush(PendingFlush {
+            from: Some(SEQ_MASK - 1),
+            until: 3,
+        });
+        assert_eq!(
+            st.queue.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![SEQ_MASK - 3, SEQ_MASK - 2, 3, 4, 5]
+        );
     }
 }
