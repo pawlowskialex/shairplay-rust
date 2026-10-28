@@ -711,6 +711,8 @@ pub(crate) struct PairVerifyServer {
     client_eph_pk: [u8; 32],
     shared_secret: [u8; 32],
     completed: bool,
+    /// The controller whose signature M3 verified against its stored key
+    controller: Option<String>,
 }
 
 impl PairVerifyServer {
@@ -735,6 +737,7 @@ impl PairVerifyServer {
             client_eph_pk: [0u8; 32],
             shared_secret: [0u8; 32],
             completed: false,
+            controller: None,
         }
     }
 
@@ -842,6 +845,7 @@ impl PairVerifyServer {
             vk.verify(&info, &sig)
                 .map_err(|_| CryptoError::PairingVerify)?;
             tracing::info!("Pair-verify: client signature verified");
+            self.controller = Some(identifier.to_string());
         } else {
             // No key lookup provided → client signature is NOT verified. This is only
             // safe for transient sessions; the shipped server always passes a real
@@ -856,6 +860,11 @@ impl PairVerifyServer {
         let mut resp = TlvValues::new();
         resp.add(TlvType::State as u8, &[4]);
         Ok(resp.encode())
+    }
+
+    /// The paired controller this session verified (none for an unverified one).
+    pub(crate) fn controller(&self) -> Option<&str> {
+        self.controller.as_deref().filter(|_| self.completed)
     }
 
     /// Returns the shared secret derived during pair-verify (for HKDF key derivation).

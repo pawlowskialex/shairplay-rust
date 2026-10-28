@@ -185,6 +185,26 @@ pub trait PairingStore: Send + Sync + 'static {
         false
     }
 
+    /// Save a controller with its permission (HAP: a controller paired by pair-setup is an admin; one added by an
+    /// admin through `/pairings` may not be). `false`: the store has no room (`/pairings` answers MaxPeers). The
+    /// default ignores the permission and always has room.
+    fn put_controller(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
+        let _ = admin;
+        self.put(device_id, public_key);
+        true
+    }
+
+    /// Whether a paired controller may manage pairings. The default: every paired controller is an admin.
+    fn is_admin(&self, device_id: &str) -> bool {
+        self.get(device_id).is_some()
+    }
+
+    /// Every paired controller: (identifier, public key, admin), for `/pairings`' ListPairings. The default lists
+    /// none (listing then answers with no controllers).
+    fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+        Vec::new()
+    }
+
     /// Load the accessory's persistent Ed25519 **identity** seed, if one was saved.
     ///
     /// This is the server's *own* long-term secret (distinct from the paired peer
@@ -211,18 +231,37 @@ pub trait PairingStore: Send + Sync + 'static {
 #[cfg(feature = "ap2-core")]
 #[derive(Default)]
 pub struct MemoryPairingStore {
-    keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    keys: std::sync::Mutex<std::collections::HashMap<String, ([u8; 32], bool)>>,
 }
 
 #[cfg(feature = "ap2-core")]
 impl PairingStore for MemoryPairingStore {
     fn get(&self, device_id: &str) -> Option<[u8; 32]> {
-        self.keys.lock().ok()?.get(device_id).copied()
+        self.keys.lock().ok()?.get(device_id).map(|k| k.0)
     }
     fn put(&self, device_id: &str, public_key: [u8; 32]) {
+        self.put_controller(device_id, public_key, true);
+    }
+    fn put_controller(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
         if let Ok(mut keys) = self.keys.lock() {
-            keys.insert(device_id.to_string(), public_key);
+            keys.insert(device_id.to_string(), (public_key, admin));
         }
+        true
+    }
+    fn is_admin(&self, device_id: &str) -> bool {
+        self.keys
+            .lock()
+            .is_ok_and(|k| k.get(device_id).is_some_and(|k| k.1))
+    }
+    fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+        self.keys
+            .lock()
+            .map(|k| {
+                k.iter()
+                    .map(|(id, (pk, a))| (id.clone(), *pk, *a))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     fn has_any_pairing(&self) -> bool {
         self.keys.lock().map(|k| !k.is_empty()).unwrap_or(false)

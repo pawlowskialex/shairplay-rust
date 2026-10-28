@@ -70,6 +70,9 @@ pub(crate) struct RaopShared {
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
     /// The connection whose sender has the audio now: (connection id, sender, its close signal).
     pub(crate) stream_owner: std::sync::Mutex<Option<(u64, String, Arc<tokio::sync::Notify>)>>,
+    /// Connections verified as a paired controller: (connection id, controller, its close signal), so removing a
+    /// pairing can close that controller's sessions
+    pub(crate) verified: std::sync::Mutex<Vec<(u64, String, Arc<tokio::sync::Notify>)>>,
 }
 
 impl RaopShared {
@@ -91,12 +94,34 @@ impl RaopShared {
         *owner = Some((id, sender.to_string(), close.clone()));
     }
 
+    /// Connection `id` was verified as `controller`.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn verified_as(&self, id: u64, controller: &str, close: &Arc<tokio::sync::Notify>) {
+        if let Ok(mut v) = self.verified.lock() {
+            v.retain(|e| e.0 != id);
+            v.push((id, controller.to_string(), close.clone()));
+        }
+    }
+
+    /// Close every connection verified as `controller` (its pairing was removed).
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn close_controller(&self, controller: &str) {
+        if let Ok(v) = self.verified.lock() {
+            for (_, _, close) in v.iter().filter(|e| e.1 == controller) {
+                close.notify_one();
+            }
+        }
+    }
+
     /// Connection `id` ends: it no longer has the audio.
     pub(crate) fn release_stream(&self, id: u64) {
         if let Ok(mut owner) = self.stream_owner.lock()
             && owner.as_ref().is_some_and(|o| o.0 == id)
         {
             *owner = None;
+        }
+        if let Ok(mut v) = self.verified.lock() {
+            v.retain(|e| e.0 != id);
         }
     }
 }
@@ -143,6 +168,8 @@ fn new_raop_connection(
         },
         close: Arc::new(tokio::sync::Notify::new()),
         sender_id: remote.ip().to_string(),
+        #[cfg(feature = "ap2-core")]
+        controller: None,
         nonce: digest::generate_nonce(MAX_NONCE_LEN),
         #[cfg(feature = "ap2-core")]
         srp_server: None,
