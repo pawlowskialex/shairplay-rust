@@ -15,6 +15,7 @@ use tracing::debug;
 const DACP_DEFAULT_PORT: u16 = 3689;
 
 const PLAY_PATH: &str = "/ctrl-int/1/play";
+const PLAY_PAUSE_PATH: &str = "/ctrl-int/1/playpause";
 const PAUSE_PATH: &str = "/ctrl-int/1/pause";
 const NEXT_PATH: &str = "/ctrl-int/1/nextitem";
 const PREVIOUS_PATH: &str = "/ctrl-int/1/previtem";
@@ -139,6 +140,10 @@ impl DacpClient {
 
     pub(crate) fn pause_blocking(&self) -> Result<(), NetworkError> {
         self.command_blocking(PAUSE_PATH)
+    }
+
+    pub(crate) fn play_pause_blocking(&self) -> Result<(), NetworkError> {
+        self.command_blocking(PLAY_PAUSE_PATH)
     }
 
     pub(crate) fn next_blocking(&self) -> Result<(), NetworkError> {
