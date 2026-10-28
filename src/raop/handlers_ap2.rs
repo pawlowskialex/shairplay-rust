@@ -443,8 +443,14 @@ pub(crate) fn handle_info(
     );
     dict.insert(
         "model".into(),
-        plist::Value::String(config::GLOBAL_MODEL.into()),
+        plist::Value::String(conn.shared.identity.model.clone()),
     );
+    if let Some(m) = &conn.shared.identity.manufacturer {
+        dict.insert("manufacturer".into(), plist::Value::String(m.clone()));
+    }
+    if let Some(sn) = &conn.shared.identity.serial_number {
+        dict.insert("serialNumber".into(), plist::Value::String(sn.clone()));
+    }
     dict.insert(
         "protocolVersion".into(),
         plist::Value::String(config::AP2_PROTOVERS.into()),
@@ -533,7 +539,11 @@ pub(crate) fn handle_pair_pin_start(
 /// Build the `updateInfo` `POST /command` message queued on a freshly-opened
 /// event channel (status flags, features, model, versions). Identical for the
 /// RC-only and normal event channels.
-fn build_update_info_message(requires_pin_pairing: bool, already_paired: bool) -> Option<Vec<u8>> {
+fn build_update_info_message(
+    requires_pin_pairing: bool,
+    already_paired: bool,
+    model: &str,
+) -> Option<Vec<u8>> {
     use crate::raop::config;
 
     let mut update_info = plist::Dictionary::new();
@@ -552,10 +562,7 @@ fn build_update_info_message(requires_pin_pairing: bool, already_paired: bool) -
                 .into(),
         ),
     );
-    value.insert(
-        "model".into(),
-        plist::Value::String(config::GLOBAL_MODEL.into()),
-    );
+    value.insert("model".into(), plist::Value::String(model.into()));
     value.insert(
         "sourceVersion".into(),
         plist::Value::String(config::AP2_SRCVERS.into()),
@@ -784,6 +791,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                     if let Some(msg) = build_update_info_message(
                         conn.shared.pin.is_some(),
                         conn.shared.pairing_store.has_any_pairing(),
+                        &conn.shared.identity.model,
                     ) {
                         let _ = tx.send(msg);
                         tracing::debug!("updateInfo queued for RC event channel");
@@ -837,6 +845,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             if let Some(msg) = build_update_info_message(
                 conn.shared.pin.is_some(),
                 conn.shared.pairing_store.has_any_pairing(),
+                &conn.shared.identity.model,
             ) {
                 let _ = tx.send(msg);
                 tracing::debug!("updateInfo queued for event channel");
