@@ -171,6 +171,7 @@ pub(crate) async fn spawn_ptp_sink() {
         match bind {
             Ok(sock) => {
                 bound += 1;
+                let sock = Arc::new(sock);
                 let seen = seen.clone();
                 let samples = samples.clone();
                 #[cfg(all(target_os = "linux", feature = "ptp-timestamps"))]
@@ -181,6 +182,9 @@ pub(crate) async fn spawn_ptp_sink() {
                 ) {
                     tracing::warn!(port, "PTP: no kernel receive timestamps: {e}");
                 }
+                if port == 319 {
+                    tokio::spawn(request_delays(sock.clone(), samples.clone()));
+                }
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     loop {
@@ -188,7 +192,12 @@ pub(crate) async fn spawn_ptp_sink() {
                             Ok((n, from, kernel_ns)) => {
                                 let user_ns = now_ns();
                                 log_ptp_packet(port, from, &buf[..n], &seen);
-                                samples.packet(&buf[..n], kernel_ns.unwrap_or(user_ns), user_ns);
+                                samples.packet(
+                                    &buf[..n],
+                                    from,
+                                    kernel_ns.unwrap_or(user_ns),
+                                    user_ns,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(port, "PTP sink recv error: {e}");
@@ -282,6 +291,13 @@ struct SyncSamples {
     syncs: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64, u64)>>,
     follow_ups: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64)>>,
     log: Option<std::sync::Mutex<std::fs::File>>,
+    /// The master heard last: its clock, where its Syncs come from, when (local ns), their first byte (the
+    /// profile's transportSpecific nibble, mirrored in our Delay_Req).
+    master: std::sync::Mutex<Option<(u64, std::net::SocketAddr, u64, u8)>>,
+    /// Delay_Reqs sent: (sequence, local send time, the master's clock)
+    requests: std::sync::Mutex<std::collections::VecDeque<(u16, u64, u64)>>,
+    /// Our port identity in Delay_Reqs (random per start)
+    identity: [u8; 8],
 }
 
 impl SyncSamples {
@@ -299,21 +315,30 @@ impl SyncSamples {
         if log.is_some() {
             tracing::info!("PTP: logging Sync / Follow_Up samples");
         }
+        let seed = now_ns() ^ (u64::from(std::process::id()) << 32);
         SyncSamples {
             syncs: std::sync::Mutex::default(),
             follow_ups: std::sync::Mutex::default(),
             log: log.map(std::sync::Mutex::new),
+            master: std::sync::Mutex::default(),
+            requests: std::sync::Mutex::default(),
+            identity: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(),
         }
     }
 
-    fn packet(&self, buf: &[u8], local_ns: u64, user_ns: u64) {
+    fn packet(&self, buf: &[u8], from: std::net::SocketAddr, local_ns: u64, user_ns: u64) {
         if buf.len() < 34 {
             return;
         }
         let clock_id = u64::from_be_bytes(buf[20..28].try_into().unwrap());
         let seq = u16::from_be_bytes([buf[30], buf[31]]);
         let sample = match buf[0] & 0x0f {
+            9 => {
+                self.delay_resp(buf, local_ns, user_ns);
+                None
+            }
             0 => {
+                *self.master.lock().unwrap() = Some((clock_id, from, user_ns, buf[0] & 0xf0));
                 let fu = {
                     let mut f = self.follow_ups.lock().unwrap();
                     f.iter()
@@ -365,6 +390,76 @@ impl SyncSamples {
                     "{clock_id:016x},{seq},{master},{local},{user}"
                 );
             }
+        }
+    }
+}
+
+impl SyncSamples {
+    /// A Delay_Req for the master heard in the last 2 s, if any: (the datagram, where to), recorded as sent now.
+    fn delay_req(&self) -> Option<(Vec<u8>, std::net::SocketAddr)> {
+        let (clock, from, seen, ts) = (*self.master.lock().unwrap())?;
+        let now = now_ns();
+        if now.saturating_sub(seen) > 2_000_000_000 {
+            return None;
+        }
+        let mut req = self.requests.lock().unwrap();
+        let seq = req.back().map_or(1, |r| r.0.wrapping_add(1));
+        let mut m = vec![0u8; 44];
+        m[0] = ts | 1; // Delay_Req, the master's transportSpecific (Apple's profile: 1)
+        m[1] = 2; // PTP version 2
+        m[2..4].copy_from_slice(&44u16.to_be_bytes());
+        m[20..28].copy_from_slice(&self.identity);
+        m[28..30].copy_from_slice(&1u16.to_be_bytes());
+        m[30..32].copy_from_slice(&seq.to_be_bytes());
+        m[32] = 1; // controlField: Delay_Req
+        m[33] = 0x7f;
+        req.push_back((seq, now, clock));
+        while req.len() > 8 {
+            req.pop_front();
+        }
+        Some((m, std::net::SocketAddr::new(from.ip(), 319)))
+    }
+
+    /// A Delay_Resp to one of our Delay_Reqs: the round trip on our clock (send to the kernel's receive time). The
+    /// master's own receiveTimestamp isn't used: a Mac's isn't on its Sync timescale (it saws by ~20 ms a second).
+    fn delay_resp(&self, buf: &[u8], local_ns: u64, user_ns: u64) {
+        if buf.len() < 54 || buf[44..52] != self.identity {
+            return;
+        }
+        let seq = u16::from_be_bytes([buf[30], buf[31]]);
+        let Some((_, sent, clock)) = self
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.0 == seq)
+            .copied()
+        else {
+            return;
+        };
+        follower().round_trip(clock, local_ns.saturating_sub(sent));
+        if let Some(log) = &self.log {
+            use std::io::Write;
+            let _ = writeln!(
+                log.lock().unwrap(),
+                "{clock:016x},D{seq},0,{sent},{local_ns},{user_ns}"
+            );
+        }
+    }
+}
+
+/// Delay_Reqs to the master once a second while one is heard: the path delay, which the Sync samples alone can't
+/// tell from the clocks' offset (over Wi-Fi ~2 ms, all of it showing up as playing late).
+async fn request_delays(sock: Arc<tokio::net::UdpSocket>, samples: Arc<SyncSamples>) {
+    if std::env::var_os("SHAIRPLAY_NO_DELAY_REQ").is_some() {
+        return;
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Some((m, to)) = samples.delay_req()
+            && let Err(e) = sock.send_to(&m, to).await
+        {
+            tracing::debug!(%to, "PTP Delay_Req: {e}");
         }
     }
 }
@@ -648,7 +743,15 @@ struct ClockTrack {
     window: u64,
     fit: Option<(f64, f64, u64)>, // d = a + b * (local - t0) ns, t0
     samples: u32,                 // since the track (re)started
+    /// Round trips of Delay_Req / Delay_Resp: (local time, ns); half the least of the recent ones is the path
+    /// delay the fit includes (both ways taken as equal)
+    trips: std::collections::VecDeque<(u64, f64)>,
 }
+
+/// Round trips kept for the path delay (a Delay_Req a second), and the longest delay believed.
+const DELAY_TRIPS: usize = 32;
+const MIN_TRIPS: usize = 5;
+const MAX_DELAY_NS: f64 = 50e6;
 
 impl ClockTrack {
     fn sample(&mut self, master: u64, local: u64) {
@@ -662,6 +765,7 @@ impl ClockTrack {
             self.minima.clear();
             self.fit = None;
             self.samples = 0;
+            self.trips.clear();
         }
         self.samples = self.samples.saturating_add(1);
         // windows older than the span (a master heard again after a pause)
@@ -752,6 +856,33 @@ impl ClockTrack {
         let (a, b, t0) = self.fit?;
         Some(a + b * (local as f64 - t0 as f64))
     }
+
+    /// A Delay_Req's round trip to the master and back (ns, our clock).
+    fn trip(&mut self, local: u64, rt: u64) {
+        let rt = rt as f64;
+        if !(0.0..2.0 * MAX_DELAY_NS).contains(&rt) {
+            return;
+        }
+        self.trips.push_back((local, rt));
+        while self.trips.len() > DELAY_TRIPS {
+            self.trips.pop_front();
+        }
+    }
+
+    /// The path delay: half the least recent round trip (both ways equal, queueing only adds); 0 until there are
+    /// [`MIN_TRIPS`] (the first ones of a session are the slowest).
+    fn delay(&self) -> f64 {
+        if self.trips.len() < MIN_TRIPS {
+            return 0.0;
+        }
+        self.trips
+            .iter()
+            .map(|t| t.1)
+            .fold(f64::INFINITY, f64::min)
+            .min(2.0 * MAX_DELAY_NS)
+            .max(0.0)
+            / 2.0
+    }
 }
 
 impl Follower {
@@ -769,6 +900,23 @@ impl Follower {
             .entry(clock_id)
             .or_default()
             .sample(master_ns, local_ns);
+    }
+
+    /// The round trip of a Delay_Req to `clock_id`'s master and back (our clock, ns).
+    pub fn round_trip(&self, clock_id: u64, rt_ns: u64) {
+        let mut clocks = self.clocks.lock().unwrap();
+        if let Some(c) = clocks.get_mut(&clock_id) {
+            let before = c.delay();
+            c.trip(now_ns(), rt_ns);
+            let after = c.delay();
+            if (after - before).abs() > 100e3 {
+                tracing::info!(
+                    clock = format!("{clock_id:016x}"),
+                    delay_us = (after / 1e3) as i64,
+                    "PTP path delay"
+                );
+            }
+        }
     }
 
     /// Whether `clock_id` has been followed long enough to use: [`LOCK_SAMPLES`] (a second at Apple's 8 Hz; the
@@ -801,6 +949,8 @@ impl Follower {
         // local = master + d(local), d = a + b (local - t0): solved for local. (Evaluating d at the master's time
         // instead would multiply the slope by the clocks' distance: days, between a Mac's uptime and ours.)
         let (a, b, t0) = c.fit?;
+        // the fit is offset + the path's least delay: without the delay, the master's time as it is
+        let a = a - c.delay();
         let local = (master_ns as f64 + a - b * t0 as f64) / (1.0 - b);
         Some(local.max(0.0) as u64)
     }
@@ -888,5 +1038,30 @@ mod follower_tests {
         f.sample(1, 1_000, 2_000);
         assert!(!f.locked(1));
         assert!(f.to_local(1, 5_000).is_none());
+    }
+
+    #[test]
+    fn the_path_delay_comes_off() {
+        // local = master + 5 s, 2 ms each way (more now and then): the fit alone says 5.002 s
+        let mut c = ClockTrack::default();
+        for i in 0..80u64 {
+            let master = 1_000_000_000_000 + i * 125_000_000;
+            let extra = if i % 3 == 0 { 0 } else { 700_000 };
+            c.sample(master, master + 5_000_000_000 + 2_000_000 + extra);
+        }
+        for i in 0..10u64 {
+            // 4 ms there and back, more with queueing
+            c.trip(i, 4_000_000 + if i % 2 == 0 { 0 } else { 3_000_000 });
+        }
+        assert!((c.delay() - 2e6).abs() < 50e3, "{}", c.delay());
+        let f = Follower::new();
+        f.clocks.lock().unwrap().insert(3, c);
+        let m = 1_000_000_000_000 + 9_000_000_000;
+        let got = f.to_local(3, m).unwrap();
+        assert!(
+            got.abs_diff(m + 5_000_000_000) < 100_000,
+            "{}",
+            got as i64 - (m + 5_000_000_000) as i64
+        );
     }
 }
