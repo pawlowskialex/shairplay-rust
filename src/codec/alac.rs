@@ -573,7 +573,13 @@ impl AlacDecoder {
         match channels {
             0 => self.decode_mono(&mut reader, output, &mut output_samples, &mut output_size),
             1 => self.decode_stereo(&mut reader, output, &mut output_samples, &mut output_size),
-            _ => {}
+            // not a frame (an element this decoder doesn't know): nothing decoded, rather than a frame's worth of
+            // whatever the output held
+            _ => return 0,
+        }
+        // a frame that reads past its end is not one (a placeholder, a truncated packet): nothing decoded
+        if reader.pos * 8 + reader.bit as usize > input.len() * 8 {
+            return 0;
         }
         output_size
     }
@@ -1151,5 +1157,26 @@ mod decode_tests {
     #[test]
     fn golden_mono_352_matches_encoder() {
         check_golden(include_bytes!("../../tests/data/alac/mono352.alac"));
+    }
+
+    #[test]
+    fn a_frame_that_is_no_frame_decodes_to_nothing() {
+        let mut alac = AlacDecoder::new(16, 2);
+        let mut info = [0u8; 48];
+        info[24..28].copy_from_slice(&352u32.to_be_bytes());
+        info[29] = 16;
+        info[30] = 40;
+        info[31] = 10;
+        info[32] = 14;
+        info[33] = 2;
+        info[34..36].copy_from_slice(&255u16.to_be_bytes());
+        info[44..48].copy_from_slice(&44100u32.to_be_bytes());
+        alac.set_info(&info);
+        // an 8-byte placeholder a test sender opens with: element ID 5
+        let mut out = vec![0u8; 352 * 4];
+        assert_eq!(
+            alac.decode_frame(&[0xbc, 0xa7, 0x0d, 0x1f, 0, 0, 0, 0], &mut out),
+            0
+        );
     }
 }
