@@ -68,8 +68,8 @@ pub enum PlayoutCommand {
     Flush {
         /// First sequence number to drop (deferred flush), or none (immediate).
         from_seq: Option<u32>,
-        /// The first sequence number that stays.
-        until_seq: u32,
+        /// The first sequence number that stays (none: everything queued goes).
+        until_seq: Option<u32>,
     },
     /// Stop playback and tear down.
     Stop,
@@ -306,13 +306,19 @@ impl BufferedAudioProcessor {
                         from_seq,
                         until_seq,
                     } => {
+                        // without an end: up to the frame after the last one queued, and nothing on the way
+                        let until = until_seq
+                            .or_else(|| s.queue.back().map(|f| f.seq.wrapping_add(1)))
+                            .unwrap_or(0);
                         let f = PendingFlush {
                             from: from_seq.map(|v| v & SEQ_MASK),
-                            until: until_seq & SEQ_MASK,
+                            until: until & SEQ_MASK,
                         };
                         let dropped = s.apply_flush(f);
-                        // frames still on the way may be covered too
-                        s.flushes.push(f);
+                        if until_seq.is_some() {
+                            // frames still on the way may be covered too
+                            s.flushes.push(f);
+                        }
                         s.recent_flushes.push(f);
                         s.epoch += 1;
                         if f.from.is_none() {

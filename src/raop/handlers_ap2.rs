@@ -1082,7 +1082,8 @@ pub(crate) fn handle_flush_buffered(
         let get = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist_u64);
         // flushFromSeq absent: an immediate flush
         let from_seq = get("flushFromSeq").map(|v| v as u32);
-        let until_seq = get("flushUntilSeq").unwrap_or(0) as u32;
+        // without flushUntilSeq: everything queued
+        let until_seq = get("flushUntilSeq").map(|v| v as u32);
         tracing::debug!(plist = plist_brief(&plist_val), "FLUSHBUFFERED");
         if let Some(cmd) = &conn.playout_cmd {
             let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush {
