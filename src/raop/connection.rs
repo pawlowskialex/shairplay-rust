@@ -68,6 +68,37 @@ pub(crate) struct RaopShared {
     pub(crate) active_audio: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "hls")]
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
+    /// The connection whose sender has the audio now: (connection id, sender, its close signal).
+    pub(crate) stream_owner: std::sync::Mutex<Option<(u64, String, Arc<tokio::sync::Notify>)>>,
+}
+
+impl RaopShared {
+    /// Connection `id` (sender `sender`) sets up an audio stream: if another sender's connection had the audio,
+    /// that connection is closed. The newest sender takes the speaker, as with Apple's receivers; the one before
+    /// sees the speaker go instead of believing it still plays. The same sender's other connections (iOS keeps
+    /// several) stay.
+    pub(crate) fn claim_stream(&self, id: u64, sender: &str, close: &Arc<tokio::sync::Notify>) {
+        let Ok(mut owner) = self.stream_owner.lock() else {
+            return;
+        };
+        if let Some((prev_id, prev_sender, prev_close)) = owner.as_ref()
+            && *prev_id != id
+            && prev_sender != sender
+        {
+            tracing::info!(from = %prev_sender, to = %sender, "Another sender takes over: closing its connection");
+            prev_close.notify_one();
+        }
+        *owner = Some((id, sender.to_string(), close.clone()));
+    }
+
+    /// Connection `id` ends: it no longer has the audio.
+    pub(crate) fn release_stream(&self, id: u64) {
+        if let Ok(mut owner) = self.stream_owner.lock()
+            && owner.as_ref().is_some_and(|o| o.0 == id)
+        {
+            *owner = None;
+        }
+    }
 }
 
 #[cfg(feature = "ap2-core")]
@@ -106,6 +137,12 @@ fn new_raop_connection(
         remote_addr: socket_ip_bytes(remote),
         remote_socket: remote,
         session: false,
+        id: {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64
+        },
+        close: Arc::new(tokio::sync::Notify::new()),
+        sender_id: remote.ip().to_string(),
         nonce: digest::generate_nonce(MAX_NONCE_LEN),
         #[cfg(feature = "ap2-core")]
         srp_server: None,
@@ -165,6 +202,7 @@ struct RaopConnectionHandler {
 
 impl Drop for RaopConnectionHandler {
     fn drop(&mut self) {
+        self.conn.shared.release_stream(self.conn.id);
         if self.conn.session {
             self.conn.shared.handler.on_session_end(&self.remote_addr);
         }
@@ -213,6 +251,10 @@ impl ConnectionHandler for RaopConnectionHandler {
         }
 
         resp
+    }
+
+    fn close_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.conn.close.clone())
     }
 
     fn is_encrypted(&self) -> bool {

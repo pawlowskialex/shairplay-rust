@@ -23,6 +23,12 @@ pub(crate) struct RaopConnection {
     pub(crate) remote_socket: std::net::SocketAddr,
     /// This connection started a session (`AudioHandler::on_session_setup`): its end is the session's end.
     pub(crate) session: bool,
+    /// This connection's number, its close signal, and who the sender is (AP2: the SETUP's `deviceID`, else its
+    /// address): a stream from another sender closes the connection that has the current one
+    /// (`RaopShared::claim_stream`).
+    pub(crate) id: u64,
+    pub(crate) close: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) sender_id: String,
     pub(crate) nonce: String,
     /// Cheap shared handle to server-wide config (identity, keys, handler, settings).
     /// Replaces the ~17 fields that were previously deep-copied into every connection.
@@ -376,6 +382,8 @@ pub(crate) fn handle_setup(
     }
 
     if let Some(rtp) = &mut conn.raop_rtp {
+        conn.shared
+            .claim_stream(conn.id, &conn.sender_id, &conn.close);
         let (cport, tport, dport) = match rtp.start(use_udp, remote_cport, remote_tport) {
             Ok(ports) => ports,
             Err(e) => {

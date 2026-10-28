@@ -406,6 +406,7 @@ impl RaopServerBuilder {
             airplay_name,
             #[cfg(feature = "ap2-core")]
             active_audio: std::sync::Mutex::new(None),
+            stream_owner: std::sync::Mutex::new(None),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
         });
