@@ -129,6 +129,12 @@ pub trait AudioHandler: Send + Sync + 'static {
 
     /// Volume change in dB (0.0 = max, -144.0 = mute).
     fn on_volume(&self, _volume: f32) {}
+    /// The receiver's volume now, in the same dB (-30.0 ..= 0.0, -144.0 = mute): what a sender is told when it asks
+    /// (AirPlay 2 GET /info `initialVolume`, AirPlay 1 GET_PARAMETER `volume`), so it starts from the receiver's
+    /// level instead of its own. `None` (the default): not told (GET_PARAMETER answers 0.0, full volume).
+    fn volume(&self) -> Option<f32> {
+        None
+    }
     /// Track metadata (parsed from DMAP).
     fn on_metadata(&self, _metadata: &crate::proto::dmap::TrackMetadata) {}
     /// Album artwork (JPEG or PNG).
