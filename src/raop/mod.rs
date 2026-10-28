@@ -184,6 +184,7 @@ impl RemoteControl for Ap2RemoteControl {
             let n = match cmd {
                 RemoteCommand::Play => 0,
                 RemoteCommand::Pause => 1,
+                RemoteCommand::PlayPause => 2,
                 RemoteCommand::Stop => 3,
                 RemoteCommand::NextTrack => 4,
                 RemoteCommand::PreviousTrack => 5,
@@ -206,6 +207,7 @@ impl RemoteControl for Ap2RemoteControl {
         vec![
             RemoteCommand::Play,
             RemoteCommand::Pause,
+            RemoteCommand::PlayPause,
             RemoteCommand::NextTrack,
             RemoteCommand::PreviousTrack,
             RemoteCommand::SetVolume(0),
@@ -222,6 +224,7 @@ impl RemoteControl for DacpRemoteControl {
             // not playpause: a play to a sender that plays (a receiver resuming it) would pause it
             RemoteCommand::Play => self.client.play_blocking(),
             RemoteCommand::Pause => self.client.pause_blocking(),
+            RemoteCommand::PlayPause => self.client.play_pause_blocking(),
             RemoteCommand::NextTrack => self.client.next_blocking(),
             RemoteCommand::PreviousTrack => self.client.prev_blocking(),
             RemoteCommand::SetVolume(v) => self.client.set_volume_blocking(v),
@@ -236,6 +239,7 @@ impl RemoteControl for DacpRemoteControl {
         vec![
             RemoteCommand::Play,
             RemoteCommand::Pause,
+            RemoteCommand::PlayPause,
             RemoteCommand::NextTrack,
             RemoteCommand::PreviousTrack,
             RemoteCommand::SetVolume(0),

@@ -313,6 +313,9 @@ pub enum RemoteCommand {
     Play,
     /// Pause playback.
     Pause,
+    /// Play if paused, else pause, as the sender sees it (a receiver can't always tell: a Mac's system audio streams
+    /// on for a while after its app paused).
+    PlayPause,
     /// Skip to next track.
     NextTrack,
     /// Skip to previous track.
