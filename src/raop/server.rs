@@ -407,6 +407,7 @@ impl RaopServerBuilder {
             #[cfg(feature = "ap2-core")]
             active_audio: std::sync::Mutex::new(None),
             stream_owner: std::sync::Mutex::new(None),
+            verified: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
         });

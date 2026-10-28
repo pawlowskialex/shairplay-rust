@@ -116,6 +116,12 @@ const ROUTES: &[Route] = &[
     #[cfg(feature = "ap2-core")]
     Route {
         method: "POST",
+        path: "/pairings",
+        handler: handlers_ap2::handle_pairings,
+    },
+    #[cfg(feature = "ap2-core")]
+    Route {
+        method: "POST",
         path: "/feedback",
         handler: handlers_ap2::handle_feedback,
     },

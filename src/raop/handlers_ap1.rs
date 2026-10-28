@@ -29,6 +29,9 @@ pub(crate) struct RaopConnection {
     pub(crate) id: u64,
     pub(crate) close: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) sender_id: String,
+    /// The paired controller pair-verify verified on this connection (none: transient or unverified)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) controller: Option<String>,
     pub(crate) nonce: String,
     /// Cheap shared handle to server-wide config (identity, keys, handler, settings).
     /// Replaces the ~17 fields that were previously deep-copied into every connection.
