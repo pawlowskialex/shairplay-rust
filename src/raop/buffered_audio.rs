@@ -349,6 +349,7 @@ impl BufferedAudioProcessor {
                 }
             };
             info!(%addr, "Buffered audio client connected");
+            crate::net::keepalive(&stream);
             receive_loop(stream, &shk, output_config, state4, &handler).await;
         });
 
