@@ -104,7 +104,13 @@ pub(crate) fn handle_pair_setup(
                     let m6 = srp
                         .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
                         .ok()?;
-                    conn.shared.pairing_store.put(&client_id, client_pk);
+                    if !conn
+                        .shared
+                        .pairing_store
+                        .put_controller(&client_id, client_pk, true)
+                    {
+                        tracing::warn!(client_id, "pairing store full: controller not stored");
+                    }
                     tracing::info!(
                         client_id,
                         "AP2 normal pair-setup complete, client key stored"
@@ -175,6 +181,10 @@ pub(crate) fn handle_pair_verify(
                     conn.pair_verify_secret = pv.shared_secret().copied();
                     conn.ap2_shared_secret = pv.shared_secret().map(|s| s.to_vec());
                     conn.is_ap2 = true;
+                    if let Some(c) = pv.controller() {
+                        conn.controller = Some(c.to_string());
+                        conn.shared.verified_as(conn.id, c, &conn.close);
+                    }
                     tracing::info!("AP2 pair-verify complete, encrypted RTSP active");
                     Some(m4)
                 }
@@ -186,6 +196,216 @@ pub(crate) fn handle_pair_verify(
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(feature = "ap2-core")]
+/// HAP pairing management, POST /pairings: [`pairings`] on this session's verified controller; the controllers whose
+/// pairing went have their connections closed (this one's after its response).
+pub(crate) fn handle_pairings(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    response.add_header("Content-Type", "application/pairing+tlv8");
+    let (body, removed) = pairings(
+        conn.shared.pairing_store.as_ref(),
+        conn.controller.as_deref(),
+        request.data().unwrap_or(&[]),
+    );
+    for id in removed {
+        conn.shared.close_controller(&id);
+    }
+    Some(body)
+}
+
+#[cfg(feature = "ap2-core")]
+/// HAP pairing management (State 1; Method 3 AddPairing, 4 RemovePairing, 5 ListPairings) for a session verified as
+/// `controller`: only an admin may. Removing the last admin removes every pairing. Returns the response TLV and the
+/// controllers removed.
+pub(crate) fn pairings(
+    store: &dyn crate::raop::PairingStore,
+    controller: Option<&str>,
+    body: &[u8],
+) -> (Vec<u8>, Vec<String>) {
+    use crate::crypto::tlv::{TlvType, TlvValues};
+    // HAP's kTLVError codes
+    const UNKNOWN: u8 = 1;
+    const AUTHENTICATION: u8 = 2;
+    const MAX_PEERS: u8 = 4;
+    let mut resp = TlvValues::new();
+    resp.add(TlvType::State as u8, &[2]);
+    let error = |mut resp: TlvValues, code: u8| {
+        resp.add(TlvType::Error as u8, &[code]);
+        (resp.encode(), Vec::new())
+    };
+    let Ok(tlv) = TlvValues::decode(body) else {
+        return error(resp, UNKNOWN);
+    };
+    if tlv.get_type(TlvType::State) != Some(&[1][..]) {
+        return error(resp, UNKNOWN);
+    }
+    let Some(admin) = controller.filter(|c| store.is_admin(c)) else {
+        tracing::warn!(?controller, "/pairings: not an admin controller's session");
+        return error(resp, AUTHENTICATION);
+    };
+    let id = tlv
+        .get_type(TlvType::Identifier)
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .map(str::to_string);
+    let mut removed = Vec::new();
+    match tlv.get_type(TlvType::Method).and_then(|m| m.first()) {
+        Some(3) => {
+            let (Some(id), Some(pk)) = (
+                id,
+                tlv.get_type(TlvType::PublicKey)
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok()),
+            ) else {
+                return error(resp, UNKNOWN);
+            };
+            let admin_perm = tlv
+                .get_type(TlvType::Permissions)
+                .and_then(|p| p.first())
+                .is_some_and(|p| p & 1 != 0);
+            // an identifier already paired with another key is refused (HAP); the same one updates its permission
+            if store.get(&id).is_some_and(|k| k != pk) {
+                return error(resp, UNKNOWN);
+            }
+            if !store.put_controller(&id, pk, admin_perm) {
+                return error(resp, MAX_PEERS);
+            }
+            tracing::info!(
+                by = admin,
+                id,
+                admin = admin_perm,
+                "/pairings: controller added"
+            );
+        }
+        Some(4) => {
+            let Some(id) = id else {
+                return error(resp, UNKNOWN);
+            };
+            store.remove(&id);
+            tracing::info!(by = admin, id, "/pairings: controller removed");
+            removed.push(id);
+            if !store.list().iter().any(|c| c.2) {
+                for (other, _, _) in store.list() {
+                    store.remove(&other);
+                    removed.push(other);
+                }
+                tracing::info!("/pairings: no admin left: every pairing removed");
+            }
+        }
+        Some(5) => {
+            for (k, (id, pk, a)) in store.list().into_iter().enumerate() {
+                if k > 0 {
+                    resp.add(TlvType::Separator as u8, &[]);
+                }
+                resp.add(TlvType::Identifier as u8, id.as_bytes());
+                resp.add(TlvType::PublicKey as u8, &pk);
+                resp.add(TlvType::Permissions as u8, &[u8::from(a)]);
+            }
+        }
+        _ => return error(resp, UNKNOWN),
+    }
+    (resp.encode(), removed)
+}
+
+#[cfg(all(test, feature = "ap2-core"))]
+mod pairings_tests {
+    use super::pairings;
+    use crate::crypto::tlv::{TlvType, TlvValues};
+    use crate::raop::{MemoryPairingStore, PairingStore};
+
+    fn req(method: u8, id: Option<&str>, pk: Option<[u8; 32]>, perm: Option<u8>) -> Vec<u8> {
+        let mut t = TlvValues::new();
+        t.add(TlvType::State as u8, &[1]);
+        t.add(TlvType::Method as u8, &[method]);
+        if let Some(id) = id {
+            t.add(TlvType::Identifier as u8, id.as_bytes());
+        }
+        if let Some(pk) = pk {
+            t.add(TlvType::PublicKey as u8, &pk);
+        }
+        if let Some(p) = perm {
+            t.add(TlvType::Permissions as u8, &[p]);
+        }
+        t.encode()
+    }
+
+    fn err(resp: &[u8]) -> Option<u8> {
+        TlvValues::decode(resp)
+            .unwrap()
+            .get_type(TlvType::Error)
+            .map(|e| e[0])
+    }
+
+    #[test]
+    fn only_an_admin_manages_pairings() {
+        let s = MemoryPairingStore::default();
+        s.put_controller("admin", [1; 32], true);
+        s.put_controller("user", [2; 32], false);
+        assert_eq!(
+            err(&pairings(&s, None, &req(5, None, None, None)).0),
+            Some(2)
+        );
+        assert_eq!(
+            err(&pairings(&s, Some("user"), &req(5, None, None, None)).0),
+            Some(2)
+        );
+        assert_eq!(
+            err(&pairings(&s, Some("stranger"), &req(5, None, None, None)).0),
+            Some(2)
+        );
+        assert_eq!(
+            err(&pairings(&s, Some("admin"), &req(5, None, None, None)).0),
+            None
+        );
+    }
+
+    #[test]
+    fn add_list_and_remove() {
+        let s = MemoryPairingStore::default();
+        s.put_controller("admin", [1; 32], true);
+        let (r, _) = pairings(
+            &s,
+            Some("admin"),
+            &req(3, Some("phone"), Some([3; 32]), Some(0)),
+        );
+        assert_eq!(err(&r), None);
+        assert_eq!(s.get("phone"), Some([3; 32]));
+        assert!(!s.is_admin("phone"));
+        // the same identifier with another key is refused
+        let (r, _) = pairings(
+            &s,
+            Some("admin"),
+            &req(3, Some("phone"), Some([4; 32]), Some(1)),
+        );
+        assert_eq!(err(&r), Some(1));
+        let (r, _) = pairings(&s, Some("admin"), &req(5, None, None, None));
+        let listed = TlvValues::decode(&r).unwrap();
+        assert_eq!(err(&r), None);
+        assert!(
+            listed.get_type(TlvType::Separator).is_some(),
+            "two controllers, separated"
+        );
+        let (r, removed) = pairings(&s, Some("admin"), &req(4, Some("phone"), None, None));
+        assert_eq!((err(&r), removed), (None, vec!["phone".to_string()]));
+        assert_eq!(s.get("phone"), None);
+    }
+
+    #[test]
+    fn removing_the_last_admin_removes_everyone() {
+        let s = MemoryPairingStore::default();
+        s.put_controller("admin", [1; 32], true);
+        s.put_controller("user", [2; 32], false);
+        let (r, mut removed) = pairings(&s, Some("admin"), &req(4, Some("admin"), None, None));
+        removed.sort();
+        assert_eq!(
+            (err(&r), removed),
+            (None, vec!["admin".to_string(), "user".to_string()])
+        );
+        assert!(!s.has_any_pairing());
     }
 }
 
