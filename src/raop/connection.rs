@@ -186,6 +186,8 @@ fn new_raop_connection(
         playout_cmd: None,
         #[cfg(feature = "ap2-core")]
         event_sender: None,
+        #[cfg(feature = "ap2-core")]
+        realtime_cmd: None,
         #[cfg(feature = "video")]
         ekey: None,
         #[cfg(feature = "video")]
