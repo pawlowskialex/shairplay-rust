@@ -371,6 +371,11 @@ pub(crate) fn handle_setup(
         "SETUP plist"
     );
     tracing::debug!(plist = plist_brief(&plist_val), "SETUP");
+    tracing::debug!(
+        dacp_id = request.header("DACP-ID"),
+        active_remote = request.header("Active-Remote").is_some(),
+        "SETUP remote-control headers"
+    );
 
     let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
         setup_streams(conn, streams)?

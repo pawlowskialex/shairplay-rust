@@ -99,6 +99,9 @@ pub(crate) struct SrpServer {
     g: BigUint,
     salt: Vec<u8>,
     v: BigUint,
+    /// v^(16^k) for k < 128: v^u (u from SHA-512) by fixed-base exponentiation, ~140 multiplications instead of 512
+    /// squarings and ~128 more; made with the rest of the state, ahead of time
+    v_table: Vec<BigUint>,
     b: BigUint,
     big_b: BigUint,
     session_key: Vec<u8>,
@@ -150,11 +153,14 @@ impl SrpServer {
             }
         };
 
+        let v_table = fixed_base_table(&v, &n, U_BITS / 4);
+
         Ok(Self {
             n,
             g,
             salt: salt_bytes.to_vec(),
             v,
+            v_table,
             b,
             big_b,
             session_key: Vec::new(),
@@ -230,7 +236,8 @@ impl SrpServer {
         let u = h_nn_pad(&big_a, &self.big_b, N_3072_LEN);
 
         // S = (A * v^u)^b mod N
-        let vu = self.v.modpow(&u, &self.n);
+        let vu = fixed_base_pow(&self.v_table, &u, &self.n)
+            .unwrap_or_else(|| self.v.modpow(&u, &self.n));
         let avu = (&big_a * &vu) % &self.n;
         let big_s = avu.modpow(&self.b, &self.n);
 
@@ -316,6 +323,46 @@ impl SrpServer {
 }
 
 // --- SRP helper functions ---
+
+/// The width of SRP's u (SHA-512).
+const U_BITS: usize = 512;
+
+/// x^(16^k) mod n for k < `digits`.
+fn fixed_base_table(x: &BigUint, n: &BigUint, digits: usize) -> Vec<BigUint> {
+    let mut t = Vec::with_capacity(digits);
+    t.push(x % n);
+    while t.len() < digits {
+        let mut y = t.last().unwrap().clone();
+        for _ in 0..4 {
+            y = &y * &y % n;
+        }
+        t.push(y);
+    }
+    t
+}
+
+/// x^e mod n from `fixed_base_table`'s powers (BGMW: for each hex digit value from 15 down, the product of the
+/// powers whose digit is at least it), or None if e has more digits than the table.
+fn fixed_base_pow(table: &[BigUint], e: &BigUint, n: &BigUint) -> Option<BigUint> {
+    let bytes = e.to_bytes_le();
+    if bytes.len() * 2 > table.len() {
+        return None;
+    }
+    let digit = |k: usize| {
+        let b = bytes.get(k / 2).copied().unwrap_or(0);
+        if k % 2 == 0 { b & 15 } else { b >> 4 }
+    };
+    let (mut acc, mut run) = (BigUint::from(1u32), BigUint::from(1u32));
+    for d in (1..16u8).rev() {
+        for (k, p) in table.iter().enumerate() {
+            if digit(k) == d {
+                run = &run * p % n;
+            }
+        }
+        acc = &acc * &run % n;
+    }
+    Some(acc)
+}
 
 fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
@@ -832,6 +879,30 @@ impl PairVerifyServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_base_pow_is_modpow() {
+        let n = BigUint::parse_bytes(super::N_3072_HEX.as_bytes(), 16).unwrap();
+        let x = BigUint::from(0x1234_5678_9abc_def0u64).pow(40) % &n;
+        let table = super::fixed_base_table(&x, &n, super::U_BITS / 4);
+        for e in [
+            BigUint::from(0u32),
+            BigUint::from(1u32),
+            BigUint::from(0xF0u32),
+            (BigUint::from(1u32) << 511u32) + 12345u32,
+            BigUint::from_bytes_be(&super::sha512(b"u")),
+        ] {
+            assert_eq!(
+                super::fixed_base_pow(&table, &e, &n),
+                Some(x.modpow(&e, &n)),
+                "{e}"
+            );
+        }
+        assert_eq!(
+            super::fixed_base_pow(&table, &(BigUint::from(1u32) << 512u32), &n),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]
