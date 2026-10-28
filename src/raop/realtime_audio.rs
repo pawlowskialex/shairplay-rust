@@ -35,6 +35,8 @@ pub(crate) struct OutputConfig {
     pub(crate) format: crate::raop::SampleFormat,
     /// Coprocessor decrypt + decode.
     pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
+    /// The receiver latency the sender asks for (SETUP `latencyMin`, frames), if it does.
+    pub(crate) latency_min: Option<u32>,
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -84,9 +86,12 @@ pub(crate) async fn run(
         })
     });
 
+    let offset_ns = realtime_offset_ns(output_config.latency_min, output_config.source_sample_rate);
     info!(
         offload = offload.is_some(),
         retransmit = ctrl.is_some(),
+        latency_min = ?output_config.latency_min,
+        offset_ms = offset_ns / 1_000_000,
         "Realtime ALAC receiver started"
     );
 
@@ -159,7 +164,7 @@ pub(crate) async fn run(
                     );
                     let at = offload_ts
                         .pop_front()
-                        .and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr)));
+                        .and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)));
                     if let Some(ref mut sess) = *session {
                         pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                     }
@@ -174,7 +179,7 @@ pub(crate) async fn run(
             'play: {
                 let (fill, packet): (u32, &[u8]) = ($fill, $packet);
                 let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-                if !timed_logged && let Some(at) = anchor.and_then(|a| a.play_at(ts, src_sr)) {
+                if !timed_logged && let Some(at) = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)) {
                     timed_logged = true;
                     let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
                     info!(ts, lead_ms, "Realtime playout on the network timeline");
@@ -211,7 +216,7 @@ pub(crate) async fn run(
                     #[cfg(feature = "resample")]
                     &mut resampler,
                 );
-                let at = anchor.and_then(|a| a.play_at(ts, src_sr));
+                let at = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns));
                 if let Some(ref mut sess) = *session {
                     pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                 }
@@ -413,30 +418,37 @@ impl Anchor {
     }
 
     /// Local time (`util::now_ns`'s clock) at which RTP time `ts` leaves the speaker, once the clock is followed.
-    fn play_at(self, ts: u32, rate: u32) -> Option<u64> {
+    fn play_at(self, ts: u32, rate: u32, offset_ns: i64) -> Option<u64> {
         let frames = i128::from(ts.wrapping_sub(self.rtp) as i32);
         let net = i128::from(self.net_ns)
-            + i128::from(realtime_offset_ns())
+            + i128::from(offset_ns)
             + frames * 1_000_000_000 / i128::from(rate.max(1));
         crate::net::ptp::follower().to_local(self.clock, net.max(0) as u64)
     }
 }
 
-/// Added to every realtime packet's network time (SHAIRPLAY_REALTIME_LATENCY_MS overrides, may be negative).
-fn realtime_offset_ns() -> i64 {
-    static L: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *L.get_or_init(|| {
-        std::env::var("SHAIRPLAY_REALTIME_LATENCY_MS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(REALTIME_OFFSET_NS, |ms| (ms * 1e6) as i64)
-    })
+/// Added to every realtime packet's network time: the receiver latency the sender asked for (SETUP `latencyMin`, when
+/// it is sane), else 11025 frames; SHAIRPLAY_REALTIME_LATENCY_MS overrides (ms, may be negative).
+fn realtime_offset_ns(latency_min: Option<u32>, rate: u32) -> i64 {
+    if let Some(ms) = std::env::var("SHAIRPLAY_REALTIME_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return (ms * 1e6) as i64;
+    }
+    let frames = latency_min
+        .filter(|&f| f > 0 && f <= MAX_LATENCY_FRAMES)
+        .unwrap_or(DEFAULT_LATENCY_FRAMES);
+    i64::from(frames) * 1_000_000_000 / i64::from(rate.max(1))
 }
 
-/// The receiver's own latency, added to the anchor: 11025 frames at 44.1 kHz. A Mac's AirPlay output device reports
-/// a stream latency of 88200 frames, the sync packets' 77175 plus these (AirPlay 1 receivers announce theirs as
-/// Audio-Latency: 11025; shairport-sync adds the same "to bring everything into sync").
-const REALTIME_OFFSET_NS: i64 = 250_000_000;
+/// The receiver's own latency when the sender names none: 11025 frames (250 ms at 44.1 kHz). A Mac's AirPlay output
+/// device reports a stream latency of 88200 frames, the sync packets' 77175 plus these (AirPlay 1 receivers announce
+/// theirs as Audio-Latency: 11025; shairport-sync adds the same "to bring everything into sync", and the
+/// esp32-airplay2 receivers' multi-room tests found it so).
+const DEFAULT_LATENCY_FRAMES: u32 = 11025;
+/// A `latencyMin` beyond this (2 s at 44.1 kHz) is taken for a mistake.
+const MAX_LATENCY_FRAMES: u32 = 88200;
 
 /// RTP payload type of a retransmit request (AirPlay's, from the receiver to the sender's control port) and of its
 /// answer (the resent packet, on our control port behind a 4-byte header).
@@ -648,6 +660,15 @@ impl Reorder {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_latency_is_the_senders_latency_min_when_sane() {
+        assert_eq!(realtime_offset_ns(Some(11025), 44100), 250_000_000);
+        assert_eq!(realtime_offset_ns(Some(22050), 44100), 500_000_000);
+        assert_eq!(realtime_offset_ns(None, 44100), 250_000_000);
+        assert_eq!(realtime_offset_ns(Some(0), 44100), 250_000_000);
+        assert_eq!(realtime_offset_ns(Some(500_000), 44100), 250_000_000);
+    }
+
+    #[test]
     fn a_macs_sync_packet_is_an_anchor() {
         // from a Mac's system audio (macOS 26), realtime ALAC 44.1 kHz
         let p = hex::decode("80d700068173ef930000ca6df003b64481751d0a9a7c6e4c200d0008").unwrap();
@@ -785,6 +806,7 @@ mod tests {
             max_channels: None,
             format: crate::raop::SampleFormat::F32,
             offload: None,
+            latency_min: None,
         });
 
         assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);
