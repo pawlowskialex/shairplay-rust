@@ -219,7 +219,9 @@ impl RemoteControl for Ap2RemoteControl {
 impl RemoteControl for DacpRemoteControl {
     fn send_command(&self, cmd: RemoteCommand) -> Result<(), crate::error::ShairplayError> {
         let result = match cmd {
-            RemoteCommand::Play | RemoteCommand::Pause => self.client.play_pause_blocking(),
+            // not playpause: a play to a sender that plays (a receiver resuming it) would pause it
+            RemoteCommand::Play => self.client.play_blocking(),
+            RemoteCommand::Pause => self.client.pause_blocking(),
             RemoteCommand::NextTrack => self.client.next_blocking(),
             RemoteCommand::PreviousTrack => self.client.prev_blocking(),
             RemoteCommand::SetVolume(v) => self.client.set_volume_blocking(v),
