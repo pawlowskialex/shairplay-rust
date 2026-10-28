@@ -95,6 +95,13 @@ pub(crate) async fn run(
     // stream in real time, so audio that never arrives would otherwise shorten the output's queue for good until it
     // runs dry (on Wi-Fi, ~1 % loss emptied a 250 ms prebuffer within a minute). Counts every 10 s.
     let mut reorder = Reorder::new(ctrl.is_some());
+    // The network timeline, from the sender's sync packets (0xd7 on the control port): an RTP time and the network
+    // time (its PTP clock) it plays at. Packets go out with their play time once the clock is followed; until then,
+    // as they arrive.
+    let mut anchor: Option<Anchor> = None;
+    let mut timed_logged = false;
+    // RTP times of the packets out on the offload, in order
+    let mut offload_ts: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     let mut report = std::time::Instant::now();
     let mut cbuf = vec![0u8; 4096];
     let mut ctrl_logged = 0u32;
@@ -149,8 +156,11 @@ pub(crate) async fn run(
                         #[cfg(feature = "resample")]
                         &mut resampler,
                     );
+                    let at = offload_ts
+                        .pop_front()
+                        .and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr)));
                     if let Some(ref mut sess) = session {
-                        pcm.deliver(sess.as_mut(), output_config.format);
+                        pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                     }
                 });
             }
@@ -162,8 +172,15 @@ pub(crate) async fn run(
         ($fill:expr, $packet:expr) => {
             'play: {
                 let (fill, packet): (u32, &[u8]) = ($fill, $packet);
+                let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+                if !timed_logged && let Some(at) = anchor.and_then(|a| a.play_at(ts, src_sr)) {
+                    timed_logged = true;
+                    let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
+                    info!(ts, lead_ms, "Realtime playout on the network timeline");
+                }
                 if let Some(off) = offload.as_mut() {
                     if off.submit(fill, packet) {
+                        offload_ts.push_back(ts);
                         drain_offload!();
                         break 'play;
                     }
@@ -193,8 +210,9 @@ pub(crate) async fn run(
                     #[cfg(feature = "resample")]
                     &mut resampler,
                 );
+                let at = anchor.and_then(|a| a.play_at(ts, src_sr));
                 if let Some(ref mut sess) = session {
-                    pcm.deliver(sess.as_mut(), output_config.format);
+                    pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                 }
             }
         };
@@ -227,6 +245,18 @@ pub(crate) async fn run(
                 // A resend answer is the original packet behind 4 bytes (0x80 0xd6 seq); anything else on the
                 // control port (sync packets) isn't audio.
                 let packet = if resent {
+                    if let Some(a) = Anchor::parse(&cbuf[..n]) {
+                        if anchor.is_none_or(|o| o.clock != a.clock) {
+                            info!(
+                                clock = format!("{:016x}", a.clock),
+                                rtp = a.rtp,
+                                latency = a.latency,
+                                "Realtime sync: the sender's timeline"
+                            );
+                        }
+                        anchor = Some(a);
+                        continue;
+                    }
                     if n < RESENT_HEADER_LEN || cbuf[1] & 0x7f != RESENT_PAYLOAD_TYPE {
                         // not a resent packet: sync packets (0xd7: RTP time <-> the sender's network time) and the
                         // like; the first few go to the log until the realtime path uses them
@@ -328,6 +358,58 @@ pub(crate) async fn run(
 
     debug!("Realtime ALAC receiver ended");
 }
+
+/// A sync packet's anchor (0xd7, 28 bytes: 0x80|0x90, 0xd7, 2 bytes, then the RTP time that plays at the network
+/// time (the sender's "now" less the stream's latency), the network time in ns on its PTP clock, the RTP time of the
+/// sender's now, the clock's ID; shairport-sync's rtp.c).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Anchor {
+    clock: u64,
+    net_ns: u64,
+    rtp: u32,
+    latency: u32, // frames between the sender's now and what plays now (77175 from Apple's senders: 1.75 s)
+}
+
+impl Anchor {
+    fn parse(p: &[u8]) -> Option<Self> {
+        if p.len() < 28 || p[1] != 0xd7 {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+        let rtp = u32_at(4);
+        Some(Anchor {
+            rtp,
+            net_ns: u64::from_be_bytes(p[8..16].try_into().ok()?),
+            latency: u32_at(16).wrapping_sub(rtp),
+            clock: u64::from_be_bytes(p[20..28].try_into().ok()?),
+        })
+    }
+
+    /// Local time (`util::now_ns`'s clock) at which RTP time `ts` leaves the speaker, once the clock is followed.
+    fn play_at(self, ts: u32, rate: u32) -> Option<u64> {
+        let frames = i128::from(ts.wrapping_sub(self.rtp) as i32);
+        let net = i128::from(self.net_ns)
+            + i128::from(realtime_offset_ns())
+            + frames * 1_000_000_000 / i128::from(rate.max(1));
+        crate::net::ptp::follower().to_local(self.clock, net.max(0) as u64)
+    }
+}
+
+/// Added to every realtime packet's network time (SHAIRPLAY_REALTIME_LATENCY_MS overrides, may be negative).
+fn realtime_offset_ns() -> i64 {
+    static L: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("SHAIRPLAY_REALTIME_LATENCY_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(REALTIME_OFFSET_NS, |ms| (ms * 1e6) as i64)
+    })
+}
+
+/// The receiver's own latency, added to the anchor: 11025 frames at 44.1 kHz. A Mac's AirPlay output device reports
+/// a stream latency of 88200 frames, the sync packets' 77175 plus these (AirPlay 1 receivers announce theirs as
+/// Audio-Latency: 11025; shairport-sync adds the same "to bring everything into sync").
+const REALTIME_OFFSET_NS: i64 = 250_000_000;
 
 /// RTP payload type of a retransmit request (AirPlay's, from the receiver to the sender's control port) and of its
 /// answer (the resent packet, on our control port behind a 4-byte header).
@@ -538,6 +620,26 @@ impl Reorder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_macs_sync_packet_is_an_anchor() {
+        // from a Mac's system audio (macOS 26), realtime ALAC 44.1 kHz
+        let p = hex::decode("80d700068173ef930000ca6df003b64481751d0a9a7c6e4c200d0008").unwrap();
+        let a = Anchor::parse(&p).unwrap();
+        assert_eq!(
+            a,
+            Anchor {
+                clock: 0x9a7c_6e4c_200d_0008,
+                net_ns: 0x0000_ca6d_f003_b644,
+                rtp: 0x8173_ef93,
+                latency: 77175,
+            }
+        );
+        assert_eq!(Anchor::parse(&p[..27]), None);
+        let mut resend = p.clone();
+        resend[1] = 0xd6;
+        assert_eq!(Anchor::parse(&resend), None);
+    }
+
     use super::*;
 
     use std::time::{Duration, Instant};
