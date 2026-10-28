@@ -63,7 +63,8 @@ pub(crate) async fn run(
     let mut decoder: Option<crate::codec::alac::AlacDecoder> = None;
     #[cfg(feature = "resample")]
     let mut resampler: Option<StreamResampler> = None;
-    let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
+    // flushed when the stream ends, however it ends (TEARDOWN aborts this task): what it queued for later doesn't play
+    let mut session = Ending(None);
     #[allow(unused_assignments)]
     let mut src_sr: u32 = 44100;
     let mut src_ch: u8 = 2;
@@ -110,7 +111,7 @@ pub(crate) async fn run(
         ($packets:expr) => {
             let packets = $packets as usize;
             if packets > 0 {
-                if let Some(ref mut sess) = session {
+                if let Some(ref mut sess) = *session {
                     let n = packets * output_config.samples_per_frame as usize * src_ch as usize;
                     let pcm = crate::codec::shape(
                         crate::codec::Pcm::S16(vec![0; n]),
@@ -159,7 +160,7 @@ pub(crate) async fn run(
                     let at = offload_ts
                         .pop_front()
                         .and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr)));
-                    if let Some(ref mut sess) = session {
+                    if let Some(ref mut sess) = *session {
                         pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                     }
                 });
@@ -211,7 +212,7 @@ pub(crate) async fn run(
                     &mut resampler,
                 );
                 let at = anchor.and_then(|a| a.play_at(ts, src_sr));
-                if let Some(ref mut sess) = session {
+                if let Some(ref mut sess) = *session {
                     pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                 }
             }
@@ -317,7 +318,7 @@ pub(crate) async fn run(
                         sample_rate: target_sr,
                     };
                     info!(?format, "Realtime audio session initialized");
-                    session = Some(handler.audio_init(format));
+                    *session = Some(handler.audio_init(format));
                 }
                 let seq = u16::from_be_bytes([packet[2], packet[3]]);
                 reorder.push(seq, packet, now, &mut out);
@@ -357,6 +358,32 @@ pub(crate) async fn run(
     }
 
     debug!("Realtime ALAC receiver ended");
+}
+
+/// The stream's session, flushed when it is dropped: a realtime stream ends at its TEARDOWN (a pause: iOS and macOS
+/// tear the stream down and set up a new one to resume), and on the network timeline its last ~2 s are still
+/// queued, waiting for their time.
+struct Ending(Option<Box<dyn crate::raop::AudioSession>>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.as_mut() {
+            s.audio_flush();
+        }
+    }
+}
+
+impl std::ops::Deref for Ending {
+    type Target = Option<Box<dyn crate::raop::AudioSession>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Ending {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 /// A sync packet's anchor (0xd7, 28 bytes: 0x80|0x90, 0xd7, 2 bytes, then the RTP time that plays at the network
