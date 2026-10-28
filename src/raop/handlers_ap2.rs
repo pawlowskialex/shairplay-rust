@@ -999,6 +999,10 @@ fn setup_stream_realtime(
             max_channels: conn.shared.output_max_channels,
             format: conn.shared.output_format,
             offload: conn.shared.packet_offload.clone(),
+            latency_min: stream0
+                .get("latencyMin")
+                .and_then(|v| v.as_unsigned_integer())
+                .and_then(|v| u32::try_from(v).ok()),
         };
 
         let handle = tokio::spawn(crate::raop::realtime_audio::run(
