@@ -297,6 +297,15 @@ impl Drop for MdnsService {
 
 // --- Linux/other: pure Rust mdns-sd ---
 
+/// The host name the services' SRV records point at: the machine's own with `-airplay`, as other mDNS responders on
+/// the same machine (a Spotify Connect or Snapcast one) claim the plain name too, and where they differ on its
+/// addresses (an interface without carrier: mdns-sd leaves it out, others don't) mdns-sd took theirs for a conflict,
+/// renamed itself mid-probe and never announced `_airplay._tcp` (browsers stopped listing the receiver).
+#[cfg(not(target_os = "macos"))]
+fn host_name() -> String {
+    format!("{}-airplay.local.", gethostname::gethostname().to_string_lossy())
+}
+
 #[cfg(not(target_os = "macos"))]
 /// mDNS service registration for AirPlay (Linux: pure Rust mdns-sd).
 pub(crate) struct MdnsService {
@@ -323,7 +332,7 @@ impl MdnsService {
         let svc = mdns_sd::ServiceInfo::new(
             "_raop._tcp.local.",
             &info.raop_name,
-            &format!("{}.local.", gethostname::gethostname().to_string_lossy()),
+            &host_name(),
             "",
             info.port,
             txt_map(&info.raop_txt),
@@ -347,7 +356,7 @@ impl MdnsService {
         let svc = mdns_sd::ServiceInfo::new(
             "_airplay._tcp.local.",
             &info.airplay_name,
-            &format!("{}.local.", gethostname::gethostname().to_string_lossy()),
+            &host_name(),
             "",
             info.port,
             txt_map(&info.airplay_txt),
