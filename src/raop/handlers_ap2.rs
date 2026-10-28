@@ -1005,12 +1005,15 @@ fn setup_stream_realtime(
                 .and_then(|v| u32::try_from(v).ok()),
         };
 
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.realtime_cmd = Some(cmd_tx);
         let handle = tokio::spawn(crate::raop::realtime_audio::run(
             socket,
             retransmit,
             shk_arr,
             handler,
             output_config,
+            cmd_rx,
         ));
         conn.shared
             .set_active_audio(Box::new(move || handle.abort()));

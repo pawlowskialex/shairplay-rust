@@ -52,6 +52,14 @@ fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
     info
 }
 
+/// What the connection tells a running realtime stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RealtimeCommand {
+    /// FLUSH: `before` is RTP-Info's rtptime, the first frame that stays (what came before goes, the timing stays);
+    /// without one everything goes until the sender's next sync packet anchors the stream again.
+    Flush { before: Option<u32> },
+}
+
 /// Run the realtime audio receiver loop.
 pub(crate) async fn run(
     socket: UdpSocket,
@@ -59,6 +67,7 @@ pub(crate) async fn run(
     shk: [u8; 32],
     handler: Arc<dyn AudioHandler>,
     output_config: OutputConfig,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<RealtimeCommand>,
 ) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
     let mut buf = vec![0u8; 4096];
@@ -106,6 +115,13 @@ pub(crate) async fn run(
     // as they arrive.
     let mut anchor: Option<Anchor> = None;
     let mut timed_logged = false;
+    // FLUSH: packets before `floor` aren't played; `await_anchor`: none until a sync packet; the last RTP time played
+    let mut floor: Option<u32> = None;
+    let mut await_anchor = false;
+    let mut last_played: Option<u32> = None;
+    let flushed = |ts: u32, floor: Option<u32>, await_anchor: bool| {
+        await_anchor || floor.is_some_and(|f| (ts.wrapping_sub(f) as i32) < 0)
+    };
     // RTP times of the packets out on the offload, in order
     let mut offload_ts: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     let mut report = std::time::Instant::now();
@@ -162,9 +178,15 @@ pub(crate) async fn run(
                         #[cfg(feature = "resample")]
                         &mut resampler,
                     );
-                    let at = offload_ts
-                        .pop_front()
-                        .and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)));
+                    let ts = offload_ts.pop_front();
+                    if ts.is_some_and(|t| flushed(t, floor, await_anchor)) {
+                        return;
+                    }
+                    let at =
+                        ts.and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)));
+                    if ts.is_some() {
+                        last_played = ts;
+                    }
                     if let Some(ref mut sess) = *session {
                         pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                     }
@@ -179,6 +201,10 @@ pub(crate) async fn run(
             'play: {
                 let (fill, packet): (u32, &[u8]) = ($fill, $packet);
                 let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+                if flushed(ts, floor, await_anchor) {
+                    break 'play;
+                }
+                floor = None;
                 if !timed_logged && let Some(at) = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)) {
                     timed_logged = true;
                     let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
@@ -217,6 +243,7 @@ pub(crate) async fn run(
                     &mut resampler,
                 );
                 let at = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns));
+                last_played = Some(ts);
                 if let Some(ref mut sess) = *session {
                     pcm.deliver_timed(sess.as_mut(), output_config.format, at);
                 }
@@ -236,6 +263,19 @@ pub(crate) async fn run(
                 }
             } => Some(r.map(|n| (n, true))),
             _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
+            c = commands.recv() => {
+                let Some(RealtimeCommand::Flush { before }) = c else { continue };
+                // queued audio goes if it is all before the flush point (it can't be cut in part), and without a
+                // point all of it
+                let older = before.is_none_or(|n| last_played.is_none_or(|l| (l.wrapping_sub(n) as i32) < 0));
+                if older && let Some(ref mut sess) = *session {
+                    sess.audio_flush();
+                }
+                floor = before;
+                await_anchor = before.is_none();
+                info!(?before, ?last_played, dropped_queued = older, "Realtime FLUSH");
+                continue;
+            }
         };
         let now = std::time::Instant::now();
         let mut out = Vec::new();
@@ -261,6 +301,7 @@ pub(crate) async fn run(
                             );
                         }
                         anchor = Some(a);
+                        await_anchor = false;
                         continue;
                     }
                     if n < RESENT_HEADER_LEN || cbuf[1] & 0x7f != RESENT_PAYLOAD_TYPE {
