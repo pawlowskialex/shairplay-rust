@@ -764,7 +764,7 @@ mod playout_tests {
         };
         let _ = PlayoutCommand::Flush {
             from_seq: None,
-            until_seq: 100,
+            until_seq: Some(100),
         };
         let _ = PlayoutCommand::Stop;
     }
