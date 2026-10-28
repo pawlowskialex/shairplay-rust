@@ -92,6 +92,8 @@ struct BufferEntry {
     /// Submitted to the offload and not back yet (under `offload_tag`).
     pending: bool,
     offload_tag: u32,
+    /// The packet's length: the same sequence number again with another length is another packet, not a duplicate
+    packet_len: usize,
 }
 
 /// Compare two RTP sequence numbers with wrapping (handles 16-bit overflow).
@@ -293,6 +295,7 @@ impl RaopBuffer {
                 audio_buffer_len: 0,
                 pending: false,
                 offload_tag: 0,
+                packet_len: 0,
             })
             .collect();
 
@@ -417,13 +420,18 @@ impl RaopBuffer {
         }
 
         let idx = seqnum as usize % RAOP_BUFFER_LENGTH;
-        // Skip exact duplicates.
-        if self.entries[idx].available && seqnum_cmp(self.entries[idx].seqnum, seqnum) == 0 {
+        // Skip duplicates: a resend of what is here or with the offload. A sender may send a placeholder and the
+        // frame under the same sequence number, in either order (one test sender opens with two 8-byte payloads):
+        // a frame decoded here stays, and one with the offload is replaced only by a longer packet.
+        if seqnum_cmp(self.entries[idx].seqnum, seqnum) == 0
+            && (self.entries[idx].available
+                || (self.entries[idx].pending && self.entries[idx].packet_len >= datalen))
+        {
             return 0;
         }
-
-        if self.entries[idx].pending && seqnum_cmp(self.entries[idx].seqnum, seqnum) == 0 {
-            return 0;
+        if self.entries[idx].pending {
+            // the offload's result for the replaced packet must not be taken for this one: a new tag
+            self.generation = self.generation.wrapping_add(1);
         }
 
         // A failed replacement must not leave stale data available in this slot.
@@ -474,6 +482,7 @@ impl RaopBuffer {
         entry.flags = data[0];
         entry.entry_type = data[1];
         entry.seqnum = seqnum;
+        entry.packet_len = data.len();
         entry.timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         entry.ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         entry.audio_buffer_len = num_samples;
@@ -597,12 +606,27 @@ impl RaopBuffer {
         Some(&self.entries[idx].audio_buffer[..len])
     }
 
-    /// Flush the buffer, discarding all queued frames.
+    /// Flush the buffer.
     ///
-    /// If `next_seq` is a valid 16-bit value (0..=0xFFFF), the buffer resets
-    /// to expect that sequence number next. Otherwise the buffer is fully emptied.
+    /// If `next_seq` is a valid 16-bit value (0..=0xFFFF), the buffer resets to expect that sequence number next,
+    /// and the frames from it on that are already here stay: a sender streams right after RECORD, so its first
+    /// packets can be queued before the flush RECORD asks for (they played as silence). Otherwise the buffer is
+    /// fully emptied.
     pub fn flush(&mut self, next_seq: i32) {
+        let keep = (0..=0xffff).contains(&next_seq) && !self.is_empty;
+        let ns = next_seq as u16;
+        let (old_last, mut kept_last) = (self.last_seqnum, None);
         for entry in &mut self.entries {
+            if keep
+                && (entry.available || entry.pending)
+                && seqnum_cmp(entry.seqnum, ns) >= 0
+                && seqnum_cmp(entry.seqnum, old_last) <= 0
+            {
+                if kept_last.is_none_or(|k| seqnum_cmp(entry.seqnum, k) > 0) {
+                    kept_last = Some(entry.seqnum);
+                }
+                continue;
+            }
             entry.available = false;
             entry.pending = false;
             entry.audio_buffer_len = 0;
@@ -611,8 +635,8 @@ impl RaopBuffer {
         if !(0..=0xffff).contains(&next_seq) {
             self.is_empty = true;
         } else {
-            self.first_seqnum = next_seq as u16;
-            self.last_seqnum = (next_seq as u16).wrapping_sub(1);
+            self.first_seqnum = ns;
+            self.last_seqnum = kept_last.unwrap_or(ns.wrapping_sub(1));
         }
     }
 }
@@ -697,13 +721,52 @@ mod offload_tests {
     fn results_from_before_a_flush_are_ignored() {
         let (mut b, q) = buffer();
         assert_eq!(b.queue(&packet(20), true), 1);
-        b.flush(20);
+        b.flush(-1);
         // the same sequence number again after the flush: a new tag (generation)
         assert_eq!(b.queue(&packet(20), true), 1);
         finish(&q, 1); // the stale one finishes first: dropped
         assert!(b.dequeue_s16(true).is_none());
         finish(&q, 2);
         assert_eq!(b.dequeue_s16(true).unwrap(), &[20; 4]);
+    }
+
+    #[test]
+    fn a_flush_keeps_what_is_already_here_from_its_sequence_number_on() {
+        // RECORD's flush to 31 arrives after the sender's first packets: 30 goes, 31 and 32 play
+        let (mut b, q) = buffer();
+        for seq in 30..33 {
+            assert_eq!(b.queue(&packet(seq), true), 1);
+        }
+        b.flush(31);
+        finish(&q, 3);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[31; 4]);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[32; 4]);
+        assert!(b.dequeue_s16(true).is_none());
+    }
+
+    #[test]
+    fn another_packet_under_a_pending_sequence_number_replaces_it() {
+        // a sender's placeholder, then the frame: the placeholder's result is not taken for the frame
+        let (mut b, q) = buffer();
+        let mut placeholder = packet(40);
+        placeholder.truncate(20);
+        assert_eq!(b.queue(&placeholder, true), 1);
+        assert_eq!(b.queue(&packet(40), true), 1);
+        assert_eq!(q.lock().unwrap().len(), 2);
+        finish(&q, 2);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[40; 4]);
+        assert!(b.dequeue_s16(true).is_none());
+    }
+
+    #[test]
+    fn a_placeholder_after_the_frame_does_not_replace_it() {
+        let (mut b, q) = buffer();
+        let mut placeholder = packet(50);
+        placeholder.truncate(20);
+        assert_eq!(b.queue(&packet(50), true), 1);
+        assert_eq!(b.queue(&placeholder, true), 0);
+        finish(&q, 1);
+        assert_eq!(b.dequeue_s16(true).unwrap(), &[50; 4]);
     }
 
     #[test]
