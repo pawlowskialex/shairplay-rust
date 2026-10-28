@@ -464,6 +464,19 @@ pub(crate) fn handle_info(
         ),
     );
     dict.insert("pk".into(), plist::Value::String(pk_hex));
+    dict.insert(
+        "supportedFormats".into(),
+        plist::Value::Dictionary(plist::Dictionary::from_iter([
+            (
+                "audioStream".to_string(),
+                plist::Value::Integer(config::AUDIO_STREAM_FORMATS.into()),
+            ),
+            (
+                "bufferStream".to_string(),
+                plist::Value::Integer(config::BUFFER_STREAM_FORMATS.into()),
+            ),
+        ])),
+    );
     if let Some(volume) = conn.shared.handler.volume() {
         dict.insert("initialVolume".into(), plist::Value::Real(volume.into()));
     }

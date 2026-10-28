@@ -73,6 +73,32 @@ impl AlacFormat {
     }
 }
 
+/// A decoder for buffered (type 103) ALAC streams: their SETUP carries no ALACSpecificConfig, the frames use
+/// Apple's encoder defaults (352 frames a packet; pb 40, mb 10, kb 14, max run 255: as shairport-sync sets up
+/// FFmpeg for them).
+#[cfg(feature = "ap2-core")]
+pub(crate) fn buffered_decoder(sample_rate: u32, bit_depth: u8, channels: u8) -> AlacDecoder {
+    let mut info = [0u8; 48];
+    info[24..28].copy_from_slice(&352u32.to_be_bytes());
+    info[29] = bit_depth;
+    info[30] = 40;
+    info[31] = 10;
+    info[32] = 14;
+    info[33] = channels;
+    info[34..36].copy_from_slice(&255u16.to_be_bytes());
+    info[44..48].copy_from_slice(&sample_rate.to_be_bytes());
+    let mut d = AlacDecoder::new(i32::from(bit_depth), i32::from(channels));
+    d.set_info(&info);
+    d
+}
+
+#[cfg(feature = "ap2-core")]
+impl crate::codec::aac::AacBackend for AlacDecoder {
+    fn decode(&mut self, frame: &[u8]) -> Option<Pcm> {
+        self.decode_frame_pcm(frame)
+    }
+}
+
 /// Bitstream reader for ALAC decoding.
 struct BitReader<'a> {
     buf: &'a [u8],
@@ -584,8 +610,8 @@ impl AlacDecoder {
         output_size
     }
 
-    /// Decode an ALAC frame into interleaved PCM: 16-bit streams as [`Pcm::S16`] (no float on the
-    /// way), 24-bit ones as [`Pcm::F32`] (full precision).
+    /// Decode an ALAC frame into interleaved PCM: 16-bit streams as [`Pcm::S16`], 24-bit ones as
+    /// [`Pcm::S24`] (no float on the way).
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) fn decode_frame_pcm(&mut self, input: &[u8]) -> Option<Pcm> {
         if self.max_samples_per_frame == 0 || self.bytes_per_sample <= 0 {
@@ -604,15 +630,14 @@ impl AlacDecoder {
 
         match self.sample_size_config {
             16 => Some(Pcm::from_s16le(&pcm_buf[..len])),
-            24 => Some(Pcm::F32(
+            24 => Some(Pcm::S24(
                 pcm_buf[..len]
                     .as_chunks::<3>()
                     .0
                     .iter()
                     .map(|c| {
                         let raw = c[0] as i32 | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
-                        let sample = (raw << 8) >> 8;
-                        sample as f32 / 8_388_608.0
+                        (raw << 8) >> 8
                     })
                     .collect(),
             )),
@@ -1005,6 +1030,27 @@ mod decode_tests {
         for (actual, expected) in decoded.iter().zip(samples) {
             assert!((*actual - expected as f32 / 8_388_608.0).abs() < f32::EPSILON);
         }
+    }
+
+    #[cfg(feature = "ap2-core")]
+    #[test]
+    fn buffered_24bit_frames_come_out_as_s24_and_round_to_16_bits() {
+        let mut dec = buffered_decoder(48_000, 24, 2);
+        let samples: [i32; 4] = [0, 0x7f_ffff, -0x80_0000, 0x17f];
+        let mut w = BitWriter::new();
+        w.put(1, 3); // channels = 1 (stereo)
+        w.put(0, 4);
+        w.put(0, 12);
+        w.put(1, 1); // has_size = 1: 2 frames, not the 352 of a full packet
+        w.put(0, 2); // uncompressed_bytes = 0
+        w.put(1, 1); // is_not_compressed = 1
+        w.put(2, 32);
+        for &sample in &samples {
+            w.put((sample as u32) & 0x00ff_ffff, 24);
+        }
+        let pcm = dec.decode_frame_pcm(&w.bytes).expect("decodes");
+        assert!(matches!(&pcm, Pcm::S24(v) if v[..] == samples[..]));
+        assert_eq!(pcm.into_s16(), vec![0, 32767, -32768, 1]);
     }
 
     #[test]
