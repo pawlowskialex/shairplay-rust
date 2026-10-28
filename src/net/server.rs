@@ -550,6 +550,7 @@ fn spawn_accept_loop(
                         Err(_) => continue,
                     };
                     tracing::info!(%remote, "New connection");
+                    crate::net::keepalive(&stream);
                     let local = match stream.local_addr() {
                         Ok(a) => a,
                         Err(_) => continue,
