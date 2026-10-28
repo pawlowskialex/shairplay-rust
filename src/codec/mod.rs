@@ -17,6 +17,8 @@ use crate::raop::{AudioSession, SampleFormat};
 pub(crate) enum Pcm {
     F32(Vec<f32>),
     S16(Vec<i16>),
+    /// 24-bit samples, sign-extended (24-bit ALAC)
+    S24(Vec<i32>),
 }
 
 #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
@@ -25,6 +27,7 @@ impl Pcm {
         match self {
             Pcm::F32(v) => v,
             Pcm::S16(v) => v.iter().map(|&s| s as f32 / 32768.0).collect(),
+            Pcm::S24(v) => v.iter().map(|&s| s as f32 / 8_388_608.0).collect(),
         }
     }
 
@@ -34,6 +37,11 @@ impl Pcm {
             Pcm::F32(v) => v
                 .iter()
                 .map(|&x| (x.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .collect(),
+            // rounded to the nearest 16-bit value (no float on the way)
+            Pcm::S24(v) => v
+                .iter()
+                .map(|&s| ((s + 128) >> 8).clamp(-32768, 32767) as i16)
                 .collect(),
         }
     }

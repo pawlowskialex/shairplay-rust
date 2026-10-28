@@ -461,13 +461,21 @@ impl Stream {
     ) -> (Self, AudioFormat) {
         let src_sr = ssrc.sample_rate();
         let src_ch = ssrc.channels();
-        let external = output_config
-            .aac_decoder
-            .as_ref()
-            .and_then(|f| f(src_sr, src_ch));
-        let decoder = match external {
-            Some(d) => Ok(Box::new(crate::codec::aac::External(d)) as Box<dyn AacBackend>),
-            None => crate::codec::aac::new_decoder(src_sr, src_ch),
+        let decoder = if ssrc.is_alac() {
+            Ok(Box::new(crate::codec::alac::buffered_decoder(
+                src_sr,
+                ssrc.bit_depth().unwrap_or(16),
+                src_ch,
+            )) as Box<dyn AacBackend>)
+        } else {
+            let external = output_config
+                .aac_decoder
+                .as_ref()
+                .and_then(|f| f(src_sr, src_ch));
+            match external {
+                Some(d) => Ok(Box::new(crate::codec::aac::External(d)) as Box<dyn AacBackend>),
+                None => crate::codec::aac::new_decoder(src_sr, src_ch),
+            }
         };
         let decoder = match decoder {
             Ok(d) => Some(d),

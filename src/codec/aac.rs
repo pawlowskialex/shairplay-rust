@@ -55,7 +55,6 @@ impl AudioSsrc {
     }
 
     /// Whether this format uses ALAC encoding.
-    #[allow(dead_code)]
     pub(crate) fn is_alac(self) -> bool {
         matches!(self, Self::Alac44100S16Stereo | Self::Alac48000S24Stereo)
     }
@@ -78,7 +77,6 @@ impl AudioSsrc {
     }
 
     /// Source bit depth for ALAC formats.
-    #[allow(dead_code)]
     pub(crate) fn bit_depth(self) -> Option<u8> {
         match self {
             Self::Alac44100S16Stereo => Some(16),
