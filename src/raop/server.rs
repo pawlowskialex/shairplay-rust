@@ -64,6 +64,7 @@ fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
 pub struct RaopServerBuilder {
     max_clients: usize,
     hwaddr: Option<Vec<u8>>,
+    identity: crate::raop::DeviceIdentity,
     password: Option<String>,
     #[cfg(feature = "pipewire-auth-setup-compat")]
     pipewire_auth_setup_compat: bool,
@@ -103,6 +104,7 @@ impl RaopServerBuilder {
         Self {
             max_clients: 10,
             hwaddr: None,
+            identity: crate::raop::DeviceIdentity::default(),
             password: None,
             #[cfg(feature = "pipewire-auth-setup-compat")]
             pipewire_auth_setup_compat: false,
@@ -134,6 +136,11 @@ impl RaopServerBuilder {
     /// Set the maximum number of concurrent connections. Default: 10.
     pub fn max_clients(mut self, n: usize) -> Self {
         self.max_clients = n;
+        self
+    }
+    /// How the receiver presents itself to senders: model, maker, serial number, firmware (default: an Apple TV).
+    pub fn identity(mut self, identity: crate::raop::DeviceIdentity) -> Self {
+        self.identity = identity;
         self
     }
     /// Set the 6-byte hardware address for mDNS registration.
@@ -367,6 +374,7 @@ impl RaopServerBuilder {
         });
 
         let shared = Arc::new(RaopShared {
+            identity: self.identity.clone(),
             rsakey,
             pairing,
             hwaddr: hwaddr.clone(),
@@ -514,6 +522,7 @@ impl RaopServer {
                     &pi,
                     self.shared.pin.is_some(),
                     self.shared.pairing_store.has_any_pairing(),
+                    &self.shared.identity,
                 );
             }
         }
@@ -523,6 +532,7 @@ impl RaopServer {
             &self.hwaddr,
             !self.shared.password.is_empty(),
             &self.ap1_advertisement,
+            &self.shared.identity,
         )
     }
 }
