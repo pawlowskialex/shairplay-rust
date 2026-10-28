@@ -462,9 +462,22 @@ struct Stream {
     resampler: Option<crate::codec::resample::StreamResampler>,
     src_channels: u8,
     out_channels: u8,
+    /// The frame the decoder should see next (sequence number), to tell a discontinuity.
+    next_seq: Option<u32>,
 }
 
 impl Stream {
+    /// Whether frame `seq`, about to go to the decoder, decodes only to prime it. AAC is a lapped transform: each
+    /// frame's output is completed by the previous one's, so the first frame after a discontinuity (a stream's start,
+    /// a flush, frames skipped as late) comes out as the new audio over the old position's tail with its aliasing
+    /// uncancelled: 23 ms of garbage at each seek, many of them while scrubbing [HW 2026-10-28]. It is decoded, to
+    /// fill the overlap, and its output dropped (pre-roll, as decoders do after a seek). ALAC frames stand alone.
+    fn preroll(&mut self, seq: u32) -> bool {
+        let gap = self.next_seq != Some(seq);
+        self.next_seq = Some(seq.wrapping_add(1) & SEQ_MASK);
+        gap && !self.ssrc.is_alac()
+    }
+
     fn new(
         ssrc: AudioSsrc,
         output_config: &OutputConfig,
@@ -530,6 +543,7 @@ impl Stream {
             resampler,
             src_channels: src_ch,
             out_channels: target_ch,
+            next_seq: None,
         };
         (stream, format)
     }
@@ -581,6 +595,8 @@ struct Ahead {
     ts: u32,
     tag: u32,
     pcm: Decoding,
+    /// Decoded only to prime the decoder ([`Stream::preroll`]): not delivered.
+    preroll: bool,
 }
 
 /// Where an `Ahead` frame is.
@@ -759,12 +775,14 @@ fn delivery_loop(
             for f in to_submit {
                 let tag = next_tag;
                 next_tag = next_tag.wrapping_add(1);
+                let preroll = st.preroll(f.seq);
                 if st.submit(tag, &f.data) {
                     ahead.push_back(Ahead {
                         seq: f.seq,
                         ts: f.ts,
                         tag,
                         pcm: Decoding::Pending,
+                        preroll,
                     });
                 } else {
                     if ahead.is_empty() {
@@ -778,6 +796,7 @@ fn delivery_loop(
                         ts: f.ts,
                         tag,
                         pcm: Decoding::Done(pcm),
+                        preroll,
                     });
                 }
             }
@@ -805,7 +824,7 @@ fn delivery_loop(
             }
             decoded += 1;
             delivered = Some(e.seq);
-            if let (Decoding::Done(Some(pcm)), Some(sess)) = (e.pcm, session.as_mut()) {
+            if let (Decoding::Done(Some(pcm)), Some(sess), false) = (e.pcm, session.as_mut(), e.preroll) {
                 deliver(pcm, e.ts, sess);
             }
             progress = true;
@@ -813,7 +832,8 @@ fn delivery_loop(
 
         for f in ready {
             let t = now_ns();
-            let pcm = stream.as_mut().and_then(|st| st.decode(&f.data));
+            let preroll = stream.as_mut().is_some_and(|st| st.preroll(f.seq));
+            let pcm = stream.as_mut().and_then(|st| st.decode(&f.data)).filter(|_| !preroll);
             decode_ns += now_ns().saturating_sub(t);
             decoded += 1;
             delivered = Some(f.seq);
@@ -916,11 +936,11 @@ mod decode_ahead_tests {
         }
     }
 
-    /// Frames 0..n (one every 1024 samples, playing from now), the delivery loop with `mock`: what came out.
-    /// `flush_at`: k frames in, a deferred flush of frames k+4 .. k+7.
-    fn play(n: u8, asynchronous: bool, flush_at: Option<u8>) -> Vec<i16> {
+    /// Frames 0..n but `skip` (one every 1024 samples, playing from now), the delivery loop with `mock`: what came
+    /// out. `flush_at`: k frames in, a deferred flush of frames k+4 .. k+7.
+    fn play_skipping(n: u8, skip: std::ops::Range<u8>, asynchronous: bool, flush_at: Option<u8>) -> Vec<i16> {
         let mut st = PlayoutState::new();
-        for k in 0..n {
+        for k in (0..n).filter(|k| !skip.contains(k)) {
             st.arrive(Frame {
                 seq: u32::from(k),
                 ts: u32::from(k) * 1024,
@@ -977,22 +997,37 @@ mod decode_ahead_tests {
         out.lock().unwrap().clone()
     }
 
+    fn play(n: u8, asynchronous: bool, flush_at: Option<u8>) -> Vec<i16> {
+        play_skipping(n, 0..0, asynchronous, flush_at)
+    }
+
     #[test]
     fn asynchronous_decoder_frames_come_out_in_order() {
-        assert_eq!(play(24, true, None), (0..24).collect::<Vec<i16>>());
+        // (the first only primes the decoder: pre-roll)
+        assert_eq!(play(24, true, None), (1..24).collect::<Vec<i16>>());
     }
 
     #[test]
     fn synchronous_decoder_frames_come_out_in_order() {
-        assert_eq!(play(16, false, None), (0..16).collect::<Vec<i16>>());
+        assert_eq!(play(16, false, None), (1..16).collect::<Vec<i16>>());
     }
 
     #[test]
     fn a_flush_drops_frames_and_nothing_comes_out_twice_or_out_of_order() {
         let got = play(24, true, Some(6));
         assert!(got.windows(2).all(|w| w[0] < w[1]), "order: {got:?}");
-        let want: Vec<i16> = (0..24).filter(|&k| !(10..13).contains(&k)).collect();
-        assert_eq!(got, want, "exactly the flushed frames are missing");
+        // and the frame after them, if the decoder hadn't had them yet (pre-roll after the gap)
+        let want: Vec<i16> = (1..24).filter(|&k| !(10..13).contains(&k)).collect();
+        let want_preroll: Vec<i16> = (1..24).filter(|&k| !(10..14).contains(&k)).collect();
+        assert!(got == want || got == want_preroll, "exactly the flushed frames are missing: {got:?}");
+    }
+
+    #[test]
+    fn the_first_frame_after_a_gap_only_primes_the_decoder() {
+        for asynchronous in [true, false] {
+            let want: Vec<i16> = (1..16).filter(|&k| !(5..9).contains(&k)).collect();
+            assert_eq!(play_skipping(16, 5..8, asynchronous, None), want, "asynchronous: {asynchronous}");
+        }
     }
 
     #[test]
