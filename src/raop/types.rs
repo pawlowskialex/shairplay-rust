@@ -337,3 +337,32 @@ pub trait RemoteControl: Send + Sync {
     /// Commands the source device supports. AP1 returns all; AP2 returns advertised set.
     fn available_commands(&self) -> Vec<RemoteCommand>;
 }
+
+/// How the receiver presents itself to senders (mDNS TXT `model` / `am`, `manufacturer`, `serialNumber`, `fv`,
+/// `osvers` / `ov`; GET /info; the event channel's `updateInfo`). Senders pick the icon from the model: one they don't
+/// know (a third-party speaker's own name) gets a generic speaker. The default is an Apple TV, as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// The model identifier (`AppleTV2,1`, or a product name as third-party speakers send: "Amp", "One").
+    pub model: String,
+    /// The maker (`manufacturer`; Apple's own devices send none).
+    pub manufacturer: Option<String>,
+    /// A serial number (`serialNumber`).
+    pub serial_number: Option<String>,
+    /// The firmware version (`fv`).
+    pub firmware_version: String,
+    /// An Apple OS version (`osvers`, `ov`): only Apple's devices send one.
+    pub os_version: Option<String>,
+}
+
+impl Default for DeviceIdentity {
+    fn default() -> Self {
+        Self {
+            model: crate::raop::config::GLOBAL_MODEL.into(),
+            manufacturer: None,
+            serial_number: None,
+            firmware_version: "77.40.00".into(),
+            os_version: Some("15.6".into()),
+        }
+    }
+}

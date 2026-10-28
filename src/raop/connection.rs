@@ -16,6 +16,7 @@ use std::sync::Arc;
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
     pub(crate) rsakey: Arc<RsaKey>,
+    pub(crate) identity: crate::raop::DeviceIdentity,
     pub(crate) pairing: Arc<Pairing>,
     pub(crate) hwaddr: Vec<u8>,
     pub(crate) password: String,

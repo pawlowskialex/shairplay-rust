@@ -44,8 +44,6 @@ pub(crate) const RAOP_AP2_VN: &str = "65537";
 
 /// Global feature bitmask for AP1 discovery.
 pub(crate) const GLOBAL_FEATURES: u32 = 0x7;
-/// Device model identifier.
-pub(crate) const GLOBAL_MODEL: &str = crate::raop::config::GLOBAL_MODEL;
 /// Software version string.
 pub(crate) const GLOBAL_VERSION: &str = "130.14";
 
@@ -54,12 +52,6 @@ pub(crate) const GLOBAL_VERSION: &str = "130.14";
 /// Source version string.
 #[cfg(feature = "ap2-core")]
 pub(crate) const AP2_SRCVERS: &str = crate::raop::config::AP2_SRCVERS;
-/// OS version string.
-#[cfg(feature = "ap2-core")]
-pub(crate) const AP2_OSVERS: &str = "15.6";
-/// Firmware version string.
-#[cfg(feature = "ap2-core")]
-pub(crate) const AP2_FW_VERSION: &str = "77.40.00";
 /// Protocol version string.
 #[cfg(feature = "ap2-core")]
 pub(crate) const AP2_PROTOVERS: &str = crate::raop::config::AP2_PROTOVERS;
@@ -82,7 +74,14 @@ pub struct AirPlayServiceInfo {
 impl AirPlayServiceInfo {
     /// Create AP1 service info with the default advertised capabilities.
     pub fn new(name: &str, port: u16, hwaddr: &[u8], password: bool) -> Self {
-        Self::new_with_ap1_advertisement(name, port, hwaddr, password, &Ap1Advertisement::default())
+        Self::new_with_ap1_advertisement(
+            name,
+            port,
+            hwaddr,
+            password,
+            &Ap1Advertisement::default(),
+            &crate::raop::DeviceIdentity::default(),
+        )
     }
 
     /// Create AP1 service info with a validated server advertisement.
@@ -92,6 +91,7 @@ impl AirPlayServiceInfo {
         hwaddr: &[u8],
         password: bool,
         advertisement: &Ap1Advertisement,
+        identity: &crate::raop::DeviceIdentity,
     ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
         let hw_airplay = util::hwaddr_airplay(hwaddr);
@@ -121,7 +121,7 @@ impl AirPlayServiceInfo {
         let airplay_txt = vec![
             ("deviceid".into(), hw_airplay),
             ("features".into(), format!("0x{GLOBAL_FEATURES:x}")),
-            ("model".into(), GLOBAL_MODEL.into()),
+            ("model".into(), identity.model.clone()),
         ];
 
         Self {
@@ -146,6 +146,7 @@ impl AirPlayServiceInfo {
         pi: &str,
         requires_pin_pairing: bool,
         already_paired: bool,
+        identity: &crate::raop::DeviceIdentity,
     ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
         let hw_airplay = util::hwaddr_airplay(hwaddr);
@@ -169,16 +170,19 @@ impl AirPlayServiceInfo {
             ),
             // AP2 fields
             ("ft".into(), ft.clone()),
-            ("fv".into(), AP2_FW_VERSION.into()),
+            ("fv".into(), identity.firmware_version.clone()),
             ("sf".into(), format!("0x{status_flags:X}")),
             ("md".into(), RAOP_MD.into()),
-            ("am".into(), GLOBAL_MODEL.into()),
+            ("am".into(), identity.model.clone()),
             ("pk".into(), pk_hex.into()),
             ("tp".into(), RAOP_TP.into()), // TCP for AP1 fallback, UDP for AP2
             ("vn".into(), RAOP_AP2_VN.into()),
             ("vs".into(), AP2_SRCVERS.into()),
-            ("ov".into(), AP2_OSVERS.into()),
         ];
+        let mut raop_txt = raop_txt;
+        if let Some(ov) = &identity.os_version {
+            raop_txt.push(("ov".into(), ov.clone()));
+        }
 
         let airplay_txt = vec![
             ("acl".into(), "0".into()),
@@ -189,15 +193,24 @@ impl AirPlayServiceInfo {
             ("gid".into(), pi.into()),
             ("igl".into(), "0".into()),
             ("gcgl".into(), "0".into()),
-            ("model".into(), GLOBAL_MODEL.into()),
+            ("model".into(), identity.model.clone()),
             ("protovers".into(), AP2_PROTOVERS.into()),
             ("pi".into(), pi.into()),
             ("pk".into(), pk_hex.into()),
             ("srcvers".into(), AP2_SRCVERS.into()),
-            ("osvers".into(), AP2_OSVERS.into()),
             ("vv".into(), "2".into()),
-            ("fv".into(), AP2_FW_VERSION.into()),
+            ("fv".into(), identity.firmware_version.clone()),
         ];
+        let mut airplay_txt = airplay_txt;
+        if let Some(os) = &identity.os_version {
+            airplay_txt.push(("osvers".into(), os.clone()));
+        }
+        if let Some(m) = &identity.manufacturer {
+            airplay_txt.push(("manufacturer".into(), m.clone()));
+        }
+        if let Some(sn) = &identity.serial_number {
+            airplay_txt.push(("serialNumber".into(), sn.clone()));
+        }
 
         Self {
             raop_name,
@@ -388,6 +401,7 @@ mod tests {
             "12345678-1234-1234-1234-123456789abc",
             false,
             false,
+            &crate::raop::DeviceIdentity::default(),
         );
 
         let find = |key: &str| {
@@ -419,6 +433,7 @@ mod tests {
             "my-uuid-here",
             false,
             false,
+            &crate::raop::DeviceIdentity::default(),
         );
 
         let find = |key: &str| {
@@ -452,6 +467,7 @@ mod tests {
             "pi",
             false,
             false,
+            &crate::raop::DeviceIdentity::default(),
         );
         assert_eq!(info.raop_name, "123456789ABC@My Speaker");
         assert_eq!(info.airplay_name, "My Speaker");
@@ -469,6 +485,7 @@ mod tests {
             "my-uuid-here",
             true,
             false,
+            &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
             info.raop_txt
@@ -501,6 +518,7 @@ mod tests {
             "my-uuid-here",
             true,
             false,
+            &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
             info.raop_txt
@@ -519,5 +537,44 @@ mod tests {
         assert_eq!(airplay("features"), Some("0x527FFEE6,0x0"));
         assert_eq!(raop("sf"), Some("0x204"));
         assert_eq!(airplay("flags"), Some("0x204"));
+    }
+
+    #[test]
+    fn a_third_party_identity_names_its_maker_and_no_apple_os() {
+        let id = crate::raop::DeviceIdentity {
+            model: "Zeppelin Air".into(),
+            manufacturer: Some("Bowers & Wilkins".into()),
+            serial_number: Some("EC-66-D1-01-EA-DE".into()),
+            firmware_version: "zd1-os abc".into(),
+            os_version: None,
+        };
+        let info = AirPlayServiceInfo::new_airplay2(
+            "Z",
+            7000,
+            &[1, 2, 3, 4, 5, 6],
+            false,
+            "00",
+            "pi",
+            false,
+            false,
+            &id,
+        );
+        let get = |k: &str| {
+            info.airplay_txt
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("model"), Some("Zeppelin Air"));
+        assert_eq!(get("manufacturer"), Some("Bowers & Wilkins"));
+        assert_eq!(get("serialNumber"), Some("EC-66-D1-01-EA-DE"));
+        assert_eq!(get("fv"), Some("zd1-os abc"));
+        assert_eq!(get("osvers"), None);
+        assert!(!info.raop_txt.iter().any(|(n, _)| n == "ov"));
+        assert!(
+            info.raop_txt
+                .iter()
+                .any(|(n, v)| n == "am" && v == "Zeppelin Air")
+        );
     }
 }
