@@ -521,6 +521,10 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         }
     }
 
+    if let Some(id) = dict.get("deviceID").and_then(|v| v.as_string()) {
+        conn.sender_id = id.to_string();
+    }
+
     let is_rc_only = dict
         .get("isRemoteControlOnly")
         .and_then(|v| v.as_boolean())
@@ -732,6 +736,8 @@ fn setup_stream_realtime(
                 sender: std::net::SocketAddr::new(conn.remote_socket.ip(), p as u16),
             });
 
+        conn.shared
+            .claim_stream(conn.id, &conn.sender_id, &conn.close);
         let handler = conn.shared.handler.clone();
         let output_config = crate::raop::realtime_audio::OutputConfig {
             source_sample_rate: alac_format.sample_rate,
@@ -844,6 +850,8 @@ fn setup_stream_buffered(
     let listener = bind_tcp(bind_addr_for(conn))?;
     let audio_port = listener.local_addr().ok()?.port();
     tracing::info!(audio_port, "Buffered audio TCP port opened");
+    conn.shared
+        .claim_stream(conn.id, &conn.sender_id, &conn.close);
 
     let handler = conn.shared.handler.clone();
     let output_config = crate::raop::buffered_audio::OutputConfig {

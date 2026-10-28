@@ -232,6 +232,11 @@ pub(crate) trait ConnectionHandler: Send {
         false
     }
 
+    /// A signal that closes the connection (another sender took over).
+    fn close_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
     /// Called after a response is written. Activates pending encryption.
     fn after_response(&mut self) {}
 }
@@ -491,17 +496,33 @@ async fn process_connection<S>(
         if !send_completed_responses(&mut stream, handler.as_mut(), &mut request, config).await {
             break;
         }
-        let read = if let Some(deadline) = request.body_deadline {
-            match timeout_at(deadline, stream.read(&mut buf)).await {
-                Ok(result) if Instant::now() < deadline => result,
-                _ => {
-                    tracing::debug!("Request body deadline exceeded");
-                    break;
-                }
+        let close = handler.close_signal();
+        let closed = async {
+            match &close {
+                Some(c) => c.notified().await,
+                None => std::future::pending().await,
             }
-        } else {
-            stream.read(&mut buf).await
         };
+        let read = tokio::select! {
+            r = async {
+                if let Some(deadline) = request.body_deadline {
+                    match timeout_at(deadline, stream.read(&mut buf)).await {
+                        Ok(result) if Instant::now() < deadline => Some(result),
+                        _ => {
+                            tracing::debug!("Request body deadline exceeded");
+                            None
+                        }
+                    }
+                } else {
+                    Some(stream.read(&mut buf).await)
+                }
+            } => r,
+            _ = closed => {
+                tracing::info!(%remote, "Closing: another sender took over");
+                None
+            }
+        };
+        let Some(read) = read else { break };
         let n = match read {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
