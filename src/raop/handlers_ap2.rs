@@ -950,6 +950,14 @@ pub(crate) fn handle_record(
 }
 
 #[cfg(feature = "ap2-core")]
+/// A plist integer as its 64 bits: Apple's plists carry unsigned 64-bit values (a fraction of a second, a clock
+/// identity) as signed integers when the top bit is set.
+pub(crate) fn plist_u64(v: &plist::Value) -> Option<u64> {
+    v.as_unsigned_integer()
+        .or_else(|| v.as_signed_integer().map(|i| i as u64))
+}
+
+#[cfg(feature = "ap2-core")]
 /// AP2 SETRATEANCHORTI: set PTP anchor for timed playout.
 pub(crate) fn handle_set_rate_anchor_time(
     conn: &mut RaopConnection,
@@ -960,27 +968,15 @@ pub(crate) fn handle_set_rate_anchor_time(
     let plist_val: plist::Value = plist::from_bytes(data).ok()?;
     let dict = plist_val.as_dictionary()?;
 
-    let rate = dict
-        .get("rate")
-        .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0) as u32;
-    let rtp_time = dict
-        .get("rtpTime")
-        .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0) as u32;
-    let net_secs = dict
-        .get("networkTimeSecs")
-        .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0);
-    let net_frac = dict
-        .get("networkTimeFrac")
-        .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0);
+    let rate = dict.get("rate").and_then(plist_u64).unwrap_or(0) as u32;
+    let rtp_time = dict.get("rtpTime").and_then(plist_u64).unwrap_or(0) as u32;
+    let net_secs = dict.get("networkTimeSecs").and_then(plist_u64).unwrap_or(0);
+    let net_frac = dict.get("networkTimeFrac").and_then(plist_u64).unwrap_or(0);
 
     // The PTP clock the network time is on (absent: whichever master is heard).
     let timeline = dict
         .get("networkTimeTimelineID")
-        .and_then(|v| v.as_unsigned_integer())
+        .and_then(plist_u64)
         .unwrap_or(0);
 
     // Convert network time to nanoseconds (saturating: net_secs is peer-supplied).
