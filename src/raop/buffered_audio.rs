@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec::aac::{AacBackend, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
-use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
+use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, POLY1305_TAG_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
 use crate::util::now_ns;
 
@@ -388,6 +388,8 @@ async fn receive_loop(
     let mut len_buf = [0u8; 2];
     let mut current_ssrc = AudioSsrc::None;
     let mut failed = 0u32;
+    // frames read; empty ones (an Apple TV sends a few per stream: SSRC 0, no payload); of an unknown format
+    let (mut packets, mut empty, mut unknown) = (0u64, 0u32, 0u32);
 
     loop {
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -402,7 +404,9 @@ async fn receive_loop(
         if stream.read_exact(&mut packet).await.is_err() {
             break;
         }
-        if packet.len() <= RTP_HEADER_LEN + NONCE_TRAIL_LEN {
+        packets += 1;
+        if packet.len() <= RTP_HEADER_LEN + POLY1305_TAG_LEN + NONCE_TRAIL_LEN {
+            empty += 1;
             continue;
         }
 
@@ -411,6 +415,10 @@ async fn receive_loop(
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
         if ssrc == AudioSsrc::None {
+            unknown += 1;
+            if unknown.is_power_of_two() {
+                warn!(unknown, ssrc = format_args!("{ssrc_val:#010x}"), seq, "Buffered audio: frames of an unknown format");
+            }
             continue;
         }
 
@@ -444,7 +452,7 @@ async fn receive_loop(
         });
         cvar.notify_all();
     }
-    debug!("Buffered audio receive loop ended");
+    info!(packets, empty, unknown, failed, "Buffered audio receive loop ended");
     let (lock, cvar) = &*state;
     if let Ok(mut s) = lock.lock() {
         s.stopped = true;
