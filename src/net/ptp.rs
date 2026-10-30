@@ -293,7 +293,8 @@ struct SyncSamples {
     // (clock id, sequence) -> the Sync's (local, user) receive times or the Follow_Up's master time, whichever came
     // first: the two arrive on different sockets, handled by different tasks
     syncs: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64, u64)>>,
-    follow_ups: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64)>>,
+    /// (clock, sequence number, master time, when it came)
+    follow_ups: std::sync::Mutex<std::collections::VecDeque<(u64, u16, u64, u64)>>,
     log: Option<std::sync::Mutex<std::fs::File>>,
     /// The master heard last: its clock, where its Syncs come from, when (local ns), their first byte (the
     /// profile's transportSpecific nibble, mirrored in our Delay_Req).
@@ -345,14 +346,16 @@ impl SyncSamples {
                 *self.master.lock().unwrap() = Some((clock_id, from, user_ns, buf[0] & 0xf0));
                 let fu = {
                     let mut f = self.follow_ups.lock().unwrap();
+                    f.retain(|e| user_ns.saturating_sub(e.3) < PAIR_NS);
                     f.iter()
                         .position(|e| e.0 == clock_id && e.1 == seq)
                         .map(|i| f.remove(i).unwrap())
                 };
                 match fu {
-                    Some((_, _, master)) => Some((master, local_ns, user_ns)),
+                    Some((_, _, master, _)) => Some((master, local_ns, user_ns)),
                     None => {
                         let mut p = self.syncs.lock().unwrap();
+                        p.retain(|e| user_ns.saturating_sub(e.3) < PAIR_NS);
                         p.push_back((clock_id, seq, local_ns, user_ns));
                         while p.len() > 16 {
                             p.pop_front();
@@ -367,6 +370,7 @@ impl SyncSamples {
                 };
                 let sync = {
                     let mut p = self.syncs.lock().unwrap();
+                    p.retain(|e| user_ns.saturating_sub(e.3) < PAIR_NS);
                     p.iter()
                         .position(|e| e.0 == id && e.1 == seq)
                         .map(|i| p.remove(i).unwrap())
@@ -375,7 +379,8 @@ impl SyncSamples {
                     Some((_, _, local, user)) => Some((master_ns, local, user)),
                     None => {
                         let mut f = self.follow_ups.lock().unwrap();
-                        f.push_back((id, seq, master_ns));
+                        f.retain(|e| user_ns.saturating_sub(e.3) < PAIR_NS);
+                        f.push_back((id, seq, master_ns, user_ns));
                         while f.len() > 16 {
                             f.pop_front();
                         }
@@ -578,6 +583,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_sync_pairs_only_with_a_recent_follow_up() {
+        let path =
+            std::env::temp_dir().join(format!("shairplay-ptp-pair-{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = SyncSamples::new(Some(path.to_string_lossy().into_owned()));
+        let from = "127.0.0.1:320".parse().unwrap();
+        let id = 0x1122_33ff_fe44_5566u64;
+        let msg = |kind: u8, seq: u16, secs: u32| {
+            let mut b = vec![0u8; 54];
+            b[0] = kind;
+            b[20..28].copy_from_slice(&id.to_be_bytes());
+            b[30..32].copy_from_slice(&seq.to_be_bytes());
+            b[36..40].copy_from_slice(&secs.to_be_bytes());
+            b
+        };
+        // a Follow_Up whose Sync was lost; 40 s later a restarted master's Sync with the same number, then its own
+        s.packet(&msg(8, 7, 100), from, 1_000_000_000, 1_000_000_000);
+        s.packet(&msg(0, 7, 0), from, 41_000_000_000, 41_000_000_000);
+        s.packet(&msg(8, 7, 140), from, 41_001_000_000, 41_001_000_000);
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let rows: Vec<&str> = log.lines().collect();
+        assert_eq!(rows.len(), 1, "{log}");
+        assert!(rows[0].contains(",140000000000,41000000000,"), "{log}");
+    }
+
+    #[test]
     fn parse_follow_up_valid() {
         // Construct a minimal Follow_Up message (54 bytes)
         let mut buf = vec![0u8; 54];
@@ -738,6 +770,11 @@ pub struct Follower {
 }
 
 pub const FOLLOW_WINDOW_NS: u64 = 2_000_000_000;
+/// A Sync and its Follow_Up come milliseconds apart; a half that waited longer is from a lost packet's pair or from
+/// a master that restarted (its sequence numbers from 0 again, under the same identity): never paired, dropped. Paired
+/// with the new master's same-numbered half, it made a sample tens of seconds off, and the follower started over
+/// every few seconds [HW 2026-10-30: back-to-back ap2send sessions].
+const PAIR_NS: u64 = 1_000_000_000;
 pub const FOLLOW_WINDOWS: usize = 32;
 pub const LOCK_SAMPLES: u32 = 8;
 
