@@ -222,7 +222,8 @@ pub(crate) async fn spawn_ptp_sink() {
     }
 }
 
-/// One datagram, with the kernel's receive time (SO_TIMESTAMPNS, wall clock ns) where the build has it.
+/// One datagram, with the kernel's receive time where the build has it: SO_TIMESTAMPNS is on the wall clock, moved
+/// onto `now_ns`'s by the clocks' difference just after the read.
 async fn recv_stamped(
     sock: &tokio::net::UdpSocket,
     buf: &mut [u8],
@@ -264,9 +265,12 @@ async fn recv_stamped(
                             })
                     })
                     .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-                // a timestamp not within a second of now is a misread (time_t width): ignore it
-                let user = now_ns();
-                let stamp = stamp.filter(|&t| t.abs_diff(user) < 1_000_000_000);
+                // a timestamp not within a second of now is a misread (time_t width), or the wall clock stepped
+                // between the arrival and the read: ignore it
+                let (wall, user) = (crate::util::wall_ns(), now_ns());
+                let stamp = stamp
+                    .filter(|&t| t.abs_diff(wall) < 1_000_000_000)
+                    .map(|t| (user as i64 + (t as i64 - wall as i64)) as u64);
                 Ok((m.bytes, from, stamp))
             });
             match r {
@@ -892,7 +896,7 @@ impl Follower {
         }
     }
 
-    /// A Sync's receive time (local wall clock, ns) and its Follow_Up's send time (the master's clock).
+    /// A Sync's receive time (local clock, ns) and its Follow_Up's send time (the master's clock).
     pub fn sample(&self, clock_id: u64, master_ns: u64, local_ns: u64) {
         self.clocks
             .lock()
