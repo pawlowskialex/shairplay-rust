@@ -534,6 +534,9 @@ mod tests {
             audio_buffer_size: 0x10_0000,
             packet_offload: None,
             aac_decoder: None,
+            identity: Default::default(),
+            stream_owner: Mutex::new(None),
+            verified: Mutex::new(Vec::new()),
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {
@@ -546,6 +549,9 @@ mod tests {
             session: false,
             nonce: String::new(),
             shared,
+            id: 0,
+            close: Arc::new(tokio::sync::Notify::new()),
+            sender_id: String::new(),
         }
     }
 
