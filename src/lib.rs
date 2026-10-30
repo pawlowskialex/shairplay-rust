@@ -78,8 +78,8 @@ pub use net::server::BindConfig;
 #[cfg(feature = "hls")]
 pub use raop::hls::{HlsHandler, HlsSession};
 pub use raop::offload::{
-    AacDecoder, AacDecoderFactory, OffloadAlac, OffloadCipher, OffloadFactory, OffloadOutput,
-    OffloadStream, PacketOffload,
+    AacDecoder, AacDecoderFactory, AlacOffload, AlacOffloadFactory, FramePcm, OffloadAlac,
+    OffloadCipher, OffloadFactory, OffloadOutput, OffloadStream, PacketOffload,
 };
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};

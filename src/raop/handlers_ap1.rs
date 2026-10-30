@@ -537,6 +537,7 @@ mod tests {
             audio_buffer_size: 0x10_0000,
             packet_offload: None,
             aac_decoder: None,
+            alac_offload: None,
             identity: Default::default(),
             stream_owner: Mutex::new(None),
             verified: Mutex::new(Vec::new()),
