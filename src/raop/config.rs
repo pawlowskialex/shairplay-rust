@@ -105,13 +105,14 @@ fn encode_txt_values<T: Copy>(values: &[T], encode: fn(T) -> &'static str) -> St
 pub(crate) const AP2_PROTOVERS: &str = "1.1";
 
 /// The formats GET /info offers (`supportedFormats`, AirPlay 2 format bits as shairport-sync names them): realtime
-/// ALAC/44100/S16/2; buffered AAC-LC/44100 (what iPhones and Macs send), ALAC/44100/S16/2 and ALAC/48000/S24/2 (the
-/// lossless stream a HomePod or an Apple TV sends to the speakers grouped with it). Not AAC-LC/48000: a Mac's Music
-/// takes it whenever it may (resampling 44.1 kHz music), for nothing gained.
+/// ALAC/44100/S16/2; buffered AAC-LC/44100 and /48000, ALAC/44100/S16/2 and ALAC/48000/S24/2 (shairport-sync's set with
+/// lossless on). An Apple TV sets a stream up in the best of them (ALAC/48000/S24) and sends each item in its own
+/// format, frame by frame (the SSRC): lossless as ALAC, 48 kHz lossy audio (YouTube) as AAC-LC/48000, and without
+/// AAC-LC/48000 on offer it sends that audio as empty frames (silence). A Mac's Music takes AAC-LC/48000 for everything.
 #[cfg(feature = "ap2-core")]
 pub(crate) const AUDIO_STREAM_FORMATS: u64 = 0x4_0000;
 #[cfg(feature = "ap2-core")]
-pub(crate) const BUFFER_STREAM_FORMATS: u64 = 0x40_0000 | 0x4_0000 | 0x20_0000;
+pub(crate) const BUFFER_STREAM_FORMATS: u64 = 0x40_0000 | 0x80_0000 | 0x4_0000 | 0x20_0000;
 
 /// Software build/source version reported in GET /info and mDNS.
 #[cfg(feature = "ap2-core")]
