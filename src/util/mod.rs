@@ -2,12 +2,25 @@
 
 use std::fmt::Write;
 
-/// Current wall-clock time in nanoseconds since the UNIX epoch.
-///
-/// Saturates to 0 if the clock is before the epoch. Used by the AP2 audio
-/// playout scheduler and PTP timing code.
+/// The clock of play times, in nanoseconds: CLOCK_MONOTONIC on Linux (the wall clock steps: a device without a
+/// real-time clock boots in 1970 and NTP sets it once, under a stream already playing), else the wall clock. Used by
+/// the AP2 audio playout scheduler and PTP timing code; an application's output compares play times with the same
+/// clock.
 #[cfg(feature = "ap2-core")]
 pub fn now_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC");
+        t.tv_sec() as u64 * 1_000_000_000 + t.tv_nsec() as u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    wall_ns()
+}
+
+/// The wall clock in nanoseconds since the UNIX epoch (0 before it).
+#[cfg(feature = "ap2-core")]
+pub fn wall_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
