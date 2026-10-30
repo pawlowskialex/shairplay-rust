@@ -1083,9 +1083,12 @@ fn setup_stream_buffered(
         .get("audioFormat")
         .and_then(|v| v.as_unsigned_integer())
         .unwrap_or(0);
+    let num = |k: &str| stream0.get(k).and_then(|v| v.as_unsigned_integer());
     tracing::info!(
         stream_type = 103,
         audio_format,
+        spf = num("spf"),
+        ct = num("ct"),
         "AP2 buffered audio stream setup"
     );
 
