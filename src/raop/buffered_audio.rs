@@ -470,6 +470,8 @@ struct Stream {
     resampler: Option<crate::codec::resample::StreamResampler>,
     src_channels: u8,
     out_channels: u8,
+    /// The session's sample format, resolved for this stream's depth.
+    format: crate::raop::SampleFormat,
     /// The frame the decoder should see next (sequence number), to tell a discontinuity.
     next_seq: Option<u32>,
 }
@@ -538,9 +540,10 @@ impl Stream {
             }
             src_sr
         };
+        let sample_format = output_config.format.resolve(ssrc.bit_depth().unwrap_or(16));
         let format = AudioFormat {
             codec: AudioCodec::Pcm,
-            bits: output_config.format.bits(),
+            bits: sample_format.bits(),
             channels: target_ch,
             sample_rate: target_sr,
         };
@@ -551,6 +554,7 @@ impl Stream {
             resampler,
             src_channels: src_ch,
             out_channels: target_ch,
+            format: sample_format,
             next_seq: None,
         };
         (stream, format)
@@ -768,13 +772,14 @@ fn delivery_loop(
             late_logged = late;
         }
 
+        let format = stream.as_ref().map_or(output_config.format, |st| st.format);
         let deliver =
             |pcm: crate::codec::Pcm, ts: u32, sess: &mut Box<dyn crate::raop::AudioSession>| {
                 let at = match timing {
                     Timing::Network { .. } => play_time(timing, ts, sr),
                     Timing::Local { .. } => None,
                 };
-                pcm.deliver_timed(sess.as_mut(), output_config.format, at);
+                pcm.deliver_timed(sess.as_mut(), format, at);
             };
 
         let mut progress = !to_submit.is_empty() || !ready.is_empty();
