@@ -10,6 +10,8 @@ pub mod rsa;
 #[cfg(feature = "ap2-core")]
 pub mod chacha_transport;
 #[cfg(feature = "ap2-core")]
+mod mont;
+#[cfg(feature = "ap2-core")]
 pub mod pairing_homekit;
 #[cfg(feature = "ap2-core")]
 pub mod tlv;

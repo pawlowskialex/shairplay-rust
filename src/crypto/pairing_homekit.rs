@@ -2,6 +2,7 @@
 //!
 //! Implements PAIR_SERVER_HOMEKIT for AirPlay 2 pair-setup and pair-verify.
 
+use super::mont::{Mont, Words};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -25,7 +26,7 @@ const PV_ENCRYPT_SALT: &str = "Pair-Verify-Encrypt-Salt";
 const PV_ENCRYPT_INFO: &str = "Pair-Verify-Encrypt-Info";
 
 // RFC 5054 3072-bit group
-const N_3072_HEX: &str = "\
+pub(crate) const N_3072_HEX: &str = "\
 FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B\
 139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485\
 B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1F\
@@ -99,9 +100,9 @@ pub(crate) struct SrpServer {
     g: BigUint,
     salt: Vec<u8>,
     v: BigUint,
-    /// v^(16^k) for k < 128: v^u (u from SHA-512) by fixed-base exponentiation, ~140 multiplications instead of 512
-    /// squarings and ~128 more; made with the rest of the state, ahead of time
-    v_table: Vec<BigUint>,
+    /// v^(16^k) for k < 128, in Montgomery form: v^u (u from SHA-512) by fixed-base exponentiation, ~140
+    /// multiplications instead of 512 squarings and ~128 more; made with the rest of the state, ahead of time
+    v_table: Vec<Words>,
     b: BigUint,
     big_b: BigUint,
     session_key: Vec<u8>,
@@ -135,7 +136,8 @@ impl SrpServer {
         let x = calculate_x(&salt, USERNAME, pin.as_bytes());
 
         // v = g^x mod N
-        let v = g.modpow(&x, &n);
+        let m = group();
+        let v = m.from_mont(&m.pow(&m.to_mont(&g), &x));
 
         // k = H(pad(N) || pad(g))
         let k = h_nn_pad(&n, &g, N_3072_LEN);
@@ -147,13 +149,13 @@ impl SrpServer {
             let mut b_bytes = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
             let b = BigUint::from_bytes_be(&b_bytes);
-            let big_b = (&kv + g.modpow(&b, &n)) % &n;
+            let big_b = (&kv + m.from_mont(&m.pow(&m.to_mont(&g), &b))) % &n;
             if to_bytes_be(&big_b).len() == N_3072_LEN {
                 break (b, big_b);
             }
         };
 
-        let v_table = fixed_base_table(&v, &n, U_BITS / 4);
+        let v_table = fixed_base_table(m, &v, U_BITS / 4);
 
         Ok(Self {
             n,
@@ -235,11 +237,14 @@ impl SrpServer {
         // u = H(pad(A) || pad(B))
         let u = h_nn_pad(&big_a, &self.big_b, N_3072_LEN);
 
-        // S = (A * v^u)^b mod N
-        let vu = fixed_base_pow(&self.v_table, &u, &self.n)
-            .unwrap_or_else(|| self.v.modpow(&u, &self.n));
-        let avu = (&big_a * &vu) % &self.n;
-        let big_s = avu.modpow(&self.b, &self.n);
+        // S = (A * v^u)^b mod N, in Montgomery form throughout
+        let t0 = std::time::Instant::now();
+        let m = group();
+        let vu =
+            fixed_base_pow(m, &self.v_table, &u).unwrap_or_else(|| m.pow(&m.to_mont(&self.v), &u));
+        let avu = m.mul(&m.to_mont(&big_a), &vu);
+        let big_s = m.from_mont(&m.pow(&avu, &self.b));
+        tracing::debug!(ms = t0.elapsed().as_secs_f64() * 1e3, "SRP M3: (A v^u)^b");
 
         // session_key = H(S), and the expected client proof M1. Implementations disagree on whether S (in K)
         // and A (in M1, M2) are hashed as minimal big-endian bytes or padded to N's length: they only differ
@@ -328,22 +333,22 @@ impl SrpServer {
 const U_BITS: usize = 512;
 
 /// x^(16^k) mod n for k < `digits`.
-fn fixed_base_table(x: &BigUint, n: &BigUint, digits: usize) -> Vec<BigUint> {
+fn fixed_base_table(m: &Mont, x: &BigUint, digits: usize) -> Vec<Words> {
     let mut t = Vec::with_capacity(digits);
-    t.push(x % n);
+    t.push(m.to_mont(x));
     while t.len() < digits {
-        let mut y = t.last().unwrap().clone();
+        let mut y = *t.last().unwrap();
         for _ in 0..4 {
-            y = &y * &y % n;
+            y = m.mul(&y, &y);
         }
         t.push(y);
     }
     t
 }
 
-/// x^e mod n from `fixed_base_table`'s powers (BGMW: for each hex digit value from 15 down, the product of the
-/// powers whose digit is at least it), or None if e has more digits than the table.
-fn fixed_base_pow(table: &[BigUint], e: &BigUint, n: &BigUint) -> Option<BigUint> {
+/// x^e (Montgomery form) from `fixed_base_table`'s powers (BGMW: for each hex digit value from 15 down, the product
+/// of the powers whose digit is at least it), or None if e has more digits than the table.
+fn fixed_base_pow(m: &Mont, table: &[Words], e: &BigUint) -> Option<Words> {
     let bytes = e.to_bytes_le();
     if bytes.len() * 2 > table.len() {
         return None;
@@ -352,16 +357,22 @@ fn fixed_base_pow(table: &[BigUint], e: &BigUint, n: &BigUint) -> Option<BigUint
         let b = bytes.get(k / 2).copied().unwrap_or(0);
         if k % 2 == 0 { b & 15 } else { b >> 4 }
     };
-    let (mut acc, mut run) = (BigUint::from(1u32), BigUint::from(1u32));
+    let (mut acc, mut run) = (m.one(), m.one());
     for d in (1..16u8).rev() {
         for (k, p) in table.iter().enumerate() {
             if digit(k) == d {
-                run = &run * p % n;
+                run = m.mul(&run, p);
             }
         }
-        acc = &acc * &run % n;
+        acc = m.mul(&acc, &run);
     }
     Some(acc)
+}
+
+/// The SRP group's modulus N for Montgomery arithmetic, made once.
+fn group() -> &'static Mont {
+    static GROUP: std::sync::OnceLock<Mont> = std::sync::OnceLock::new();
+    GROUP.get_or_init(|| Mont::new(&BigUint::parse_bytes(N_3072_HEX.as_bytes(), 16).unwrap()))
 }
 
 fn sha512(data: &[u8]) -> [u8; 64] {
@@ -892,7 +903,8 @@ mod tests {
     fn fixed_base_pow_is_modpow() {
         let n = BigUint::parse_bytes(super::N_3072_HEX.as_bytes(), 16).unwrap();
         let x = BigUint::from(0x1234_5678_9abc_def0u64).pow(40) % &n;
-        let table = super::fixed_base_table(&x, &n, super::U_BITS / 4);
+        let m = super::group();
+        let table = super::fixed_base_table(m, &x, super::U_BITS / 4);
         for e in [
             BigUint::from(0u32),
             BigUint::from(1u32),
@@ -901,13 +913,13 @@ mod tests {
             BigUint::from_bytes_be(&super::sha512(b"u")),
         ] {
             assert_eq!(
-                super::fixed_base_pow(&table, &e, &n),
+                super::fixed_base_pow(m, &table, &e).map(|p| m.from_mont(&p)),
                 Some(x.modpow(&e, &n)),
                 "{e}"
             );
         }
         assert_eq!(
-            super::fixed_base_pow(&table, &(BigUint::from(1u32) << 512u32), &n),
+            super::fixed_base_pow(m, &table, &(BigUint::from(1u32) << 512u32)),
             None
         );
     }
