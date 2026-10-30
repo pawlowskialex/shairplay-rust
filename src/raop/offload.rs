@@ -88,6 +88,32 @@ pub trait AacDecoder: Send {
     }
 }
 
+/// Samples an application's frame decoder hands back.
+pub enum FramePcm<'a> {
+    /// Interleaved 16-bit samples.
+    S16(&'a [i16]),
+    /// Interleaved 24-bit samples, sign-extended to 32 bits.
+    S24(&'a [i32]),
+}
+
+/// AirPlay 2 buffered ALAC frames decoded by the application (a coprocessor), ahead of playout like
+/// [`AacDecoder`]'s asynchronous interface: the playout submits frames shortly before they are due and collects
+/// them in order. A frame it doesn't take is decoded by the library's own ALAC decoder (and, if nothing was in
+/// flight, the rest of the stream too). Install with
+/// [`RaopServerBuilder::alac_offload`](crate::RaopServerBuilder::alac_offload).
+pub trait AlacOffload: Send {
+    /// Queue a frame under `tag`; `false` if it can't be taken now.
+    fn submit(&mut self, tag: u32, frame: &[u8]) -> bool;
+    /// Hand over finished frames in submission order, stopping at the first unfinished one (`None`: dropped).
+    fn collect(&mut self, done: &mut dyn FnMut(u32, Option<FramePcm<'_>>));
+    /// Frames submitted and not yet collected.
+    fn in_flight(&self) -> usize;
+}
+
+/// Makes a buffered ALAC stream's offload from its parameters and sample rate, or `None` to decode it in software.
+pub type AlacOffloadFactory =
+    Arc<dyn Fn(&OffloadAlac, u32) -> Option<Box<dyn AlacOffload>> + Send + Sync>;
+
 /// Makes a stream's AAC decoder from its sample rate and channel count, or `None` to use the library's own
 /// (`aac-symphonia`).
 pub type AacDecoderFactory = Arc<dyn Fn(u32, u8) -> Option<Box<dyn AacDecoder>> + Send + Sync>;
