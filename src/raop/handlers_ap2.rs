@@ -860,7 +860,11 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                 .map(str::to_string);
             tracing::debug!(?group, "AP2 remote control on the event channel");
             conn.shared.handler.on_remote_control(std::sync::Arc::new(
-                crate::raop::Ap2RemoteControl::new(sender.clone(), group),
+                crate::raop::Ap2RemoteControl::new(
+                    sender.clone(),
+                    group,
+                    conn.mr_supported.clone(),
+                ),
             ));
             tokio::spawn(async move {
                 if let Ok((stream, addr)) = event_listener.accept().await {
@@ -1388,7 +1392,7 @@ pub(crate) fn handle_feedback(
 #[cfg(feature = "ap2-core")]
 /// AP2 POST /command: forward binary plist commands to event channel.
 pub(crate) fn handle_command(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
@@ -1401,7 +1405,9 @@ pub(crate) fn handle_command(
             .and_then(|v| v.as_string())
             .unwrap_or("unknown");
         tracing::debug!(cmd_type, "POST /command");
-        if cmd_type == "updateMRSupportedCommands" {}
+        if cmd_type == "updateMRSupportedCommands" {
+            conn.mr_supported.update(dict);
+        }
     }
     None
 }

@@ -79,12 +79,96 @@ impl DacpRemoteControl {
 pub(crate) struct Ap2RemoteControl {
     events: event_channel::EventSender,
     group: Option<String>, // the session's group UUID (SETUP `groupUUID`): the command's destination
+    supported: std::sync::Arc<SupportedCommands>,
+}
+
+/// The commands the sender takes now (POST /command `updateMRSupportedCommands`, sent whenever they change: next
+/// track is off with nothing queued, a podcast app takes skips instead): MediaRemote command number -> enabled, and
+/// a skip's preferred interval (s). Empty until the first update: then every command is sent.
+#[cfg(feature = "ap2-core")]
+#[derive(Default)]
+pub(crate) struct SupportedCommands(
+    std::sync::Mutex<std::collections::HashMap<u64, (bool, Option<f64>)>>,
+);
+
+#[cfg(feature = "ap2-core")]
+impl SupportedCommands {
+    /// `params.mrSupportedCommandsFromSender`: one binary plist per command (`kCommandInfoCommandKey`,
+    /// `kCommandInfoEnabledKey`, options with `kMRMediaRemoteCommandInfoPreferredIntervalsKey` for the skips).
+    pub(crate) fn update(&self, dict: &plist::Dictionary) {
+        let Some(cmds) = dict
+            .get("params")
+            .and_then(|p| p.as_dictionary())
+            .and_then(|p| p.get("mrSupportedCommandsFromSender"))
+            .and_then(|v| v.as_array())
+        else {
+            return;
+        };
+        let mut map = std::collections::HashMap::new();
+        for info in cmds.iter().filter_map(|c| c.as_data()) {
+            let Ok(plist::Value::Dictionary(info)) = plist::from_bytes::<plist::Value>(info) else {
+                continue;
+            };
+            let Some(n) = info
+                .get("kCommandInfoCommandKey")
+                .and_then(|v| v.as_unsigned_integer())
+            else {
+                continue;
+            };
+            let enabled = info
+                .get("kCommandInfoEnabledKey")
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(true);
+            let interval = info
+                .get("kCommandInfoOptionsKey")
+                .and_then(|o| o.as_dictionary())
+                .and_then(|o| o.get("kMRMediaRemoteCommandInfoPreferredIntervalsKey"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| {
+                    v.as_real()
+                        .or_else(|| v.as_signed_integer().map(|i| i as f64))
+                });
+            map.insert(n, (enabled, interval));
+        }
+        tracing::debug!(
+            enabled = ?{ let mut v: Vec<_> = map.iter().filter(|(_, e)| e.0).map(|(n, _)| *n).collect(); v.sort(); v },
+            "the sender's commands"
+        );
+        *self.0.lock().unwrap() = map;
+    }
+
+    /// The command to send for `primary` (next / previous track): it if the sender takes it (or hasn't said), else
+    /// the skip it takes (with its interval), else none.
+    fn pick(&self, primary: u64, skip: u64) -> Option<(u64, Option<f64>)> {
+        let map = self.0.lock().unwrap();
+        if map.is_empty() || map.get(&primary).is_none_or(|e| e.0) {
+            return Some((primary, None));
+        }
+        match map.get(&skip) {
+            Some(&(true, interval)) => Some((skip, Some(interval.unwrap_or(15.0)))),
+            _ => None,
+        }
+    }
+
+    fn takes(&self, n: u64) -> bool {
+        let map = self.0.lock().unwrap();
+        map.is_empty() || map.get(&n).is_none_or(|e| e.0)
+    }
 }
 
 #[cfg(feature = "ap2-core")]
 impl Ap2RemoteControl {
-    pub(crate) fn new(events: event_channel::EventSender, group: Option<String>) -> Self {
-        Self { events, group }
+    pub(crate) fn new(
+        events: event_channel::EventSender,
+        group: Option<String>,
+        supported: std::sync::Arc<SupportedCommands>,
+    ) -> Self {
+        Self {
+            events,
+            group,
+            supported,
+        }
     }
 
     /// The command's options: its ID, redirected (from a receiver), to the session's group.
@@ -180,23 +264,41 @@ impl RemoteControl for Ap2RemoteControl {
                 )])),
             );
         } else {
-            // MRMediaRemoteCommand numbers
-            let n = match cmd {
-                RemoteCommand::Play => 0,
-                RemoteCommand::Pause => 1,
-                RemoteCommand::PlayPause => 2,
-                RemoteCommand::Stop => 3,
-                RemoteCommand::NextTrack => 4,
-                RemoteCommand::PreviousTrack => 5,
-                RemoteCommand::ToggleShuffle => 6, // advance the shuffle mode
-                RemoteCommand::ToggleRepeat => 7,  // advance the repeat mode
+            // MRMediaRemoteCommand numbers; next / previous track fall back to the skips (17 / 18: forward /
+            // backward by an interval) when the sender takes only those
+            let picked = match cmd {
+                RemoteCommand::Play => Some((0, None)),
+                RemoteCommand::Pause => Some((1, None)),
+                RemoteCommand::PlayPause => Some((2, None)),
+                RemoteCommand::Stop => Some((3, None)),
+                RemoteCommand::NextTrack => self.supported.pick(4, 17),
+                RemoteCommand::PreviousTrack => self.supported.pick(5, 18),
+                RemoteCommand::ToggleShuffle => Some((6, None)), // advance the shuffle mode
+                RemoteCommand::ToggleRepeat => Some((7, None)),  // advance the repeat mode
                 RemoteCommand::SetVolume(_) => unreachable!(),
             };
+            let Some((n, interval)) = picked else {
+                tracing::info!(
+                    ?cmd,
+                    "the sender takes neither this command nor a skip now: not sent"
+                );
+                return Ok(());
+            };
+            if n == 17 || n == 18 {
+                tracing::info!(?cmd, skip = n, interval, "the sender takes a skip instead");
+            }
             c.insert(
                 "modernMediaRemoteCommand".into(),
                 plist::Value::String(n.to_string()),
             );
-            c.insert("params".into(), plist::Value::Dictionary(self.options()));
+            let mut options = self.options();
+            if let Some(s) = interval {
+                options.insert(
+                    "kMRMediaRemoteOptionSkipInterval".into(),
+                    plist::Value::Real(s),
+                );
+            }
+            c.insert("params".into(), plist::Value::Dictionary(options));
         }
         self.events
             .post_command(&c)
@@ -204,17 +306,27 @@ impl RemoteControl for Ap2RemoteControl {
     }
 
     fn available_commands(&self) -> Vec<RemoteCommand> {
-        vec![
-            RemoteCommand::Play,
-            RemoteCommand::Pause,
-            RemoteCommand::PlayPause,
-            RemoteCommand::NextTrack,
-            RemoteCommand::PreviousTrack,
-            RemoteCommand::SetVolume(0),
-            RemoteCommand::ToggleShuffle,
-            RemoteCommand::ToggleRepeat,
-            RemoteCommand::Stop,
-        ]
+        let s = &self.supported;
+        let mut v = vec![RemoteCommand::SetVolume(0)];
+        for (cmd, n) in [
+            (RemoteCommand::Play, 0),
+            (RemoteCommand::Pause, 1),
+            (RemoteCommand::PlayPause, 2),
+            (RemoteCommand::Stop, 3),
+            (RemoteCommand::ToggleShuffle, 6),
+            (RemoteCommand::ToggleRepeat, 7),
+        ] {
+            if s.takes(n) {
+                v.push(cmd);
+            }
+        }
+        if s.pick(4, 17).is_some() {
+            v.push(RemoteCommand::NextTrack);
+        }
+        if s.pick(5, 18).is_some() {
+            v.push(RemoteCommand::PreviousTrack);
+        }
+        v
     }
 }
 
@@ -255,19 +367,106 @@ mod ap2_remote_tests {
     use super::*;
 
     fn sent(cmd: RemoteCommand) -> plist::Dictionary {
+        sent_to(cmd, Default::default()).unwrap()
+    }
+
+    /// What the remote sends for `cmd` to a sender that takes `supported`, if anything.
+    fn sent_to(
+        cmd: RemoteCommand,
+        supported: std::sync::Arc<SupportedCommands>,
+    ) -> Option<plist::Dictionary> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let remote = Ap2RemoteControl::new(
             event_channel::EventSender::from_tx(tx),
             Some("GROUP-1".into()),
+            supported,
         );
         remote.send_command(cmd).unwrap();
-        let msg = rx.try_recv().unwrap();
+        let msg = rx.try_recv().ok()?;
         let start = msg.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert!(msg.starts_with(b"POST /command RTSP/1.0\r\n"));
         plist::from_bytes::<plist::Value>(&msg[start..])
             .unwrap()
             .into_dictionary()
-            .unwrap()
+    }
+
+    /// An `updateMRSupportedCommands` body: (command, enabled, preferred interval).
+    fn supported(cmds: &[(u64, bool, Option<i64>)]) -> std::sync::Arc<SupportedCommands> {
+        let infos = cmds
+            .iter()
+            .map(|&(n, enabled, interval)| {
+                let mut d = plist::Dictionary::new();
+                d.insert(
+                    "kCommandInfoCommandKey".into(),
+                    plist::Value::Integer(n.into()),
+                );
+                d.insert(
+                    "kCommandInfoEnabledKey".into(),
+                    plist::Value::Boolean(enabled),
+                );
+                if let Some(i) = interval {
+                    let o = plist::Dictionary::from_iter([(
+                        "kMRMediaRemoteCommandInfoPreferredIntervalsKey".to_string(),
+                        plist::Value::Array(vec![plist::Value::Integer(i.into())]),
+                    )]);
+                    d.insert("kCommandInfoOptionsKey".into(), plist::Value::Dictionary(o));
+                }
+                let mut b = Vec::new();
+                plist::Value::Dictionary(d)
+                    .to_writer_binary(&mut b)
+                    .unwrap();
+                plist::Value::Data(b)
+            })
+            .collect();
+        let params = plist::Dictionary::from_iter([(
+            "mrSupportedCommandsFromSender".to_string(),
+            plist::Value::Array(infos),
+        )]);
+        let body = plist::Dictionary::from_iter([(
+            "params".to_string(),
+            plist::Value::Dictionary(params),
+        )]);
+        let s = std::sync::Arc::new(SupportedCommands::default());
+        s.update(&body);
+        s
+    }
+
+    fn command(c: &plist::Dictionary) -> (&str, Option<f64>) {
+        let params = c.get("params").and_then(|v| v.as_dictionary()).unwrap();
+        (
+            c.get("modernMediaRemoteCommand")
+                .and_then(|v| v.as_string())
+                .unwrap(),
+            params
+                .get("kMRMediaRemoteOptionSkipInterval")
+                .and_then(|v| v.as_real()),
+        )
+    }
+
+    #[test]
+    fn next_track_falls_back_to_the_skip_the_sender_takes() {
+        // a podcast app: no next track, skips of 30 s
+        let s = supported(&[
+            (4, false, None),
+            (5, false, None),
+            (17, true, Some(30)),
+            (18, true, Some(15)),
+        ]);
+        let c = sent_to(RemoteCommand::NextTrack, s.clone()).unwrap();
+        assert_eq!(command(&c), ("17", Some(30.0)));
+        let c = sent_to(RemoteCommand::PreviousTrack, s).unwrap();
+        assert_eq!(command(&c), ("18", Some(15.0)));
+        // Music with the next track queued: next track as it is
+        let s = supported(&[(4, true, None), (17, false, Some(30))]);
+        assert_eq!(
+            command(&sent_to(RemoteCommand::NextTrack, s).unwrap()),
+            ("4", None)
+        );
+        // nothing to skip to and no skips: nothing sent
+        let s = supported(&[(4, false, None), (17, false, Some(30))]);
+        assert!(sent_to(RemoteCommand::NextTrack, s).is_none());
+        // not told yet: sent
+        assert_eq!(command(&sent(RemoteCommand::NextTrack)), ("4", None));
     }
 
     #[test]

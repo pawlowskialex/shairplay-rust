@@ -53,6 +53,9 @@ pub(crate) struct RaopConnection {
         Option<tokio::sync::mpsc::UnboundedSender<crate::raop::buffered_audio::PlayoutCommand>>,
     #[cfg(feature = "ap2-core")]
     pub(crate) event_sender: Option<crate::raop::event_channel::EventSender>,
+    /// What the sender says it takes (`updateMRSupportedCommands`), shared with the session's remote control.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) mr_supported: std::sync::Arc<crate::raop::SupportedCommands>,
     #[cfg(feature = "ap2-core")]
     pub(crate) realtime_cmd:
         Option<tokio::sync::mpsc::UnboundedSender<crate::raop::realtime_audio::RealtimeCommand>>,
