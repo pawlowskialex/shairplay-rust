@@ -734,6 +734,8 @@ fn delivery_loop(
         {
             let ssrc = f.ssrc;
             drop(s);
+            // the previous stream's decoder goes first: it may hold a coprocessor the new one wants
+            drop(stream.take());
             let (st, format) = Stream::new(ssrc, &output_config, &handler);
             info!(?format, "Audio session initialized");
             session = Some(handler.audio_init(format));
@@ -1169,6 +1171,86 @@ mod decode_ahead_tests {
             .map(|k| k << 12)
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// An AAC decoder (synchronous) that counts the live ones.
+    struct Live(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::raop::offload::AacDecoder for Live {
+        fn decode(&mut self, au: &[u8]) -> Option<Vec<i16>> {
+            Some(vec![au[0] as i16; 2048])
+        }
+    }
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_new_formats_decoder_is_made_after_the_previous_one_is_gone() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // AAC frames 0..8, then ALAC frames 8..16 (an Apple TV between a lossy and a lossless item)
+        let mut st = PlayoutState::new();
+        for k in 0..16u8 {
+            st.arrive(Frame {
+                seq: u32::from(k),
+                ts: u32::from(k) * 352,
+                ssrc: if k < 8 {
+                    AudioSsrc::Aac44100F24Stereo
+                } else {
+                    AudioSsrc::Alac48000S24Stereo
+                },
+                data: vec![k],
+            });
+        }
+        st.playing = true;
+        st.timing = Some(Timing::Local {
+            local_ns: now_ns() + 10_000_000,
+            rtp: 0,
+        });
+        let state = Arc::new((Mutex::new(st), Condvar::new()));
+        let out = Arc::new(StdMutex::new(Vec::new()));
+        let handler: Arc<dyn AudioHandler> = Arc::new(Handler(out.clone()));
+        let live = Arc::new(AtomicUsize::new(0));
+        let alive_at_alac = Arc::new(AtomicUsize::new(usize::MAX));
+        let (l1, l2, a2) = (live.clone(), live.clone(), alive_at_alac.clone());
+        let aac: crate::raop::offload::AacDecoderFactory = Arc::new(move |_, _| {
+            l1.fetch_add(1, SeqCst);
+            Some(Box::new(Live(l1.clone())) as Box<dyn crate::raop::offload::AacDecoder>)
+        });
+        let alac: crate::raop::offload::AlacOffloadFactory = Arc::new(move |_, _| {
+            a2.store(l2.load(SeqCst), SeqCst);
+            Some(Box::new(AlacMock {
+                decline: 0..0,
+                queue: VecDeque::new(),
+            }) as Box<dyn crate::raop::offload::AlacOffload>)
+        });
+        let config = OutputConfig {
+            sample_rate: None,
+            max_channels: None,
+            format: crate::raop::SampleFormat::S16,
+            aac_decoder: Some(aac),
+            alac_offload: Some(alac),
+        };
+        let st = state.clone();
+        let t = std::thread::spawn(move || delivery_loop(st, handler, config));
+        std::thread::sleep(Duration::from_millis(16 * 352 * 1000 / 44100 + 300));
+        {
+            let (lock, cvar) = &*state;
+            lock.lock().unwrap().stopped = true;
+            cvar.notify_all();
+        }
+        t.join().unwrap();
+        assert_eq!(
+            alive_at_alac.load(SeqCst),
+            0,
+            "the AAC decoder was still there"
+        );
+        // AAC from frame 1 (frame 0 primes it), ALAC frames (k << 4, 24-bit) rounded to 16 bits
+        let want: Vec<i16> = (1..8)
+            .chain((8..16).map(|k| ((k << 4) + 128) >> 8))
+            .collect();
+        assert_eq!(*out.lock().unwrap(), want);
     }
 
     #[test]
