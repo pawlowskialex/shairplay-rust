@@ -191,8 +191,14 @@ fn deliver_next(
         return true;
     }
     match format {
-        crate::raop::SampleFormat::S16 => match buf.dequeue_s16(no_resend) {
-            Some(samples) => session.audio_process_s16(samples),
+        crate::raop::SampleFormat::S16 | crate::raop::SampleFormat::Integer => {
+            match buf.dequeue_s16(no_resend) {
+                Some(samples) => session.audio_process_s16(samples),
+                None => return false,
+            }
+        }
+        crate::raop::SampleFormat::S32 => match buf.dequeue_s16(no_resend) {
+            Some(samples) => crate::codec::Pcm::S16(samples.to_vec()).deliver(session, format),
             None => return false,
         },
         crate::raop::SampleFormat::F32 => match buf.dequeue(no_resend) {
