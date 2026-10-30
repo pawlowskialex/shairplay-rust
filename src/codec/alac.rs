@@ -73,18 +73,32 @@ impl AlacFormat {
     }
 }
 
+/// A buffered stream's ALAC parameters (Apple's encoder defaults: [`buffered_decoder`]).
+#[cfg(feature = "ap2-core")]
+pub(crate) fn buffered_params(bit_depth: u8, channels: u8) -> crate::raop::offload::OffloadAlac {
+    crate::raop::offload::OffloadAlac {
+        frame_length: 352,
+        bit_depth,
+        pb: 40,
+        mb: 10,
+        kb: 14,
+        channels,
+    }
+}
+
 /// A decoder for buffered (type 103) ALAC streams: their SETUP carries no ALACSpecificConfig, the frames use
 /// Apple's encoder defaults (352 frames a packet; pb 40, mb 10, kb 14, max run 255: as shairport-sync sets up
 /// FFmpeg for them).
 #[cfg(feature = "ap2-core")]
 pub(crate) fn buffered_decoder(sample_rate: u32, bit_depth: u8, channels: u8) -> AlacDecoder {
+    let p = buffered_params(bit_depth, channels);
     let mut info = [0u8; 48];
-    info[24..28].copy_from_slice(&352u32.to_be_bytes());
-    info[29] = bit_depth;
-    info[30] = 40;
-    info[31] = 10;
-    info[32] = 14;
-    info[33] = channels;
+    info[24..28].copy_from_slice(&p.frame_length.to_be_bytes());
+    info[29] = p.bit_depth;
+    info[30] = p.pb;
+    info[31] = p.mb;
+    info[32] = p.kb;
+    info[33] = p.channels;
     info[34..36].copy_from_slice(&255u16.to_be_bytes());
     info[44..48].copy_from_slice(&sample_rate.to_be_bytes());
     let mut d = AlacDecoder::new(i32::from(bit_depth), i32::from(channels));

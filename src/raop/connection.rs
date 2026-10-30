@@ -42,6 +42,9 @@ pub(crate) struct RaopShared {
     /// The application's AAC decoder, if it supplied one.
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) aac_decoder: Option<crate::raop::offload::AacDecoderFactory>,
+    /// The application's buffered ALAC offload, if it supplied one.
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
+    pub(crate) alac_offload: Option<crate::raop::offload::AlacOffloadFactory>,
     #[cfg(feature = "ap2-core")]
     pub(crate) pin: Option<String>,
     /// The next pair-setup's SRP state, made ahead of time.

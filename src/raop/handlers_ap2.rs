@@ -1124,6 +1124,7 @@ fn setup_stream_buffered(
         max_channels: conn.shared.output_max_channels,
         format: conn.shared.output_format,
         aac_decoder: conn.shared.aac_decoder.clone(),
+        alac_offload: conn.shared.alac_offload.clone(),
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
