@@ -46,6 +46,18 @@ impl Pcm {
         }
     }
 
+    /// 32-bit samples, the sample in the top bits (no float on the way from integer ones).
+    pub(crate) fn into_s32(self) -> Vec<i32> {
+        match self {
+            Pcm::S16(v) => v.iter().map(|&s| (s as i32) << 16).collect(),
+            Pcm::S24(v) => v.iter().map(|&s| s << 8).collect(),
+            Pcm::F32(v) => v
+                .iter()
+                .map(|&x| (x.clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32)
+                .collect(),
+        }
+    }
+
     /// 16-bit little-endian PCM bytes (what the ALAC decoder writes) as samples.
     pub(crate) fn from_s16le(bytes: &[u8]) -> Self {
         Pcm::S16(
@@ -67,17 +79,25 @@ impl Pcm {
         play_at_ns: Option<u64>,
     ) {
         match (play_at_ns, format) {
-            (Some(t), SampleFormat::S16) => session.audio_process_timed_s16(&self.into_s16(), t),
+            (Some(t), SampleFormat::S16 | SampleFormat::Integer) => {
+                session.audio_process_timed_s16(&self.into_s16(), t)
+            }
+            (Some(t), SampleFormat::S32) => session.audio_process_timed_s32(&self.into_s32(), t),
             _ => self.deliver(session, format),
         }
     }
 
-    /// Hand the samples to the session in its format.
+    /// Hand the samples to the session in its format (`Integer` unresolved: as `S16`).
     pub(crate) fn deliver(self, session: &mut dyn AudioSession, format: SampleFormat) {
         match (self, format) {
-            (Pcm::S16(v), SampleFormat::S16) => session.audio_process_s16(&v),
+            (Pcm::S16(v), SampleFormat::S16 | SampleFormat::Integer) => {
+                session.audio_process_s16(&v)
+            }
             (Pcm::F32(v), SampleFormat::F32) => session.audio_process(&v),
-            (p, SampleFormat::S16) => session.audio_process_s16(&p.into_s16()),
+            (p, SampleFormat::S16 | SampleFormat::Integer) => {
+                session.audio_process_s16(&p.into_s16())
+            }
+            (p, SampleFormat::S32) => session.audio_process_s32(&p.into_s32()),
             (p, SampleFormat::F32) => session.audio_process(&p.into_f32()),
         }
     }
@@ -164,4 +184,62 @@ pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) ->
         output.push(r.clamp(-1.0, 1.0));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Got {
+        s16: Vec<i16>,
+        s32: Vec<i32>,
+        timed: Option<u64>,
+    }
+    impl AudioSession for Got {
+        fn audio_process(&mut self, _: &[f32]) {
+            panic!("float delivery");
+        }
+        fn audio_process_s16(&mut self, s: &[i16]) {
+            self.s16.extend_from_slice(s);
+        }
+        fn audio_process_s32(&mut self, s: &[i32]) {
+            self.s32.extend_from_slice(s);
+        }
+        fn audio_process_timed_s32(&mut self, s: &[i32], at: u64) {
+            self.timed = Some(at);
+            self.audio_process_s32(s);
+        }
+    }
+
+    #[test]
+    fn integer_follows_the_source_depth() {
+        assert_eq!(SampleFormat::Integer.resolve(16), SampleFormat::S16);
+        assert_eq!(SampleFormat::Integer.resolve(24), SampleFormat::S32);
+        assert_eq!(SampleFormat::S16.resolve(24), SampleFormat::S16);
+        assert_eq!(SampleFormat::F32.resolve(24), SampleFormat::F32);
+    }
+
+    #[test]
+    fn s32_keeps_24_bits() {
+        let mut got = Got::default();
+        Pcm::S24(vec![0x7F_FFFF, -0x80_0000, 1, -1]).deliver_timed(
+            &mut got,
+            SampleFormat::S32,
+            Some(7),
+        );
+        assert_eq!(got.s32, [0x7FFF_FF00, i32::MIN, 0x100, -0x100]);
+        assert_eq!(got.timed, Some(7));
+        Pcm::S16(vec![-32768, 1]).deliver(&mut got, SampleFormat::S32);
+        assert_eq!(&got.s32[4..], [i32::MIN, 0x1_0000]);
+        assert!(got.s16.is_empty());
+    }
+
+    #[test]
+    fn integer_unresolved_is_s16() {
+        let mut got = Got::default();
+        Pcm::S24(vec![0x12_3480]).deliver(&mut got, SampleFormat::Integer);
+        assert_eq!(got.s16, [0x1235]);
+        assert!(got.s32.is_empty());
+    }
 }

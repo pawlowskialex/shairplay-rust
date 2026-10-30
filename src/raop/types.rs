@@ -88,14 +88,30 @@ pub enum SampleFormat {
     /// keeps the whole path integer: ALAC and raw L16 produce 16-bit samples, and
     /// float conversion happens only where mixdown or resampling needs it.
     S16,
+    /// Signed 32-bit with the sample in the top bits (a 16-bit sample in bits 31:16, a 24-bit one in 31:8),
+    /// through [`AudioSession::audio_process_s32`]. Integer end to end like [`S16`](Self::S16).
+    S32,
+    /// Integers at the source's depth: [`S16`](Self::S16) for 16-bit sources, [`S32`](Self::S32) for deeper
+    /// ones (24-bit ALAC), chosen per stream; the session's [`AudioFormat::bits`] says which. A 24-bit source
+    /// keeps its depth, a 16-bit one costs no more than with `S16`.
+    Integer,
 }
 
 impl SampleFormat {
-    /// Bits per sample.
+    /// Bits per sample (`Integer`: 16, what it gives a 16-bit source).
     pub const fn bits(self) -> u8 {
         match self {
-            SampleFormat::F32 => 32,
-            SampleFormat::S16 => 16,
+            SampleFormat::F32 | SampleFormat::S32 => 32,
+            SampleFormat::S16 | SampleFormat::Integer => 16,
+        }
+    }
+
+    /// The format a stream from a source of `source_bits` gets: `Integer` resolved, the others as they are.
+    pub const fn resolve(self, source_bits: u8) -> SampleFormat {
+        match self {
+            SampleFormat::Integer if source_bits > 16 => SampleFormat::S32,
+            SampleFormat::Integer => SampleFormat::S16,
+            f => f,
         }
     }
 }
@@ -105,7 +121,8 @@ impl SampleFormat {
 pub struct AudioFormat {
     /// Audio codec (always PCM for decoded output).
     pub codec: AudioCodec,
-    /// Bits per sample: 32 for [`SampleFormat::F32`] (`&[f32]`), 16 for [`SampleFormat::S16`] (`&[i16]`).
+    /// Bits per sample: 32 for [`SampleFormat::F32`] (`&[f32]`) and [`SampleFormat::S32`] (`&[i32]`), 16 for
+    /// [`SampleFormat::S16`] (`&[i16]`); [`SampleFormat::Integer`]: 16 or 32, as the stream is delivered.
     pub bits: u8,
     /// Number of channels.
     pub channels: u8,
@@ -301,6 +318,23 @@ pub trait AudioSession: Send + Sync {
     fn audio_process_timed_s16(&mut self, samples: &[i16], play_at_ns: u64) {
         let _ = play_at_ns;
         self.audio_process_s16(samples);
+    }
+    /// Receive signed 32-bit interleaved PCM, the sample in the top bits. Called when the stream's format is
+    /// [`SampleFormat::S32`] (or [`SampleFormat::Integer`] with a deeper source); the default converts to f32
+    /// and calls `audio_process`.
+    fn audio_process_s32(&mut self, samples: &[i32]) {
+        let f: Vec<f32> = samples
+            .iter()
+            .map(|&s| s as f32 / 2_147_483_648.0)
+            .collect();
+        self.audio_process(&f);
+    }
+    /// 32-bit PCM like [`audio_process_s32`](Self::audio_process_s32), with the time its first frame should
+    /// leave the speaker, as [`audio_process_timed_s16`](Self::audio_process_timed_s16); the default ignores the
+    /// time.
+    fn audio_process_timed_s32(&mut self, samples: &[i32], play_at_ns: u64) {
+        let _ = play_at_ns;
+        self.audio_process_s32(samples);
     }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
