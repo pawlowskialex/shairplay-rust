@@ -986,7 +986,7 @@ fn setup_stream_realtime(
             .get("controlPort")
             .and_then(|v| v.as_unsigned_integer())
             .filter(|&p| p > 0 && u16::try_from(p).is_ok())
-            .map(|p| crate::raop::realtime_audio::Retransmit {
+            .map(|p| crate::raop::reorder::Retransmit {
                 socket: ctrl,
                 sender: std::net::SocketAddr::new(conn.remote_socket.ip(), p as u16),
             });

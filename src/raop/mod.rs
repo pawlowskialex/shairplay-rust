@@ -22,6 +22,7 @@ pub(crate) mod ntp;
 pub mod offload;
 #[cfg(feature = "ap2-core")]
 pub(crate) mod realtime_audio;
+pub(crate) mod reorder;
 pub(crate) mod rtp;
 mod rtsp;
 #[cfg(feature = "video")]
