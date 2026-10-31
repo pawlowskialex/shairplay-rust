@@ -7,8 +7,9 @@
 //! ```
 //!
 //! Two transport modes:
-//! - **UDP** (default): data, control, and timing on separate UDP sockets.
-//!   Control channel carries retransmit responses (payload type 0x56).
+//! - **UDP** (default): data, control, and timing on separate UDP sockets. Packets go through
+//!   [`Reorder`](super::reorder::Reorder): lost ones are asked for on the sender's control port and come back on
+//!   ours (payload type 0x56).
 //! - **TCP**: single TCP connection with `$`-prefixed interleaved framing.
 //!   No retransmits (reliable transport).
 
@@ -21,15 +22,15 @@ use tracing::info;
 
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::buffer::{RAOP_PACKET_LEN, RaopBuffer, StreamFormat};
+use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
 
 /// Sentinel value for [`RtpState::flush`] indicating no flush is pending.
 const NO_FLUSH: i32 = -42;
 
-/// RTP payload type for retransmit (RESEND) responses on the control channel.
-const CTRL_PAYLOAD_TYPE: u8 = 0x56;
-/// Bytes of retransmit header preceding the original RTP packet in a RESEND.
-const RETRANSMIT_HEADER_LEN: usize = 4;
+/// Packets held behind a gap at most: what is released at once has to fit the buffer's window
+/// (`RAOP_BUFFER_LENGTH`, 32), where packets wait on the offload.
+const MAX_HELD: usize = 24;
 
 /// Determine the bind address for RTP sockets.
 /// Uses the specific local IP for routable addresses (respects BindConfig).
@@ -303,65 +304,90 @@ impl RaopRtp {
                 b.set_offload(self.offload.as_ref());
             }
             let state = self.state.clone();
-            // If control_rport is 0, the iPhone doesn't support retransmits.
-            let no_resend = control_rport == 0;
-            let _remote_for_task = self.remote.clone();
+            // A control port of 0: the sender takes no retransmit requests (our control port stays open, unread).
+            let (ctrl, _unread) = if control_rport != 0 {
+                let mut sender = self.remote_socket;
+                sender.set_port(control_rport);
+                (
+                    Some(Retransmit {
+                        socket: csock,
+                        sender,
+                    }),
+                    None,
+                )
+            } else {
+                (None, Some(csock))
+            };
 
             tokio::spawn(async move {
+                let _unread = _unread;
                 let mut shutdown_rx = shutdown_rx;
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
+                // In sequence order before the buffer, gaps asked for again; one given up on reaches the buffer as a
+                // missing sequence number, played as silence.
+                let mut reorder = Reorder::new(ctrl.is_some(), MAX_HELD);
+                let mut report = std::time::Instant::now();
                 loop {
                     // Drain flush events only — metadata goes through AudioHandler now.
                     {
                         let mut st = state.lock().await;
                         if st.flush != NO_FLUSH {
                             buffer.lock().await.flush(st.flush);
+                            reorder.flush(u16::try_from(st.flush).ok());
                             session.audio_flush();
                             st.flush = NO_FLUSH;
                         }
                     }
 
-                    // Packets with the offload: look again shortly even if nothing arrives (the stream's end).
-                    let offloading = buffer.lock().await.in_flight() > 0;
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if offloading => {
-                            let mut buf = buffer.lock().await;
-                            while deliver_next(
-                                &mut buf,
-                                session.as_mut(),
-                                output_format,
-                                no_resend,
-                                #[cfg(feature = "resample")]
-                                &mut resampler,
-                            ) {}
-                        }
+                    // Packets with the offload or held behind a gap: look again shortly even if nothing arrives.
+                    let waiting = buffer.lock().await.in_flight() > 0 || reorder.holding();
+                    let received = tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
                         // Data channel: audio RTP packets.
-                        result = dsock.recv_from(&mut data_packet) => {
-                            if let Ok((len, _)) = result
-                                && len >= 12 {
-                                    let mut buf = buffer.lock().await;
-                                    buf.queue(&data_packet[..len], true);
-                                    while deliver_next(
-                                        &mut buf,
-                                        session.as_mut(),
-                                        output_format,
-                                        no_resend,
-                                        #[cfg(feature = "resample")]
-                                        &mut resampler,
-                                    ) {}
-                                }
-                        }
-                        // Control channel: retransmit responses (payload type 0x56).
-                        result = csock.recv_from(&mut ctrl_packet) => {
-                            if let Ok((len, _)) = result
-                                && len >= 12 && (ctrl_packet[1] & !0x80) == CTRL_PAYLOAD_TYPE {
-                                    let mut buf = buffer.lock().await;
-                                    // Retransmit packets have a 4-byte header before the original RTP.
-                                    if len > RETRANSMIT_HEADER_LEN { buf.queue(&ctrl_packet[RETRANSMIT_HEADER_LEN..len], true); }
-                                }
-                        }
+                        result = dsock.recv_from(&mut data_packet) => match result {
+                            Ok((len, _)) if len >= 12 => Some(&data_packet[..len]),
+                            _ => None,
+                        },
+                        // Control channel: resent packets; sync packets aren't used.
+                        result = async {
+                            match &ctrl {
+                                Some(c) => c.socket.recv_from(&mut ctrl_packet).await,
+                                None => std::future::pending().await,
+                            }
+                        } => match result {
+                            Ok((len, _)) => resent_packet(&ctrl_packet[..len]).filter(|p| p.len() >= 12),
+                            Err(_) => None,
+                        },
                         _ = shutdown_rx.changed() => break,
+                    };
+                    let now = std::time::Instant::now();
+                    let mut out = Vec::new();
+                    // A packet under a sequence number that went out already is the buffer's to judge: a sender's
+                    // placeholder and the frame come under one number.
+                    let late = received.filter(|p| {
+                        !reorder.push(u16::from_be_bytes([p[2], p[3]]), p, now, &mut out)
+                    });
+                    reorder.tick(now, &mut out);
+                    if let Some(c) = &ctrl {
+                        c.ask(&mut reorder).await;
+                    }
+                    let mut buf = buffer.lock().await;
+                    for packet in out.iter().map(|(_, p)| &p[..]).chain(late) {
+                        buf.queue(packet, true);
+                    }
+                    while deliver_next(
+                        &mut buf,
+                        session.as_mut(),
+                        output_format,
+                        true,
+                        #[cfg(feature = "resample")]
+                        &mut resampler,
+                    ) {}
+                    drop(buf);
+                    if report.elapsed() >= std::time::Duration::from_secs(10) {
+                        reorder.report("AP1");
+                        report = std::time::Instant::now();
                     }
                 }
                 // AudioSession dropped here → triggers cleanup in the app.
