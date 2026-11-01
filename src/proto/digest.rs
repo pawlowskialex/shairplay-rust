@@ -119,10 +119,65 @@ pub fn is_valid(
 
 /// Extract a quoted value from a "key=\"value\"" pair.
 fn extract_quoted<'a>(part: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=\"");
-    if part.starts_with(&prefix) && part.ends_with('"') {
-        Some(&part[prefix.len()..part.len() - 1])
-    } else {
-        None
+    part.strip_prefix(key)?
+        .strip_prefix("=\"")?
+        .strip_suffix('"')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_response, is_valid};
+
+    fn header(response: &str) -> String {
+        format!(
+            "Digest username=\"iTunes\", realm=\"raop\", nonce=\"n1\", uri=\"rtsp://x/1\", response=\"{response}\""
+        )
+    }
+
+    #[test]
+    fn a_correct_response_is_valid() {
+        let ok = get_response("iTunes", "raop", "secret", "n1", "ANNOUNCE", "rtsp://x/1");
+        let h = header(&ok);
+        assert!(is_valid(
+            "raop",
+            "secret",
+            "n1",
+            "ANNOUNCE",
+            "rtsp://x/1",
+            Some(&h)
+        ));
+        assert!(!is_valid(
+            "raop",
+            "wrong",
+            "n1",
+            "ANNOUNCE",
+            "rtsp://x/1",
+            Some(&h)
+        ));
+        assert!(!is_valid(
+            "raop",
+            "secret",
+            "n2",
+            "ANNOUNCE",
+            "rtsp://x/1",
+            Some(&h)
+        ));
+    }
+
+    #[test]
+    fn malformed_headers_are_refused() {
+        for h in [
+            "Digest username=\"",
+            "Digest username=\"\"",
+            "Digest response=\",",
+            "Digest",
+            "Basic abc",
+            "Digest \u{e9}=\"",
+        ] {
+            assert!(
+                !is_valid("raop", "secret", "n1", "ANNOUNCE", "rtsp://x/1", Some(h)),
+                "{h}"
+            );
+        }
     }
 }
