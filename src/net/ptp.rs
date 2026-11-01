@@ -787,7 +787,12 @@ struct ClockTrack {
     /// Round trips of Delay_Req / Delay_Resp: (local time, ns); half the least of the recent ones is the path
     /// delay the fit includes (both ways taken as equal)
     trips: std::collections::VecDeque<(u64, f64)>,
+    /// The last sample's local time (which track goes when there are too many)
+    last: u64,
 }
+
+/// Clocks followed at once: any host on the network can send Sync messages, each identity a track.
+const MAX_CLOCKS: usize = 8;
 
 /// Round trips kept for the path delay (a Delay_Req a second), and the longest delay believed.
 const DELAY_TRIPS: usize = 32;
@@ -796,6 +801,7 @@ const MAX_DELAY_NS: f64 = 50e6;
 
 impl ClockTrack {
     fn sample(&mut self, master: u64, local: u64) {
+        self.last = local;
         let d = local as i64 - master as i64;
         // a master that stepped (or restarted on another timescale under the same identity): start over. Below the
         // line by more than jitter can explain, or seconds above it (stalls stay well under)
@@ -934,9 +940,15 @@ impl Follower {
 
     /// A Sync's receive time (local clock, ns) and its Follow_Up's send time (the master's clock).
     pub fn sample(&self, clock_id: u64, master_ns: u64, local_ns: u64) {
-        self.clocks
-            .lock()
-            .unwrap()
+        let mut clocks = self.clocks.lock().unwrap();
+        if !clocks.contains_key(&clock_id) && clocks.len() >= MAX_CLOCKS {
+            // a new identity when the table is full: the one heard from longest ago makes room
+            let oldest = clocks.iter().min_by_key(|(_, c)| c.last).map(|(&id, _)| id);
+            if let Some(oldest) = oldest {
+                clocks.remove(&oldest);
+            }
+        }
+        clocks
             .entry(clock_id)
             .or_default()
             .sample(master_ns, local_ns);
@@ -1027,6 +1039,20 @@ mod follower_tests {
         let expect = (m as f64 * (1.0 - 22e-6)) as u64 + 5_000_000_000 + 1_000_000;
         let got = f.to_local(7, m).unwrap();
         assert!(got.abs_diff(expect) < 200_000, "{} vs {}", got, expect);
+    }
+
+    #[test]
+    fn a_flood_of_clock_identities_keeps_the_table_bounded() {
+        let f = Follower::new();
+        f.sample(1, 1_000, 2_000_000);
+        for id in 100..10_100u64 {
+            f.sample(id, 1_000, 1_000_000 + id);
+            // the clock that keeps sending stays
+            f.sample(1, 1_000 + id, 2_000_000 + id);
+        }
+        let clocks = f.clocks.lock().unwrap();
+        assert_eq!(clocks.len(), MAX_CLOCKS);
+        assert!(clocks.contains_key(&1));
     }
 
     #[test]
