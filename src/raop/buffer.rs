@@ -113,24 +113,24 @@ fn parse_fmtp(fmtp: &str) -> Option<AlacConfig> {
     // input and must be rejected, not silently coerced to 0 (a 0 here yields a
     // zero-size audio buffer and a 0-channel decoder downstream).
     let p = |i: usize| vals[i].parse::<u32>().ok();
+    // and in range: 272 isn't 16 bits
+    let b = |i: usize| vals[i].parse::<u8>().ok();
     let config = AlacConfig {
         frame_length: p(1)?,
-        compatible_version: p(2)? as u8,
-        bit_depth: p(3)? as u8,
-        pb: p(4)? as u8,
-        mb: p(5)? as u8,
-        kb: p(6)? as u8,
-        num_channels: p(7)? as u8,
-        max_run: p(8)? as u16,
+        compatible_version: b(2)?,
+        bit_depth: b(3)?,
+        pb: b(4)?,
+        mb: b(5)?,
+        kb: b(6)?,
+        num_channels: b(7)?,
+        max_run: vals[8].parse::<u16>().ok()?,
         max_frame_bytes: p(9)?,
         avg_bit_rate: p(10)?,
         sample_rate: p(11)?,
     };
-    // Reject configs that would produce degenerate buffers / decoder state.
-    if config.frame_length == 0
-        || config.num_channels == 0
-        || config.bit_depth == 0
-        || config.sample_rate == 0
+    // The buffers and the decoder are sized from these: only shapes the decoder takes.
+    if !crate::codec::alac::supported(config.frame_length, config.bit_depth, config.num_channels)
+        || !crate::codec::alac::supported_rate(config.sample_rate)
     {
         return None;
     }
@@ -270,11 +270,13 @@ impl RaopBuffer {
             }
             CodecConfig::Alac => {
                 let config = parse_fmtp(fmtp)?;
-                // ALAC outputs one f32 per sample: frame_length × channels.
+                // one i16 per sample in a slot: frame_length × channels
                 let frame_samples = config.frame_length as usize * config.num_channels as usize;
                 let mut decoder =
                     AlacDecoder::new(config.bit_depth as i32, config.num_channels as i32);
-                decoder.set_info(&build_decoder_info(&config));
+                if !decoder.set_info(&build_decoder_info(&config)) {
+                    return None;
+                }
                 (
                     Codec::Alac { config, decoder },
                     frame_samples,
@@ -504,27 +506,22 @@ impl RaopBuffer {
         // Decode into the slot's s16 buffer.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
-            Codec::Alac { decoder, .. } => {
-                // ALAC decode → S16LE bytes → samples.
-                let s16_buf = &mut self.decode_scratch;
-                s16_buf.resize(capacity * 2, 0);
-                let output_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decoder.decode_frame(packet_buf, s16_buf)
-                }))
-                .unwrap_or(0);
+            Codec::Alac { decoder, config } => {
+                // ALAC decode -> little-endian PCM (2 or 3 bytes a sample) -> the slot's i16 (24-bit: its top 16)
+                let width = usize::from(config.bit_depth / 8);
+                let pcm = &mut self.decode_scratch;
+                pcm.resize(capacity * width, 0);
+                let output_size = decoder.decode_frame(packet_buf, pcm);
                 if output_size == 0 {
                     return 0;
                 }
-                let limit = output_size.min(s16_buf.len());
                 let out = &mut self.entries[idx].audio_buffer;
                 let mut n = 0;
-                for (chunk, out_sample) in s16_buf[..limit]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
+                for (sample, out_sample) in pcm[..output_size.min(pcm.len())]
+                    .chunks_exact(width)
                     .zip(out.iter_mut())
                 {
-                    *out_sample = i16::from_le_bytes(*chunk);
+                    *out_sample = i16::from_le_bytes([sample[width - 2], sample[width - 1]]);
                     n += 1;
                 }
                 n
@@ -775,5 +772,28 @@ mod offload_tests {
         assert_eq!(b.queue(&packet(5), true), 1);
         assert_eq!(b.queue(&packet(5), true), 0);
         assert_eq!(q.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod fmtp_tests {
+    use super::parse_fmtp;
+
+    #[test]
+    fn fmtp_takes_only_streams_the_decoder_takes() {
+        let ok = |s: &str| parse_fmtp(s).is_some();
+        assert!(ok("96 352 0 16 40 10 14 2 255 0 0 44100"));
+        assert!(ok("96 4096 0 24 40 10 14 1 255 0 0 48000"));
+        // the slots and the decoder were sized from these: 128 MB for a million samples a frame
+        assert!(!ok("96 1000000 0 16 40 10 14 2 255 0 0 44100"));
+        assert!(!ok("96 4294967295 0 16 40 10 14 2 255 0 0 44100"));
+        assert!(
+            !ok("96 352 0 272 40 10 14 2 255 0 0 44100"),
+            "272 isn't 16 bits"
+        );
+        assert!(!ok("96 352 0 20 40 10 14 2 255 0 0 44100"));
+        assert!(!ok("96 352 0 16 40 10 14 6 255 0 0 44100"));
+        assert!(!ok("96 352 0 16 40 10 14 2 255 0 0 0"));
+        assert!(!ok("96 352 0 16 40 10 14 2"));
     }
 }

@@ -113,6 +113,23 @@ impl crate::codec::aac::AacBackend for AlacDecoder {
     }
 }
 
+/// The longest ALAC frame a stream may announce: the reference encoder's default (AirPlay's senders use 352).
+pub(crate) const MAX_FRAME_LENGTH: u32 = 4096;
+
+/// Whether this decoder can take a stream of this shape: mono or stereo (it decodes no other element), 16 or 24
+/// bits, frames of 1..=[`MAX_FRAME_LENGTH`] samples. Every stream's parameters come from a sender; the decoder's
+/// buffers are sized from them.
+pub(crate) fn supported(frame_length: u32, bit_depth: u8, channels: u8) -> bool {
+    (1..=MAX_FRAME_LENGTH).contains(&frame_length)
+        && matches!(bit_depth, 16 | 24)
+        && matches!(channels, 1 | 2)
+}
+
+/// A sample rate a stream may announce.
+pub(crate) fn supported_rate(sample_rate: u32) -> bool {
+    (8_000..=384_000).contains(&sample_rate)
+}
+
 /// Bitstream reader for ALAC decoding.
 struct BitReader<'a> {
     buf: &'a [u8],
@@ -219,9 +236,9 @@ fn entropy_decode_value(
         x = value;
     } else if k != 1 {
         let extra_bits = reader.readbits(k);
-        x *= ((1 << k) - 1) & rice_kmodifier_mask;
+        x = x.wrapping_mul(((1 << k) - 1) & rice_kmodifier_mask);
         if extra_bits > 1 {
-            x += extra_bits - 1;
+            x = x.wrapping_add(extra_bits - 1);
         } else {
             reader.unreadbits(1);
         }
@@ -309,18 +326,22 @@ fn entropy_rice_decode(
             }
         };
 
-        let decoded_value =
-            entropy_decode_value(reader, read_sample_size, k, 0xFFFFFFFF) + sign_modifier;
+        // a stream's values stay well inside i32; the arithmetic wraps (as the C decoders' does) so that a
+        // malformed frame decodes to garbage instead of overflowing
+        let decoded_value = entropy_decode_value(reader, read_sample_size, k, 0xFFFFFFFF)
+            .wrapping_add(sign_modifier);
         let final_value = {
-            let v = (decoded_value + 1) / 2;
+            let v = decoded_value.wrapping_add(1) / 2;
             if decoded_value & 1 != 0 { -v } else { v }
         };
         output[i] = final_value;
         sign_modifier = 0;
 
-        history +=
-            decoded_value * rice.history_mult as i32 - ((history * rice.history_mult as i32) >> 9);
-        if decoded_value > 0xFFFF {
+        let mult = rice.history_mult as i32;
+        history = history
+            .wrapping_add(decoded_value.wrapping_mul(mult))
+            .wrapping_sub(history.wrapping_mul(mult) >> 9);
+        if decoded_value > 0xFFFF || history < 0 {
             history = 0xFFFF;
         }
 
@@ -378,8 +399,8 @@ fn predictor_decompress_fir_adapt(
         return;
     }
 
-    // Warm-up samples
-    for i in 0..predictor_coef_num {
+    // Warm-up samples (a frame may be shorter than the predictor's order)
+    for i in 0..predictor_coef_num.min(output_size - 1) {
         let val = sign_extend_32(
             buffer_out[i].wrapping_add(error_buffer[i + 1]),
             readsamplesize,
@@ -388,7 +409,7 @@ fn predictor_decompress_fir_adapt(
     }
 
     // General case — use a sliding window via offset
-    if predictor_coef_num > 0 {
+    if predictor_coef_num > 0 && output_size > predictor_coef_num + 1 {
         for (off, &error_val) in error_buffer[predictor_coef_num + 1..output_size]
             .iter()
             .enumerate()
@@ -396,12 +417,17 @@ fn predictor_decompress_fir_adapt(
             let mut sum = 0i64;
 
             for j in 0..predictor_coef_num {
-                sum += (buffer_out[off + predictor_coef_num - j] - buffer_out[off]) as i64
-                    * predictor_coef_table[j] as i64;
+                let d = buffer_out[off + predictor_coef_num - j].wrapping_sub(buffer_out[off]);
+                sum += i64::from(d) * i64::from(predictor_coef_table[j]);
             }
 
-            let mut outval =
-                ((1i64 << (predictor_quantitization - 1)) + sum) >> predictor_quantitization;
+            // the quantisation is 4 bits: 0 has no rounding term
+            let round = if predictor_quantitization > 0 {
+                1i64 << (predictor_quantitization - 1)
+            } else {
+                0
+            };
+            let mut outval = (round + sum) >> predictor_quantitization;
             outval += buffer_out[off] as i64 + error_val as i64;
             let outval = sign_extend_32(outval as i32, readsamplesize);
             buffer_out[off + predictor_coef_num + 1] = outval;
@@ -410,22 +436,32 @@ fn predictor_decompress_fir_adapt(
                 let mut pn = predictor_coef_num as i32 - 1;
                 let mut ev = error_val;
                 while pn >= 0 && ev > 0 {
-                    let val = buffer_out[off] - buffer_out[off + predictor_coef_num - pn as usize];
+                    let val = buffer_out[off]
+                        .wrapping_sub(buffer_out[off + predictor_coef_num - pn as usize]);
                     let sign = sign_only(val);
-                    predictor_coef_table[pn as usize] -= sign as i16;
-                    let val = val * sign;
-                    ev -= (val >> predictor_quantitization) * (predictor_coef_num as i32 - pn);
+                    predictor_coef_table[pn as usize] =
+                        predictor_coef_table[pn as usize].wrapping_sub(sign as i16);
+                    let val = val.wrapping_mul(sign);
+                    ev = ev.wrapping_sub(
+                        (val >> predictor_quantitization)
+                            .wrapping_mul(predictor_coef_num as i32 - pn),
+                    );
                     pn -= 1;
                 }
             } else if error_val < 0 {
                 let mut pn = predictor_coef_num as i32 - 1;
                 let mut ev = error_val;
                 while pn >= 0 && ev < 0 {
-                    let val = buffer_out[off] - buffer_out[off + predictor_coef_num - pn as usize];
+                    let val = buffer_out[off]
+                        .wrapping_sub(buffer_out[off + predictor_coef_num - pn as usize]);
                     let sign = -sign_only(val);
-                    predictor_coef_table[pn as usize] -= sign as i16;
-                    let val = val * sign;
-                    ev -= (val >> predictor_quantitization) * (predictor_coef_num as i32 - pn);
+                    predictor_coef_table[pn as usize] =
+                        predictor_coef_table[pn as usize].wrapping_sub(sign as i16);
+                    let val = val.wrapping_mul(sign);
+                    ev = ev.wrapping_sub(
+                        (val >> predictor_quantitization)
+                            .wrapping_mul(predictor_coef_num as i32 - pn),
+                    );
                     pn -= 1;
                 }
             }
@@ -442,20 +478,14 @@ fn deinterlace_16(
     shift: u8,
     leftweight: u8,
 ) {
-    let _out_i16: &mut [i16] = {
-        // Safe reinterpretation: out is aligned and sized for i16
-        let _ptr = out.as_mut_ptr() as *mut i16;
-        let _len = out.len() / 2;
-        // SAFETY: not needed — we write byte-by-byte instead
-        &mut []
-    };
-
     for i in 0..num_samples {
         let (left, right) = if leftweight != 0 {
-            let mid = buf_a[i];
-            let diff = buf_b[i];
-            let r = mid - ((diff * leftweight as i32) >> shift);
-            (r + diff, r)
+            let (mid, diff) = (buf_a[i], buf_b[i]);
+            let r = mid.wrapping_sub(
+                diff.wrapping_mul(leftweight as i32)
+                    .wrapping_shr(shift.into()),
+            );
+            (r.wrapping_add(diff), r)
         } else {
             (buf_a[i], buf_b[i])
         };
@@ -482,10 +512,12 @@ struct Deinterlace24Params<'a> {
 fn deinterlace_24(p: &Deinterlace24Params, out: &mut [u8]) {
     for i in 0..p.num_samples {
         let (mut left, mut right) = if p.leftweight != 0 {
-            let mid = p.buf_a[i];
-            let diff = p.buf_b[i];
-            let r = mid - ((diff * p.leftweight as i32) >> p.shift);
-            (r + diff, r)
+            let (mid, diff) = (p.buf_a[i], p.buf_b[i]);
+            let r = mid.wrapping_sub(
+                diff.wrapping_mul(p.leftweight as i32)
+                    .wrapping_shr(p.shift.into()),
+            );
+            (r.wrapping_add(diff), r)
         } else {
             (p.buf_a[i], p.buf_b[i])
         };
@@ -553,13 +585,15 @@ impl AlacDecoder {
         }
     }
 
-    /// Initialize the decoder with a 48-byte ALACSpecificConfig block.
-    pub(crate) fn set_info(&mut self, config: &[u8]) {
+    /// Initialize the decoder with a 48-byte ALACSpecificConfig block. False, and a decoder that decodes nothing,
+    /// for a shape it can't take ([`supported`], the sample size given to [`new`](Self::new), a Rice parameter
+    /// past 31).
+    pub(crate) fn set_info(&mut self, config: &[u8]) -> bool {
         // The ALACSpecificConfig fields live in config[24..48]; ignore anything
         // shorter rather than panic on out-of-bounds indexing (the RTSP caller
         // always passes a fixed 48-byte block, but this keeps the API safe).
         if config.len() < 48 {
-            return;
+            return false;
         }
         let mut p = 24; // skip: size(4) + frma(4) + alac(4) + size(4) + alac(4) + 0(4)
         self.max_samples_per_frame =
@@ -585,7 +619,15 @@ impl AlacDecoder {
         p += 4;
         self.sample_rate =
             u32::from_be_bytes([config[p], config[p + 1], config[p + 2], config[p + 3]]);
+        let ok = u8::try_from(self.num_channels).is_ok_and(|ch| {
+            supported(self.max_samples_per_frame, self.sample_size_config, ch)
+                && self.bytes_per_sample == i32::from(self.sample_size_config / 8) * i32::from(ch)
+        }) && self.rice_k_modifier <= 31;
+        if !ok {
+            self.max_samples_per_frame = 0;
+        }
         self.allocate_buffers();
+        ok
     }
 
     /// Allocate internal decode buffers. Called automatically by set_info.
@@ -612,6 +654,8 @@ impl AlacDecoder {
 
         match channels {
             0 => self.decode_mono(&mut reader, output, &mut output_samples, &mut output_size),
+            // a stereo element in a mono stream would write two channels into a buffer sized for one
+            1 if self.num_channels < 2 => return 0,
             1 => self.decode_stereo(&mut reader, output, &mut output_samples, &mut output_size),
             // not a frame (an element this decoder doesn't know): nothing decoded, rather than a frame's worth of
             // whatever the output held
@@ -634,10 +678,7 @@ impl AlacDecoder {
 
         let max_output_size = self.max_samples_per_frame as usize * self.bytes_per_sample as usize;
         let mut pcm_buf = vec![0u8; max_output_size];
-        let len = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.decode_frame(input, &mut pcm_buf)
-        }))
-        .unwrap_or(0);
+        let len = self.decode_frame(input, &mut pcm_buf);
         if len == 0 {
             return None;
         }
@@ -732,6 +773,12 @@ impl AlacDecoder {
             *output_samples = 0;
             return;
         }
+        // the bytes sent verbatim can't be the whole sample: not a frame
+        if uncompressed_bytes * 8 >= u32::from(self.sample_size_config) {
+            *output_size = 0;
+            *output_samples = 0;
+            return;
+        }
 
         let readsamplesize = self.sample_size_config as u32 - uncompressed_bytes * 8;
 
@@ -815,6 +862,12 @@ impl AlacDecoder {
                     "ALAC frame larger than the stream's frame length: dropped"
                 );
             }
+            *output_size = 0;
+            *output_samples = 0;
+            return;
+        }
+        // the bytes sent verbatim can't be the whole sample: not a frame
+        if uncompressed_bytes * 8 >= u32::from(self.sample_size_config) {
             *output_size = 0;
             *output_samples = 0;
             return;
@@ -1238,5 +1291,102 @@ mod decode_tests {
             alac.decode_frame(&[0xbc, 0xa7, 0x0d, 0x1f, 0, 0, 0, 0], &mut out),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    /// xorshift64*: deterministic, so a failure reproduces.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn info(frame_length: u32, bit_depth: u8, channels: u8) -> [u8; 48] {
+        let mut c = [0u8; 48];
+        c[24..28].copy_from_slice(&frame_length.to_be_bytes());
+        c[29] = bit_depth;
+        c[30] = 40;
+        c[31] = 10;
+        c[32] = 14;
+        c[33] = channels;
+        c[34..36].copy_from_slice(&255u16.to_be_bytes());
+        c[44..48].copy_from_slice(&44100u32.to_be_bytes());
+        c
+    }
+
+    fn seeds() -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for f in ["stereo352", "mono352"] {
+            let d = std::fs::read(format!(
+                "{}/tests/data/alac/{f}.alac",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let clen = u32::from_le_bytes(d[16..20].try_into().unwrap()) as usize;
+            let mut p = 20 + clen;
+            let n = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            for _ in 0..n.min(8) {
+                let len = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+                out.push(d[p + 4..p + 4 + len].to_vec());
+                p += 4 + len;
+            }
+        }
+        out
+    }
+
+    /// Random and mutated frames never panic (a debug build: overflow panics too), for every stream shape the
+    /// receiver accepts. Before the decoder checked its frames, a sample count below the predictor's order, a
+    /// stereo element in a mono stream and 24-bit frames all indexed out of bounds.
+    #[test]
+    fn no_frame_panics_the_decoder() {
+        let seeds = seeds();
+        let mut rng = Rng(0x5eed_a1ac);
+        for &(frame_length, bit_depth, channels) in &[
+            (1, 16, 2),
+            (2, 16, 1),
+            (31, 16, 2),
+            (32, 24, 1),
+            (352, 16, 2),
+            (352, 16, 1),
+            (352, 24, 2),
+            (4096, 24, 2),
+        ] {
+            let mut dec = AlacDecoder::new(i32::from(bit_depth), i32::from(channels));
+            assert!(dec.set_info(&info(frame_length, bit_depth, channels)));
+            let mut out =
+                vec![
+                    0u8;
+                    frame_length as usize * usize::from(channels) * usize::from(bit_depth / 8)
+                ];
+            for i in 0..4000 {
+                let frame: Vec<u8> = if i % 2 == 0 {
+                    let len = rng.below(700);
+                    (0..len).map(|_| rng.next() as u8).collect()
+                } else {
+                    let mut f = seeds[rng.below(seeds.len())].clone();
+                    for _ in 0..=rng.below(8) {
+                        let at = rng.below(f.len());
+                        f[at] ^= 1 << rng.below(8);
+                    }
+                    f.truncate(rng.below(f.len() + 1).max(1));
+                    f
+                };
+                let n = dec.decode_frame(&frame, &mut out);
+                assert!(n <= out.len());
+                let _ = dec.decode_frame_pcm(&frame);
+            }
+        }
     }
 }
