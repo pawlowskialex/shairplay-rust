@@ -946,13 +946,28 @@ fn setup_stream_realtime(
     let audio_format = stream0
         .get("audioFormat")
         .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0) as u32;
-    let alac_format = AlacFormat::from_audio_format(audio_format).unwrap_or(AlacFormat {
-        sample_rate: sr as u32,
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    let alac_format = AlacFormat::from_audio_format(audio_format).unwrap_or_else(|| AlacFormat {
+        sample_rate: u32::try_from(sr).unwrap_or(0),
         bit_depth: 16,
         channels: 2,
     });
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
+    // the decoder's buffers are sized from these: a stream the decoder can't take is refused here
+    let Ok(spf) = u32::try_from(spf) else {
+        return None;
+    };
+    if !crate::codec::alac::supported(spf, alac_format.bit_depth, alac_format.channels)
+        || !crate::codec::alac::supported_rate(alac_format.sample_rate)
+    {
+        tracing::warn!(
+            spf,
+            ?alac_format,
+            "AP2 realtime stream refused: not a shape the decoder takes"
+        );
+        return None;
+    }
 
     if shk.len() == 32 {
         // AP2 realtime ALAC — ChaCha20-Poly1305 per-packet encryption.
@@ -996,7 +1011,7 @@ fn setup_stream_realtime(
         let handler = conn.shared.handler.clone();
         let output_config = crate::raop::realtime_audio::OutputConfig {
             source_sample_rate: alac_format.sample_rate,
-            samples_per_frame: spf as u32,
+            samples_per_frame: spf,
             channels: alac_format.channels,
             bit_depth: alac_format.bit_depth,
             sample_rate: conn.shared.output_sample_rate,
