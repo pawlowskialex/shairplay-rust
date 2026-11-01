@@ -636,7 +636,7 @@ impl RaopBuffer {
             self.is_empty = true;
         } else {
             self.first_seqnum = ns;
-            self.last_seqnum = kept_last.unwrap_or(ns.wrapping_sub(1));
+            self.last_seqnum = kept_last.unwrap_or_else(|| ns.wrapping_sub(1));
         }
     }
 }

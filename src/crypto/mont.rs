@@ -104,7 +104,7 @@ impl Mont {
     }
 
     /// Out of Montgomery form.
-    pub(crate) fn from_mont(&self, a: &Words) -> BigUint {
+    pub(crate) fn out_of_mont(&self, a: &Words) -> BigUint {
         let mut unit = [0u32; WORDS];
         unit[0] = 1;
         BigUint::from_slice(&self.mul(a, &unit))
@@ -169,7 +169,7 @@ mod tests {
         let s = samples(&n);
         for a in &s {
             for b in s.iter().step_by(3) {
-                let got = m.from_mont(&m.mul(&m.to_mont(a), &m.to_mont(b)));
+                let got = m.out_of_mont(&m.mul(&m.to_mont(a), &m.to_mont(b)));
                 assert_eq!(got, a * b % &n, "a={a:x} b={b:x}");
             }
         }
@@ -182,11 +182,11 @@ mod tests {
         let s = samples(&n);
         for (i, base) in s.iter().enumerate() {
             let e = &s[(i * 7 + 3) % s.len()] >> (i * 97 % 2800);
-            let got = m.from_mont(&m.pow(&m.to_mont(base), &e));
+            let got = m.out_of_mont(&m.pow(&m.to_mont(base), &e));
             assert_eq!(got, base.modpow(&e, &n), "base={base:x} e={e:x}");
         }
         assert_eq!(
-            m.from_mont(&m.pow(&m.to_mont(&s[4]), &BigUint::from(0u32))),
+            m.out_of_mont(&m.pow(&m.to_mont(&s[4]), &BigUint::from(0u32))),
             BigUint::from(1u32)
         );
     }
@@ -196,7 +196,7 @@ mod tests {
         let n = n();
         let m = Mont::new(&n);
         for x in [n.clone(), &n + 5u32, (&n << 1u32) + 3u32] {
-            assert_eq!(m.from_mont(&m.to_mont(&x)), &x % &n);
+            assert_eq!(m.out_of_mont(&m.to_mont(&x)), &x % &n);
         }
     }
 }

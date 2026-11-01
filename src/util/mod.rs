@@ -10,8 +10,8 @@ use std::fmt::Write;
 pub fn now_ns() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        let t = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
-            .expect("CLOCK_MONOTONIC");
+        let t =
+            nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC");
         t.tv_sec() as u64 * 1_000_000_000 + t.tv_nsec() as u64
     }
     #[cfg(not(target_os = "linux"))]

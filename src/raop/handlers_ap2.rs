@@ -922,7 +922,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
 
     resp_dict.insert(
         "timingPort".into(),
-        plist::Value::Integer((timing_port as u64).into()),
+        plist::Value::Integer(u64::from(timing_port).into()),
     );
 
     Some(resp_dict)
@@ -1050,6 +1050,7 @@ fn setup_stream_realtime(
                     output_sample_rate: conn.shared.output_sample_rate,
                     output_format: conn.shared.output_format,
                     remote_socket: conn.remote_socket,
+                    offload: None,
                 },
             );
             if let Some(rtp) = &mut conn.raop_rtp {

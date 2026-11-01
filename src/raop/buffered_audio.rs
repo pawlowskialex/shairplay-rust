@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 
 use crate::codec::aac::{AacBackend, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
-use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, POLY1305_TAG_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
+use crate::raop::audio_pipeline::{
+    NONCE_TRAIL_LEN, POLY1305_TAG_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha,
+};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
 use crate::util::now_ns;
 
@@ -420,7 +422,12 @@ async fn receive_loop(
         if ssrc == AudioSsrc::None {
             unknown += 1;
             if unknown.is_power_of_two() {
-                warn!(unknown, ssrc = format_args!("{ssrc_val:#010x}"), seq, "Buffered audio: frames of an unknown format");
+                warn!(
+                    unknown,
+                    ssrc = format_args!("{ssrc_val:#010x}"),
+                    seq,
+                    "Buffered audio: frames of an unknown format"
+                );
             }
             continue;
         }
@@ -455,7 +462,10 @@ async fn receive_loop(
         });
         cvar.notify_all();
     }
-    info!(packets, empty, unknown, failed, "Buffered audio receive loop ended");
+    info!(
+        packets,
+        empty, unknown, failed, "Buffered audio receive loop ended"
+    );
     let (lock, cvar) = &*state;
     if let Ok(mut s) = lock.lock() {
         s.stopped = true;
@@ -865,7 +875,9 @@ fn delivery_loop(
             }
             decoded += 1;
             delivered = Some(e.seq);
-            if let (Decoding::Done(Some(pcm)), Some(sess), false) = (e.pcm, session.as_mut(), e.preroll) {
+            if let (Decoding::Done(Some(pcm)), Some(sess), false) =
+                (e.pcm, session.as_mut(), e.preroll)
+            {
                 deliver(pcm, e.ts, sess);
             }
             progress = true;
@@ -874,7 +886,10 @@ fn delivery_loop(
         for f in ready {
             let t = now_ns();
             let preroll = stream.as_mut().is_some_and(|st| st.preroll(f.seq));
-            let pcm = stream.as_mut().and_then(|st| st.decode(&f.data)).filter(|_| !preroll);
+            let pcm = stream
+                .as_mut()
+                .and_then(|st| st.decode(&f.data))
+                .filter(|_| !preroll);
             decode_ns += now_ns().saturating_sub(t);
             decoded += 1;
             delivered = Some(f.seq);
@@ -979,7 +994,12 @@ mod decode_ahead_tests {
 
     /// Frames 0..n but `skip` (one every 1024 samples, playing from now), the delivery loop with `mock`: what came
     /// out. `flush_at`: k frames in, a deferred flush of frames k+4 .. k+7.
-    fn play_skipping(n: u8, skip: std::ops::Range<u8>, asynchronous: bool, flush_at: Option<u8>) -> Vec<i16> {
+    fn play_skipping(
+        n: u8,
+        skip: std::ops::Range<u8>,
+        asynchronous: bool,
+        flush_at: Option<u8>,
+    ) -> Vec<i16> {
         let mut st = PlayoutState::new();
         for k in (0..n).filter(|k| !skip.contains(k)) {
             st.arrive(Frame {
@@ -1265,14 +1285,21 @@ mod decode_ahead_tests {
         // and the frame after them, if the decoder hadn't had them yet (pre-roll after the gap)
         let want: Vec<i16> = (1..24).filter(|&k| !(10..13).contains(&k)).collect();
         let want_preroll: Vec<i16> = (1..24).filter(|&k| !(10..14).contains(&k)).collect();
-        assert!(got == want || got == want_preroll, "exactly the flushed frames are missing: {got:?}");
+        assert!(
+            got == want || got == want_preroll,
+            "exactly the flushed frames are missing: {got:?}"
+        );
     }
 
     #[test]
     fn the_first_frame_after_a_gap_only_primes_the_decoder() {
         for asynchronous in [true, false] {
             let want: Vec<i16> = (1..16).filter(|&k| !(5..9).contains(&k)).collect();
-            assert_eq!(play_skipping(16, 5..8, asynchronous, None), want, "asynchronous: {asynchronous}");
+            assert_eq!(
+                play_skipping(16, 5..8, asynchronous, None),
+                want,
+                "asynchronous: {asynchronous}"
+            );
         }
     }
 
