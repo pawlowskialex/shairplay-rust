@@ -154,6 +154,8 @@ pub(crate) async fn run(
             if let Some(off) = offload.as_mut() {
                 off.collect(&mut |fill, out| {
                     silence!(fill);
+                    // each packet out takes its timestamp, whatever became of it
+                    let ts = offload_ts.pop_front();
                     let pcm = match out {
                         crate::raop::offload::OffloadOutput::Pcm(s) => {
                             crate::codec::Pcm::S16(s.to_vec())
@@ -179,7 +181,6 @@ pub(crate) async fn run(
                         #[cfg(feature = "resample")]
                         &mut resampler,
                     );
-                    let ts = offload_ts.pop_front();
                     if ts.is_some_and(|t| flushed(t, floor, await_anchor)) {
                         return;
                     }
@@ -265,7 +266,8 @@ pub(crate) async fn run(
             } => Some(r.map(|n| (n, true))),
             _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
             c = commands.recv() => {
-                let Some(RealtimeCommand::Flush { before }) = c else { continue };
+                // the connection is gone (its end of the channel with it): so is the stream
+                let Some(RealtimeCommand::Flush { before }) = c else { break };
                 // queued audio goes if it is all before the flush point (it can't be cut in part), and without a
                 // point all of it
                 let older = before.is_none_or(|n| last_played.is_none_or(|l| (l.wrapping_sub(n) as i32) < 0));
@@ -287,7 +289,8 @@ pub(crate) async fn run(
                 handler.on_error(&ShairplayError::Network(NetworkError::Io(e)));
                 break;
             }
-            Some(Ok((0, false))) => break,
+            // an empty datagram is no packet (UDP has no end of stream)
+            Some(Ok((0, _))) => {}
             Some(Ok((n, resent))) => {
                 // A resend answer is the original packet behind 4 bytes (0x80 0xd6 seq); anything else on the
                 // control port (sync packets) isn't audio.
@@ -532,5 +535,46 @@ mod tests {
         assert_eq!(info[33], 2);
         assert_eq!(u16::from_be_bytes(info[34..36].try_into().unwrap()), 255);
         assert_eq!(u32::from_be_bytes(info[44..48].try_into().unwrap()), 48_000);
+    }
+
+    struct Silent;
+    impl crate::raop::AudioSession for Silent {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+    struct NoAudio;
+    impl AudioHandler for NoAudio {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            Box::new(Silent)
+        }
+    }
+
+    /// The stream ends with its connection (the command channel's other end): it spun on the closed channel at
+    /// 100 % of a CPU before. An empty datagram doesn't end it.
+    #[tokio::test]
+    async fn the_stream_ends_with_its_connection_not_with_an_empty_datagram() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let config = OutputConfig {
+            source_sample_rate: 44100,
+            samples_per_frame: 352,
+            channels: 2,
+            bit_depth: 16,
+            sample_rate: None,
+            max_channels: None,
+            format: crate::raop::SampleFormat::S16,
+            offload: None,
+            latency_min: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run(socket, None, [0; 32], Arc::new(NoAudio), config, rx));
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&[], ("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "an empty datagram ended the stream");
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("the stream outlived its connection")
+            .unwrap();
     }
 }
