@@ -133,7 +133,7 @@ impl SupportedCommands {
             map.insert(n, (enabled, interval));
         }
         tracing::debug!(
-            enabled = ?{ let mut v: Vec<_> = map.iter().filter(|(_, e)| e.0).map(|(n, _)| *n).collect(); v.sort(); v },
+            enabled = ?{ let mut v: Vec<_> = map.iter().filter(|(_, e)| e.0).map(|(n, _)| *n).collect(); v.sort_unstable(); v },
             "the sender's commands"
         );
         *self.0.lock().unwrap() = map;
@@ -368,7 +368,7 @@ mod ap2_remote_tests {
     use super::*;
 
     fn sent(cmd: RemoteCommand) -> plist::Dictionary {
-        sent_to(cmd, Default::default()).unwrap()
+        sent_to(cmd, std::sync::Arc::default()).unwrap()
     }
 
     /// What the remote sends for `cmd` to a sender that takes `supported`, if anything.

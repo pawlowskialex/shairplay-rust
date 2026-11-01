@@ -137,7 +137,7 @@ impl SrpServer {
 
         // v = g^x mod N
         let m = group();
-        let v = m.from_mont(&m.pow(&m.to_mont(&g), &x));
+        let v = m.out_of_mont(&m.pow(&m.to_mont(&g), &x));
 
         // k = H(pad(N) || pad(g))
         let k = h_nn_pad(&n, &g, N_3072_LEN);
@@ -149,7 +149,7 @@ impl SrpServer {
             let mut b_bytes = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
             let b = BigUint::from_bytes_be(&b_bytes);
-            let big_b = (&kv + m.from_mont(&m.pow(&m.to_mont(&g), &b))) % &n;
+            let big_b = (&kv + m.out_of_mont(&m.pow(&m.to_mont(&g), &b))) % &n;
             if to_bytes_be(&big_b).len() == N_3072_LEN {
                 break (b, big_b);
             }
@@ -243,7 +243,7 @@ impl SrpServer {
         let vu =
             fixed_base_pow(m, &self.v_table, &u).unwrap_or_else(|| m.pow(&m.to_mont(&self.v), &u));
         let avu = m.mul(&m.to_mont(&big_a), &vu);
-        let big_s = m.from_mont(&m.pow(&avu, &self.b));
+        let big_s = m.out_of_mont(&m.pow(&avu, &self.b));
         tracing::debug!(ms = t0.elapsed().as_secs_f64() * 1e3, "SRP M3: (A v^u)^b");
 
         // session_key = H(S), and the expected client proof M1. Implementations disagree on whether S (in K)
@@ -355,7 +355,7 @@ fn fixed_base_pow(m: &Mont, table: &[Words], e: &BigUint) -> Option<Words> {
     }
     let digit = |k: usize| {
         let b = bytes.get(k / 2).copied().unwrap_or(0);
-        if k % 2 == 0 { b & 15 } else { b >> 4 }
+        if k.is_multiple_of(2) { b & 15 } else { b >> 4 }
     };
     let (mut acc, mut run) = (m.one(), m.one());
     for d in (1..16u8).rev() {
@@ -913,7 +913,7 @@ mod tests {
             BigUint::from_bytes_be(&super::sha512(b"u")),
         ] {
             assert_eq!(
-                super::fixed_base_pow(m, &table, &e).map(|p| m.from_mont(&p)),
+                super::fixed_base_pow(m, &table, &e).map(|p| m.out_of_mont(&p)),
                 Some(x.modpow(&e, &n)),
                 "{e}"
             );

@@ -303,7 +303,10 @@ impl Drop for MdnsService {
 /// renamed itself mid-probe and never announced `_airplay._tcp` (browsers stopped listing the receiver).
 #[cfg(not(target_os = "macos"))]
 fn host_name() -> String {
-    format!("{}-airplay.local.", gethostname::gethostname().to_string_lossy())
+    format!(
+        "{}-airplay.local.",
+        gethostname::gethostname().to_string_lossy()
+    )
 }
 
 #[cfg(not(target_os = "macos"))]

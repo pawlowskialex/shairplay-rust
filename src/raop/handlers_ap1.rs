@@ -538,7 +538,7 @@ mod tests {
             packet_offload: None,
             aac_decoder: None,
             alac_offload: None,
-            identity: Default::default(),
+            identity: crate::raop::DeviceIdentity::default(),
             stream_owner: Mutex::new(None),
             verified: Mutex::new(Vec::new()),
         });

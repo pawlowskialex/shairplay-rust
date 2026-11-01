@@ -920,8 +920,7 @@ impl ClockTrack {
             .iter()
             .map(|t| t.1)
             .fold(f64::INFINITY, f64::min)
-            .min(2.0 * MAX_DELAY_NS)
-            .max(0.0)
+            .clamp(0.0, 2.0 * MAX_DELAY_NS)
             / 2.0
     }
 }
