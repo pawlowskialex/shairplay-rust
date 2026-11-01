@@ -1035,7 +1035,7 @@ fn setup_stream_realtime(
             cmd_rx,
         ));
         conn.shared
-            .set_active_audio(Box::new(move || handle.abort()));
+            .set_active_audio(conn.id, Box::new(move || handle.abort()));
 
         stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     } else {
@@ -1146,9 +1146,12 @@ fn setup_stream_buffered(
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
     let cmd_tx = proc.start(shk_arr, output_config, handler);
     conn.playout_cmd = Some(cmd_tx.clone());
-    conn.shared.set_active_audio(Box::new(move || {
-        let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
-    }));
+    conn.shared.set_active_audio(
+        conn.id,
+        Box::new(move || {
+            let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+        }),
+    );
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     stream_resp.insert(

@@ -548,3 +548,37 @@ impl RaopServer {
         )
     }
 }
+
+#[cfg(all(test, feature = "ap2-core"))]
+mod session_tests {
+    use super::RaopServer;
+    use crate::raop::{AudioFormat, AudioHandler, AudioSession};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Silent;
+    impl AudioSession for Silent {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+    struct NoAudio;
+    impl AudioHandler for NoAudio {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(Silent)
+        }
+    }
+
+    /// A streams-only TEARDOWN stops its own connection's stream, not whoever plays.
+    #[test]
+    fn only_the_connection_that_started_a_stream_stops_it() {
+        let server = RaopServer::builder().build(Arc::new(NoAudio)).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let s = stopped.clone();
+        server
+            .shared
+            .set_active_audio(1, Box::new(move || s.store(true, Ordering::SeqCst)));
+        server.shared.stop_audio_of(2);
+        assert!(!stopped.load(Ordering::SeqCst));
+        server.shared.stop_audio_of(1);
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+}

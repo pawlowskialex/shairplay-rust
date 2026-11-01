@@ -69,7 +69,9 @@ pub(crate) struct RaopShared {
     /// new session here — and stopping the previous — keeps only the newest
     /// playout feeding the output (avoids overlapping / post-disconnect audio).
     #[cfg(feature = "ap2-core")]
-    pub(crate) active_audio: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// (the connection that started it, its stop)
+    #[allow(clippy::type_complexity)]
+    pub(crate) active_audio: std::sync::Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>>,
     #[cfg(feature = "hls")]
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
     /// The connection whose sender has the audio now: (connection id, sender, its close signal).
@@ -132,16 +134,28 @@ impl RaopShared {
 
 #[cfg(feature = "ap2-core")]
 impl RaopShared {
-    /// Register a newly-started audio session, stopping the previous one so only
+    /// Register a newly-started audio session of connection `id`, stopping the previous one so only
     /// the latest connection's playout feeds the audio output.
-    pub(crate) fn set_active_audio(&self, stop: Box<dyn FnOnce() + Send>) {
+    pub(crate) fn set_active_audio(&self, id: u64, stop: Box<dyn FnOnce() + Send>) {
         let prev = self
             .active_audio
             .lock()
             .ok()
-            .and_then(|mut g| g.replace(stop));
-        if let Some(prev) = prev {
+            .and_then(|mut g| g.replace((id, stop)));
+        if let Some((_, prev)) = prev {
             prev();
+        }
+    }
+
+    /// Stop the active audio session if connection `id` started it (a streams-only TEARDOWN).
+    pub(crate) fn stop_audio_of(&self, id: u64) {
+        let stop = self
+            .active_audio
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take_if(|(owner, _)| *owner == id));
+        if let Some((_, stop)) = stop {
+            stop();
         }
     }
 }

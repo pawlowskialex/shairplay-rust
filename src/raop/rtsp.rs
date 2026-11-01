@@ -394,16 +394,9 @@ fn handle_teardown(
     let streams_only = false;
     tracing::info!(streams_only, "TEARDOWN");
     if streams_only {
+        // this connection's stream only: a TEARDOWN from another connection doesn't stop who plays
         #[cfg(feature = "ap2-core")]
-        if let Some(stop) = conn
-            .shared
-            .active_audio
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-        {
-            stop();
-        }
+        conn.shared.stop_audio_of(conn.id);
     } else {
         response.add_header("Connection", "close");
         response.set_disconnect(true);
