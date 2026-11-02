@@ -32,6 +32,12 @@ pub(crate) struct RaopShared {
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
+    /// Buffered audio plays this much after its network time (builder's buffered_offset_ms)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) buffered_offset_ns: i64,
+    /// Realtime audio's latency instead of the sender's (builder's realtime_latency_ms)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) realtime_latency_ns: Option<i64>,
     /// Sample format of the PCM handed to the sessions.
     pub(crate) output_format: crate::raop::SampleFormat,
     /// AP2 buffered audio: the buffer size advertised to the sender (how far ahead it may send).

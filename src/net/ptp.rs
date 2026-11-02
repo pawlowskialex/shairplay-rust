@@ -76,6 +76,25 @@ pub fn parse_announce(buf: &[u8]) -> Option<u64> {
     Some(clock_id)
 }
 
+/// The PTP sink's settings (the server builder's `ptp*` options).
+#[derive(Clone, Debug)]
+pub(crate) struct PtpOptions {
+    pub(crate) sink: bool,
+    /// CSV of the clock samples
+    pub(crate) log: Option<String>,
+    pub(crate) delay_req: bool,
+}
+
+impl Default for PtpOptions {
+    fn default() -> Self {
+        PtpOptions {
+            sink: true,
+            log: None,
+            delay_req: true,
+        }
+    }
+}
+
 /// AirPlay 2 PTP sink: bind the PTP event (319) and general (320) ports and
 /// drain the sender's clock stream. We do not discipline a clock — draining is
 /// enough. With nothing bound, every PTP packet the sender emits bounces an
@@ -86,15 +105,15 @@ pub fn parse_announce(buf: &[u8]) -> Option<u64> {
 /// Received messages are decoded at `debug`; the first is noted once at `info`.
 /// Binds gracefully — ports <1024 may need root / `CAP_NET_BIND_SERVICE`; on bind
 /// failure it logs one line and returns, leaving normal operation untouched.
-/// IPv6-unspecified bind (AirPlay timing traffic is IPv6), IPv4 on hosts without IPv6. Set `SHAIRPLAY_NO_PTP`
-/// to skip the bind (for A/B measuring the effect).
-pub(crate) async fn spawn_ptp_sink() {
-    if std::env::var("SHAIRPLAY_NO_PTP").is_ok() {
-        tracing::info!("PTP sink disabled via SHAIRPLAY_NO_PTP — expect slow AP2 connect");
+/// IPv6-unspecified bind (AirPlay timing traffic is IPv6), IPv4 on hosts without IPv6.
+pub(crate) async fn spawn_ptp_sink(options: &PtpOptions) {
+    if !options.sink {
+        tracing::info!("PTP sink off: expect slow AP2 connects");
         return;
     }
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let samples = Arc::new(SyncSamples::new(std::env::var("SHAIRPLAY_PTP_LOG").ok()));
+    let samples = Arc::new(SyncSamples::new(options.log.clone()));
+    let delay_req = options.delay_req;
     let mut bound = 0u8;
     for port in [319u16, 320u16] {
         let bind = match tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await
@@ -118,7 +137,7 @@ pub(crate) async fn spawn_ptp_sink() {
                 ) {
                     tracing::warn!(port, "PTP: no kernel receive timestamps: {e}");
                 }
-                if port == 319 {
+                if port == 319 && delay_req {
                     tokio::spawn(request_delays(sock.clone(), samples.clone()));
                 }
                 tokio::spawn(async move {
@@ -396,9 +415,6 @@ impl SyncSamples {
 /// Delay_Reqs to the master once a second while one is heard: the path delay, which the Sync samples alone can't
 /// tell from the clocks' offset (over Wi-Fi ~2 ms, all of it showing up as playing late).
 async fn request_delays(sock: Arc<tokio::net::UdpSocket>, samples: Arc<SyncSamples>) {
-    if std::env::var_os("SHAIRPLAY_NO_DELAY_REQ").is_some() {
-        return;
-    }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if let Some((m, to)) = samples.delay_req()

@@ -39,6 +39,8 @@ pub(crate) struct OutputConfig {
     pub(crate) aac_decoder: Option<crate::raop::offload::AacDecoderFactory>,
     /// The application's ALAC offload, tried first.
     pub(crate) alac_offload: Option<crate::raop::offload::AlacOffloadFactory>,
+    /// Added to every frame's network time (may be negative; the builder's buffered_offset_ms)
+    pub(crate) offset_ns: i64,
 }
 
 impl std::fmt::Debug for OutputConfig {
@@ -214,9 +216,7 @@ fn play_time(timing: Timing, ts: u32, sample_rate: u32) -> Option<u64> {
     match timing {
         Timing::Network { clock, net_ns, rtp } => {
             let frames = i128::from(ts.wrapping_sub(rtp) as i32);
-            let net = i128::from(net_ns)
-                + i128::from(buffered_offset_ns())
-                + frames * 1_000_000_000 / rate;
+            let net = i128::from(net_ns) + frames * 1_000_000_000 / rate;
             crate::net::ptp::follower().to_local(clock, net.max(0) as u64)
         }
         Timing::Local { local_ns, rtp } => {
@@ -255,6 +255,7 @@ impl BufferedAudioProcessor {
 
         // Command handler
         let state3 = state.clone();
+        let offset_ns = output_config.offset_ns;
         let mut cmd_rx = cmd_rx;
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
@@ -281,9 +282,13 @@ impl BufferedAudioProcessor {
                             } else {
                                 ptp.latest()
                             };
-                            s.anchor = clock
-                                .filter(|_| anchor_time_ns != 0)
-                                .map(|c| (c, anchor_time_ns, anchor_rtp));
+                            s.anchor = clock.filter(|_| anchor_time_ns != 0).map(|c| {
+                                (
+                                    c,
+                                    anchor_time_ns.saturating_add_signed(offset_ns),
+                                    anchor_rtp,
+                                )
+                            });
                             if s.time_anchor() {
                                 let in_ms = s
                                     .timing
@@ -667,18 +672,6 @@ const LATE_NS: u64 = 25_000_000;
 /// more).
 const MAX_QUEUED_BYTES: usize = 4 << 20;
 
-/// A fixed offset added to every frame's network time (SHAIRPLAY_BUFFERED_LATENCY_MS, may be negative; default
-/// none): a frame plays at the network time its anchor gives it, as Apple's receivers do.
-fn buffered_offset_ns() -> i64 {
-    static L: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *L.get_or_init(|| {
-        std::env::var("SHAIRPLAY_BUFFERED_LATENCY_MS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(0, |ms| (ms * 1e6) as i64)
-    })
-}
-
 /// How far ahead of its time a frame goes to an asynchronous decoder, and how many at most.
 const LOOKAHEAD_NS: u64 = 80_000_000;
 const AHEAD_MAX: usize = 6;
@@ -1028,6 +1021,7 @@ mod decode_ahead_tests {
             format: crate::raop::SampleFormat::S16,
             aac_decoder: Some(factory),
             alac_offload: None,
+            offset_ns: 0,
         };
         let st = state.clone();
         let t = std::thread::spawn(move || delivery_loop(st, handler, config));
@@ -1157,6 +1151,7 @@ mod decode_ahead_tests {
             format: crate::raop::SampleFormat::Integer,
             aac_decoder: None,
             alac_offload: Some(factory),
+            offset_ns: 0,
         };
         let st = state.clone();
         let t = std::thread::spawn(move || delivery_loop(st, handler, config));
@@ -1249,6 +1244,7 @@ mod decode_ahead_tests {
             format: crate::raop::SampleFormat::S16,
             aac_decoder: Some(aac),
             alac_offload: Some(alac),
+            offset_ns: 0,
         };
         let st = state.clone();
         let t = std::thread::spawn(move || delivery_loop(st, handler, config));

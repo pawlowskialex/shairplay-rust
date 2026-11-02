@@ -61,6 +61,13 @@ fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
 /// Builder for [`RaopServer`].
 pub struct RaopServerBuilder {
     max_clients: usize,
+    mdns: bool,
+    #[cfg(feature = "ap2-core")]
+    ptp: crate::net::ptp::PtpOptions,
+    #[cfg(feature = "ap2-core")]
+    buffered_offset_ns: i64,
+    #[cfg(feature = "ap2-core")]
+    realtime_latency_ns: Option<i64>,
     hwaddr: Option<Vec<u8>>,
     identity: crate::raop::DeviceIdentity,
     password: Option<String>,
@@ -100,6 +107,13 @@ impl RaopServerBuilder {
     pub fn new() -> Self {
         Self {
             max_clients: 10,
+            mdns: true,
+            #[cfg(feature = "ap2-core")]
+            ptp: crate::net::ptp::PtpOptions::default(),
+            #[cfg(feature = "ap2-core")]
+            buffered_offset_ns: 0,
+            #[cfg(feature = "ap2-core")]
+            realtime_latency_ns: None,
             hwaddr: None,
             identity: crate::raop::DeviceIdentity::default(),
             password: None,
@@ -134,6 +148,51 @@ impl RaopServerBuilder {
         self.max_clients = n;
         self
     }
+    /// Announce the receiver over mDNS (Bonjour) when it starts. Default: true; tests turn it off.
+    pub fn mdns(mut self, on: bool) -> Self {
+        self.mdns = on;
+        self
+    }
+
+    /// Run the PTP sink on UDP 319/320 (AirPlay 2's clock). Default: true. Without it a sender's buffered audio
+    /// starts seconds late and plays on the local clock.
+    #[cfg(feature = "ap2-core")]
+    pub fn ptp(mut self, on: bool) -> Self {
+        self.ptp.sink = on;
+        self
+    }
+
+    /// Append every PTP clock sample to this file as CSV (clock, sequence, master ns, local ns, task ns): for
+    /// measuring the clock follower.
+    #[cfg(feature = "ap2-core")]
+    pub fn ptp_log(mut self, path: impl Into<String>) -> Self {
+        self.ptp.log = Some(path.into());
+        self
+    }
+
+    /// Measure the path delay to the PTP master with a Delay_Req a second. Default: true.
+    #[cfg(feature = "ap2-core")]
+    pub fn ptp_delay_req(mut self, on: bool) -> Self {
+        self.ptp.delay_req = on;
+        self
+    }
+
+    /// Play buffered audio this much later than its network time (ms, may be negative). Default: 0, at its time,
+    /// as Apple's receivers do: for measurements.
+    #[cfg(feature = "ap2-core")]
+    pub fn buffered_offset_ms(mut self, ms: f64) -> Self {
+        self.buffered_offset_ns = (ms * 1e6) as i64;
+        self
+    }
+
+    /// Play realtime audio this long after its network time (ms), instead of the latency the sender asks for (its
+    /// SETUP's latencyMin, else 11025 frames): for measurements.
+    #[cfg(feature = "ap2-core")]
+    pub fn realtime_latency_ms(mut self, ms: f64) -> Self {
+        self.realtime_latency_ns = Some((ms * 1e6) as i64);
+        self
+    }
+
     /// How the receiver presents itself to senders: model, maker, serial number, firmware (default: an Apple TV).
     pub fn identity(mut self, identity: crate::raop::DeviceIdentity) -> Self {
         self.identity = identity;
@@ -383,6 +442,10 @@ impl RaopServerBuilder {
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
+            #[cfg(feature = "ap2-core")]
+            buffered_offset_ns: self.buffered_offset_ns,
+            #[cfg(feature = "ap2-core")]
+            realtime_latency_ns: self.realtime_latency_ns,
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
             packet_offload: self.packet_offload.clone(),
@@ -431,6 +494,9 @@ impl RaopServerBuilder {
             ap1_advertisement,
             #[cfg(feature = "ap2-core")]
             mode: self.mode,
+            announce: self.mdns,
+            #[cfg(feature = "ap2-core")]
+            ptp: self.ptp,
         })
     }
 }
@@ -450,6 +516,10 @@ pub struct RaopServer {
     ap1_advertisement: Ap1Advertisement,
     #[cfg(feature = "ap2-core")]
     mode: AirPlayMode,
+    /// mDNS on start (the builder's mdns)
+    announce: bool,
+    #[cfg(feature = "ap2-core")]
+    ptp: crate::net::ptp::PtpOptions,
 }
 
 impl RaopServer {
@@ -469,10 +539,10 @@ impl RaopServer {
         // stall the buffered-audio start. No-op if the ports can't be bound.
         #[cfg(feature = "ap2-core")]
         if self.mode == AirPlayMode::AirPlay2 {
-            crate::net::ptp::spawn_ptp_sink().await;
+            crate::net::ptp::spawn_ptp_sink(&self.ptp).await;
         }
 
-        if std::env::var("CI").is_err() {
+        if self.announce {
             let info = self.service_info();
             let mut mdns = MdnsService::new()?;
             mdns.register_raop(&info)?;
