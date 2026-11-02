@@ -193,6 +193,8 @@ pub(crate) struct RaopRtp {
 struct Playout {
     decoder: Decoder,
     output: Output,
+    /// A unit has come out with audio (until then a repeated packet starts the stream over: see `arrive`)
+    started: bool,
     /// Frames in a packet: the format's, or (PCM) the last packet's
     frames: usize,
     pcm_channels: Option<usize>,
@@ -205,6 +207,7 @@ impl Playout {
             self.output.silence(fill as usize * self.frames, None);
             match pcm {
                 Some(pcm) => {
+                    self.started = true;
                     if let Some(ch) = self.pcm_channels {
                         self.frames = pcm.len() / ch.max(1);
                     }
@@ -213,6 +216,25 @@ impl Playout {
                 // didn't decrypt or decode: as long a silence
                 None => self.output.silence(self.frames, None),
             }
+        }
+    }
+
+    /// A packet from the sender into the reorder stage; what can go to the decoder now into `out`. A packet under a
+    /// sequence number that went out already, before any audio came out, starts the stream over from it: a sender
+    /// may open with placeholders under the first sequence numbers (they decode to nothing) and send the frames under
+    /// the same numbers after them. Later, it is a resend that came too late: dropped.
+    fn arrive(
+        &mut self,
+        reorder: &mut Reorder,
+        packet: &[u8],
+        now: std::time::Instant,
+        out: &mut Vec<(u32, Vec<u8>)>,
+    ) {
+        if !reorder.push(rtp_seq(packet), packet, now, out) && !self.started {
+            out.clear();
+            self.flush(None);
+            reorder.flush(None);
+            reorder.push(rtp_seq(packet), packet, now, out);
         }
     }
 
@@ -279,7 +301,8 @@ impl RaopRtp {
             codec: self.format.codec(),
         });
         Playout {
-            decoder: Decoder::new(offload, library).replaceable(),
+            decoder: Decoder::new(offload, library),
+            started: false,
             output: Output::new(self.handler.as_ref(), self.format.source(), &self.output),
             frames: self.format.frames(),
             pcm_channels: matches!(self.format, Ap1Format::L16 { .. })
@@ -413,12 +436,8 @@ async fn receive_udp(
         };
         let now = std::time::Instant::now();
         let mut out = Vec::new();
-        // A packet under a sequence number that went out already is the decoder's to judge: a sender's placeholder
-        // and the frame come under one number.
-        if let Some(p) = received
-            && !reorder.push(rtp_seq(p), p, now, &mut out)
-        {
-            playout.decoder.replace(u32::from(rtp_seq(p)), p);
+        if let Some(p) = received {
+            playout.arrive(&mut reorder, p, now, &mut out);
         }
         reorder.tick(now, &mut out);
         if let Some(c) = &ctrl {
@@ -549,25 +568,24 @@ mod tests {
         }
     }
 
-    type Jobs = Arc<Mutex<Vec<(u32, i16, bool)>>>;
+    type Jobs = Arc<Mutex<Vec<(u32, Option<i16>, bool)>>>;
 
     /// Finishes packets only when told; "decodes" one to 4 samples of its RTP sequence number (a placeholder, a
-    /// packet shorter than 40 bytes, to -100).
+    /// packet shorter than 40 bytes, to nothing).
     struct Mock(Jobs);
     impl Offload for Mock {
         fn submit(&mut self, tag: u32, packet: &[u8]) -> bool {
-            let v = if packet.len() < 40 {
-                -100
-            } else {
-                rtp_seq(packet) as i16
-            };
+            let v = (packet.len() >= 40).then(|| rtp_seq(packet) as i16);
             self.0.lock().unwrap().push((tag, v, false));
             true
         }
         fn collect(&mut self, done: &mut dyn FnMut(u32, Decoded<'_>)) {
             let mut q = self.0.lock().unwrap();
             while let Some(&(tag, v, true)) = q.first() {
-                done(tag, Decoded::S16(&[v; 4]));
+                match v {
+                    Some(v) => done(tag, Decoded::S16(&[v; 4])),
+                    None => done(tag, Decoded::Failed),
+                }
                 q.remove(0);
             }
         }
@@ -646,7 +664,7 @@ mod tests {
     }
 
     /// A sender that opens with placeholders under the first sequence numbers, then sends the frames under the
-    /// same numbers: the frames play, not the placeholders.
+    /// same numbers: the frames play, not the placeholders; once audio has come out, a repeated packet is dropped.
     #[test]
     fn placeholders_are_replaced_by_the_frames_under_their_numbers() {
         let got = Got::default();
@@ -654,19 +672,24 @@ mod tests {
         let mut reorder = Reorder::new(true, MAX_HELD);
         let t = std::time::Instant::now();
         let mut out = Vec::new();
-        for (seq, len) in [(7u16, 20), (8, 20), (7, 40), (8, 40), (9, 40)] {
-            let pk = packet(seq, len);
-            if !reorder.push(seq, &pk, t, &mut out) {
-                assert!(p.decoder.replace(u32::from(seq), &pk));
-            }
+        let mut send = |p: &mut Playout, seq: u16, len: usize| {
+            p.arrive(&mut reorder, &packet(seq, len), t, &mut out);
             for (fill, pk) in out.drain(..) {
                 p.decoder.push(u32::from(rtp_seq(&pk)), 0, fill, &pk);
             }
+        };
+        for (seq, len) in [(7u16, 20), (8, 20), (7, 40), (8, 40), (9, 40)] {
+            send(&mut p, seq, len);
         }
-        // the placeholders' results come back first: not taken for the frames
+        // the placeholders' results come back first: dropped
         finish(&q);
         p.drain();
         assert_eq!(*got.0.lock().unwrap(), [7, 8, 9]);
+        send(&mut p, 8, 40); // too late now
+        send(&mut p, 10, 40);
+        finish(&q);
+        p.drain();
+        assert_eq!(*got.0.lock().unwrap(), [7, 8, 9, 10]);
     }
 
     /// FLUSH keeps what is in the decoder from its sequence number on.
