@@ -234,11 +234,11 @@ impl Playout {
         now: std::time::Instant,
         out: &mut Vec<(u32, Vec<u8>)>,
     ) {
-        if !reorder.push(rtp_seq(packet), packet, now, out) && !self.started {
+        if !reorder.push(rtp_seq(packet), packet.to_vec(), now, out) && !self.started {
             out.clear();
             self.flush(None);
             reorder.flush(None);
-            reorder.push(rtp_seq(packet), packet, now, out);
+            reorder.push(rtp_seq(packet), packet.to_vec(), now, out);
         }
     }
 
@@ -653,7 +653,7 @@ mod tests {
         let t = std::time::Instant::now();
         let mut out = Vec::new();
         for seq in [65534u16, 65535, 0, 2] {
-            reorder.push(seq, &packet(seq, 40), t, &mut out);
+            reorder.push(seq, packet(seq, 40), t, &mut out);
         }
         for (fill, pk) in &out {
             p.decoding.push(u32::from(rtp_seq(pk)), 0, *fill, pk);
