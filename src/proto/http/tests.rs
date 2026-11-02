@@ -158,3 +158,40 @@ fn global_body_and_header_count_limits_cannot_be_widened() {
     let request = parse_fragmented(b"POST / RTSP/1.0\r\nContent-Length: \t003 \t\r\n\r\nabc");
     assert_eq!(request.data(), Some(b"abc".as_slice()));
 }
+
+/// The PipeWire probe (a source-derived request) parses whole at every split of its bytes.
+#[test]
+fn source_probe_survives_every_request_split() {
+    let body = hex::decode(include_str!("../../../tests/fixtures/pipewire-auth-setup.hex").trim())
+        .unwrap();
+    assert_eq!(body.len(), 33);
+    assert_eq!(body[0], 1);
+    let mut wire = format!(
+        "POST /auth-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    wire.extend_from_slice(&body);
+    for split in 0..=wire.len() {
+        let mut parsed = HttpRequest::new();
+        parsed
+            .add_data(&wire[..split])
+            .unwrap_or_else(|error| panic!("split {split}: {error}"));
+        assert_eq!(parsed.is_complete(), split == wire.len());
+        parsed.add_data(&wire[split..]).unwrap();
+        assert!(parsed.is_complete(), "split at {split}");
+        assert_eq!(parsed.method(), Some("POST"));
+        assert_eq!(parsed.url(), Some("/auth-setup"));
+        assert_eq!(
+            parsed.header("Content-Type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(parsed.data(), Some(body.as_slice()));
+    }
+    let mut parsed = HttpRequest::new();
+    for byte in &wire {
+        parsed.add_data(std::slice::from_ref(byte)).unwrap();
+    }
+    assert!(parsed.is_complete());
+    assert_eq!(parsed.data(), Some(body.as_slice()));
+}

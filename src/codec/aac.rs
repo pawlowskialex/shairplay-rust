@@ -41,9 +41,7 @@ impl AudioSsrc {
     }
 
     /// Whether this format uses AAC encoding.
-    // Part of the AudioSsrc accessor set, exercised by the unit tests; the
-    // production AP2 path only calls `from_u32`/`sample_rate`/`channels`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_aac(self) -> bool {
         matches!(
             self,
@@ -86,7 +84,7 @@ impl AudioSsrc {
     }
 
     /// ADTS channel configuration index for this format.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn adts_channel_config(self) -> u8 {
         match self {
             Self::Aac48000F24Surround51 => 6,
@@ -101,9 +99,7 @@ impl AudioSsrc {
 /// `packet_len` is the total length including the 7-byte header itself.
 /// `rate` is the sample rate (44100 or 48000).
 /// `channels` is the channel configuration (2 = stereo).
-// ADTS framing helpers retained for the AAC path and verified by the unit
-// tests; not currently invoked by the buffered-audio production code.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> [u8; 7] {
     let profile = 2u8; // AAC-LC
     let freq_idx: u8 = match rate {
@@ -126,7 +122,7 @@ pub(crate) fn adts_header(packet_len: usize, rate: u32, channels: u8) -> [u8; 7]
 }
 
 /// Wrap a raw AAC frame with an ADTS header.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
     let total_len = raw_aac.len() + 7;
     let header = adts_header(total_len, rate, channels);

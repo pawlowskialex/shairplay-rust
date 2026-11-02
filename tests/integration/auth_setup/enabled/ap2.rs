@@ -1,4 +1,4 @@
-use shairplay::crypto::chacha_transport::EncryptedChannel;
+use crate::support::EncryptedChannel;
 
 use super::*;
 

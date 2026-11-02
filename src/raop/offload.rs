@@ -16,26 +16,41 @@ pub enum OffloadCipher {
     None,
     /// AirPlay 1: AES-128-CBC over the payload's whole 16-byte blocks, the IV reset for every packet; a tail of
     /// fewer than 16 bytes is in the clear.
-    Aes128Cbc { key: [u8; 16], iv: [u8; 16] },
+    Aes128Cbc {
+        /// The session's AES key (ANNOUNCE's rsaaeskey, decrypted).
+        key: [u8; 16],
+        /// Its IV (aesiv).
+        iv: [u8; 16],
+    },
     /// AirPlay 2 realtime: ChaCha20-Poly1305. Packet: `[RTP header 12][ciphertext][tag 16][nonce tail 8]`, nonce
     /// `[0; 4] ++ tail`, AAD the header's bytes 4..12.
-    ChaCha20Poly1305 { key: [u8; 32] },
+    ChaCha20Poly1305 {
+        /// The stream key (SETUP's shk).
+        key: [u8; 32],
+    },
 }
 
 /// The stream's ALAC parameters (the SDP fmtp / SETUP values).
 #[derive(Clone, Copy, Debug)]
 pub struct OffloadAlac {
+    /// Samples a frame.
     pub frame_length: u32,
+    /// Bits a sample: 16 or 24.
     pub bit_depth: u8,
+    /// Rice parameters: history multiplier,
     pub pb: u8,
+    /// initial history,
     pub mb: u8,
+    /// and k limit.
     pub kb: u8,
+    /// 1 or 2.
     pub channels: u8,
 }
 
 /// What an offload is asked to do for every packet of a stream.
 #[derive(Clone)]
 pub struct OffloadStream {
+    /// How the packets are encrypted.
     pub cipher: OffloadCipher,
     /// Decode ALAC too (else the offload returns the plaintext payload for the software decoder).
     pub alac: Option<OffloadAlac>,

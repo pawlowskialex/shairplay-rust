@@ -701,7 +701,7 @@ impl AlacDecoder {
     }
 
     /// Decode an ALAC frame and return F32LE interleaved samples.
-    #[allow(dead_code)] // the unit tests' entry point; the pipelines use decode_frame_pcm
+    #[cfg(test)]
     pub(crate) fn decode_frame_f32(&mut self, input: &[u8]) -> Option<Vec<f32>> {
         self.decode_frame_pcm(input).map(Pcm::into_f32)
     }

@@ -61,6 +61,7 @@ impl Sdp {
         sdp
     }
 
+    #[cfg(test)]
     /// SDP version (v=).
     pub fn version(&self) -> Option<&str> {
         self.version.as_deref()
@@ -89,6 +90,7 @@ impl Sdp {
     pub fn aesiv(&self) -> Option<&str> {
         self.aesiv.as_deref()
     }
+    #[cfg(test)]
     /// Minimum latency (a=min-latency).
     pub fn min_latency(&self) -> Option<&str> {
         self.min_latency.as_deref()

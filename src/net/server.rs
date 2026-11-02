@@ -109,6 +109,9 @@ async fn write_bad_request_and_close<S: AsyncWrite + Unpin>(
     let _ = stream.shutdown().await;
 }
 
+/// Default RTSP listening port for AirPlay receivers.
+pub(crate) const DEFAULT_RTSP_PORT: u16 = 5000;
+
 /// Controls how the server binds to network addresses.
 ///
 /// # Examples
@@ -129,9 +132,6 @@ async fn write_bad_request_and_close<S: AsyncWrite + Unpin>(
 /// // Bind to a specific port
 /// let config = BindConfig::new().port(7000);
 /// ```
-/// Default RTSP listening port for AirPlay receivers.
-pub(crate) const DEFAULT_RTSP_PORT: u16 = 5000;
-
 #[derive(Debug, Clone)]
 pub struct BindConfig {
     /// IP addresses to bind to. Empty = bind to all interfaces (0.0.0.0 + \[::\]).
