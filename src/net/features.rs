@@ -115,6 +115,7 @@ pub(crate) fn features_from(flags: &[AirPlayFeature]) -> u64 {
     val
 }
 
+#[cfg(test)]
 /// Features for an audio-only AirPlay 2 receiver.
 ///
 /// Features for an audio-only AirPlay 2 receiver.

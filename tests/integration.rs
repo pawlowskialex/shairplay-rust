@@ -10,6 +10,8 @@ use shairplay::{AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer,
 
 #[path = "integration/auth_setup.rs"]
 mod auth_setup;
+#[allow(dead_code)]
+mod support;
 
 struct TestHandler {
     inits: Arc<Mutex<Vec<AudioFormat>>>,
@@ -606,7 +608,7 @@ async fn teardown_closes_connection() {
 #[cfg(feature = "ap2-core")]
 mod ap2_tests {
     use super::*;
-    use shairplay::crypto::tlv::{TlvType, TlvValues};
+    use crate::support::{TlvType, TlvValues};
 
     #[tokio::test]
     #[serial]
@@ -1191,7 +1193,7 @@ mod ap2_tests {
         let session_key = perform_transient_pairing(&mut stream).await;
 
         // Derive client-side transport cipher context (swapped write/read relative to server)
-        let mut client_cipher = shairplay::crypto::chacha_transport::EncryptedChannel::new(
+        let mut client_cipher = crate::support::EncryptedChannel::new(
             &session_key,
             "Control-Salt",
             "Control-Write-Encryption-Key",

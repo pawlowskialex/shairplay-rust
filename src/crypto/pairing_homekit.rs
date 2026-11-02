@@ -526,6 +526,7 @@ pub fn generate_identity_seed() -> [u8; 32] {
     seed
 }
 
+#[cfg(test)]
 /// **INSECURE** — deterministic Ed25519 keypair derived from the public `device_id`
 /// (matches the original C `server_keypair`, i.e. libsodium `crypto_sign_seed_keypair`
 /// over the zero-padded device id).

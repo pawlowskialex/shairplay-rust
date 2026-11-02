@@ -24,6 +24,7 @@ impl Pairing {
         })
     }
 
+    #[cfg(test)]
     /// Create from a known 32-byte seed. Equivalent to pairing_init_seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self {
@@ -173,6 +174,7 @@ impl PairingSession {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Derive a key from the shared secret. Equivalent to pairing_session_derive_key.
     pub fn derive_key(&self, salt: &[u8], key_len: usize) -> Result<Vec<u8>, CryptoError> {
         self.derive_key_internal(salt, key_len)

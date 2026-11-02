@@ -1,13 +1,13 @@
-//! Unit tests with test vectors generated from the original C implementation.
+//! Test vectors generated from the original C implementation (shairplay).
 
-use shairplay::crypto::aes::AesCtr;
-use shairplay::crypto::fairplay::FairPlay;
-use shairplay::crypto::pairing::Pairing;
-use shairplay::net::mdns::AirPlayServiceInfo;
-use shairplay::proto::digest;
-use shairplay::proto::http::{HttpRequest, HttpResponse};
-use shairplay::proto::sdp::Sdp;
-use shairplay::raop::buffer::RaopBuffer;
+use crate::crypto::aes::AesCtr;
+use crate::crypto::fairplay::FairPlay;
+use crate::crypto::pairing::Pairing;
+use crate::net::mdns::AirPlayServiceInfo;
+use crate::proto::digest;
+use crate::proto::http::{HttpRequest, HttpResponse};
+use crate::proto::sdp::Sdp;
+use crate::raop::buffer::RaopBuffer;
 
 // ============================================================
 // Base64 — vectors from C base64_encode/base64_decode
@@ -542,8 +542,8 @@ mod ap2_tests {
 
     #[test]
     fn c_vector_audio_packet_decrypt() {
+        use crate::raop::audio_pipeline::decrypt_rtp_chacha;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
-        use shairplay::raop::audio_pipeline::decrypt_rtp_chacha;
 
         let packet = hex_decode(AUDIO_PACKET_HEX);
         let cipher = ChaCha20Poly1305::new((&[0x42u8; 32]).into());
@@ -557,8 +557,8 @@ mod ap2_tests {
 
     #[test]
     fn audio_packet_wrong_key_fails() {
+        use crate::raop::audio_pipeline::decrypt_rtp_chacha;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
-        use shairplay::raop::audio_pipeline::decrypt_rtp_chacha;
 
         let packet = hex_decode(AUDIO_PACKET_HEX);
         let cipher = ChaCha20Poly1305::new((&[0x00u8; 32]).into());
@@ -583,7 +583,7 @@ mod ap2_tests {
 
     #[test]
     fn ap2_features_hilo_split() {
-        use shairplay::net::features::receiver_features;
+        use crate::net::features::receiver_features;
         let lo = receiver_features() & 0xFFFFFFFF;
         let hi = (receiver_features() >> 32) & 0xFFFFFFFF;
         let formatted = format!("0x{:X},0x{:X}", lo, hi);
@@ -621,11 +621,11 @@ mod ap2_tests {
 
     #[test]
     fn server_keypair_deterministic() {
-        let (_, vk1) = shairplay::crypto::pairing_homekit::server_keypair("TestDevice");
-        let (_, vk2) = shairplay::crypto::pairing_homekit::server_keypair("TestDevice");
+        let (_, vk1) = crate::crypto::pairing_homekit::server_keypair("TestDevice");
+        let (_, vk2) = crate::crypto::pairing_homekit::server_keypair("TestDevice");
         assert_eq!(vk1.as_bytes(), vk2.as_bytes());
         // Different device_id → different key
-        let (_, vk3) = shairplay::crypto::pairing_homekit::server_keypair("OtherDevice");
+        let (_, vk3) = crate::crypto::pairing_homekit::server_keypair("OtherDevice");
         assert_ne!(vk1.as_bytes(), vk3.as_bytes());
     }
 
@@ -633,7 +633,7 @@ mod ap2_tests {
 
     #[test]
     fn c_vector_server_keypair() {
-        let (_, vk) = shairplay::crypto::pairing_homekit::server_keypair("AABBCCDD1122");
+        let (_, vk) = crate::crypto::pairing_homekit::server_keypair("AABBCCDD1122");
         let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             pk_hex,
@@ -663,7 +663,7 @@ mod ap2_tests {
 
     #[test]
     fn test_airplay2_persistent_identity() {
-        use shairplay::raop::{AudioFormat, AudioHandler, AudioSession, RaopServer};
+        use crate::raop::{AudioFormat, AudioHandler, AudioSession, RaopServer};
         use std::sync::Arc;
 
         struct DummyHandler;
@@ -751,7 +751,7 @@ mod frac_edge_tests {
 
 #[cfg(all(test, feature = "ap2-core"))]
 mod playout_tests {
-    use shairplay::raop::buffered_audio::PlayoutCommand;
+    use crate::raop::buffered_audio::PlayoutCommand;
 
     #[test]
     fn playout_command_variants() {
@@ -777,7 +777,7 @@ mod playout_tests {
 #[cfg(feature = "ap2-core")]
 #[test]
 fn identity_key_has_entropy_and_is_not_device_derived() {
-    use shairplay::crypto::pairing_homekit::{
+    use crate::crypto::pairing_homekit::{
         generate_identity_seed, identity_keypair, server_keypair,
     };
     // Generated seeds carry real entropy (not constant / not derived from public data).
@@ -792,7 +792,7 @@ fn identity_key_has_entropy_and_is_not_device_derived() {
 #[cfg(feature = "ap2-core")]
 #[test]
 fn pairing_store_identity_methods_default_and_roundtrip() {
-    use shairplay::{MemoryPairingStore, PairingStore};
+    use crate::{MemoryPairingStore, PairingStore};
     // Default trait methods keep the extension non-breaking: a store that doesn't
     // implement them still compiles and reports "no persisted identity".
     let mem = MemoryPairingStore::default();
@@ -824,7 +824,7 @@ fn pairing_store_identity_methods_default_and_roundtrip() {
 #[cfg(feature = "ap2-core")]
 #[test]
 fn server_build_generates_and_persists_random_identity() {
-    use shairplay::{AudioFormat, AudioHandler, AudioSession, PairingStore, RaopServer};
+    use crate::{AudioFormat, AudioHandler, AudioSession, PairingStore, RaopServer};
     use std::sync::Arc;
 
     struct NoopHandler;

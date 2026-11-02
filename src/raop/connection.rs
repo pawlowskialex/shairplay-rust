@@ -185,7 +185,6 @@ fn new_raop_connection(
         fairplay: FairPlay::new(),
         pairing: shared.pairing.create_session(),
         local_addr: socket_ip_bytes(local),
-        remote_addr: socket_ip_bytes(remote),
         remote_socket: remote,
         session: false,
         id: {

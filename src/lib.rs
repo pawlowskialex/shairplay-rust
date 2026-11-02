@@ -54,18 +54,15 @@ server.start().await?;
 - `video` — Experimental screen mirroring (implies `ap2`)
 "]
 
+#[cfg(test)]
+mod c_vectors;
 pub(crate) mod codec;
-#[doc(hidden)]
-pub mod crypto;
-#[doc(hidden)]
-pub mod dacp;
+mod crypto;
+mod dacp;
 pub mod error;
-#[doc(hidden)]
-pub mod net;
-#[doc(hidden)]
-pub mod proto;
-#[doc(hidden)]
-pub mod raop;
+mod net;
+mod proto;
+mod raop;
 pub(crate) mod util;
 
 pub use error::ShairplayError;

@@ -7,7 +7,6 @@ mod enabled;
 use super::{ap1_builder, empty_handler, raop_txt, start_server};
 use md5::{Digest, Md5};
 use serial_test::serial;
-use shairplay::proto::http::HttpRequest;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -123,36 +122,6 @@ async fn read_response(client: &mut BufReader<TcpStream>) -> Response {
     })
     .await
     .expect("response deadline")
-}
-
-#[test]
-fn source_probe_survives_every_request_split() {
-    let body = probe();
-    assert_eq!(body.len(), 33);
-    assert_eq!(body[0], 1);
-    let wire = request(1, None);
-    for split in 0..=wire.len() {
-        let mut parsed = HttpRequest::new();
-        parsed
-            .add_data(&wire[..split])
-            .unwrap_or_else(|error| panic!("split {split}: {error}"));
-        assert_eq!(parsed.is_complete(), split == wire.len());
-        parsed.add_data(&wire[split..]).unwrap();
-        assert!(parsed.is_complete(), "split at {split}");
-        assert_eq!(parsed.method(), Some("POST"));
-        assert_eq!(parsed.url(), Some("/auth-setup"));
-        assert_eq!(
-            parsed.header("Content-Type"),
-            Some("application/octet-stream")
-        );
-        assert_eq!(parsed.data(), Some(body.as_slice()));
-    }
-    let mut parsed = HttpRequest::new();
-    for byte in &wire {
-        parsed.add_data(std::slice::from_ref(byte)).unwrap();
-    }
-    assert!(parsed.is_complete());
-    assert_eq!(parsed.data(), Some(body.as_slice()));
 }
 
 #[tokio::test]

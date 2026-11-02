@@ -24,18 +24,10 @@ pub enum TlvType {
     State = 6,
     /// Error code.
     Error = 7,
-    /// Retry delay in seconds.
-    RetryDelay = 8,
-    /// MFi certificate.
-    Certificate = 9,
     /// Ed25519 signature.
     Signature = 10,
     /// Pairing permissions.
     Permissions = 11,
-    /// Fragment data.
-    FragmentData = 13,
-    /// Last fragment marker.
-    FragmentLast = 14,
     /// Pairing flags (transient bit).
     Flags = 19,
     /// TLV separator.

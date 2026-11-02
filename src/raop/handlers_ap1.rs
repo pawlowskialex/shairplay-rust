@@ -18,8 +18,6 @@ pub(crate) struct RaopConnection {
     pub(crate) fairplay: FairPlay,
     pub(crate) pairing: PairingSession,
     pub(crate) local_addr: Vec<u8>,
-    #[allow(dead_code)] // read in AP2 event channel binding
-    pub(crate) remote_addr: Vec<u8>,
     pub(crate) remote_socket: std::net::SocketAddr,
     /// This connection started a session (`AudioHandler::on_session_setup`): its end is the session's end.
     pub(crate) session: bool,
@@ -552,7 +550,6 @@ mod tests {
             fairplay: FairPlay::new(),
             pairing,
             local_addr: vec![127, 0, 0, 1],
-            remote_addr: vec![127, 0, 0, 1],
             remote_socket: "127.0.0.1:5000".parse().unwrap(),
             session: false,
             nonce: String::new(),
