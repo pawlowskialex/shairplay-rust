@@ -7,9 +7,9 @@ use super::types::*;
 use crate::crypto::fairplay::FairPlay;
 use crate::crypto::pairing::Pairing;
 use crate::crypto::rsa::RsaKey;
-use crate::net::server::{ConnectionHandler, HttpdCallbacks};
+use crate::net::server::{ConnectionHandler, HttpdCallbacks, Reply};
 use crate::proto::digest;
-use crate::proto::http::{HttpRequest, HttpResponse};
+use crate::proto::http::HttpRequest;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -238,9 +238,7 @@ impl HttpdCallbacks for RaopShared {
             remote_addr: remote_str,
             connected_at: std::time::Instant::now(),
             #[cfg(feature = "ap2-core")]
-            cipher: None,
-            #[cfg(feature = "ap2-core")]
-            pending_secret: None,
+            encrypted: false,
         }))
     }
 }
@@ -251,10 +249,9 @@ struct RaopConnectionHandler {
     /// Connection-start instant, used to log per-request elapsed time for
     /// connect-latency diagnostics (AP2 PTP-sync wait vs AP1 fast path).
     connected_at: std::time::Instant,
+    /// The connection is encrypted (a pairing gave it its secret)
     #[cfg(feature = "ap2-core")]
-    cipher: Option<crate::crypto::chacha_transport::EncryptedChannel>,
-    #[cfg(feature = "ap2-core")]
-    pending_secret: Option<Vec<u8>>,
+    encrypted: bool,
 }
 
 impl Drop for RaopConnectionHandler {
@@ -294,7 +291,7 @@ impl ConnectionHandler for RaopConnectionHandler {
         rtsp::request_body_policy(&self.conn, request)
     }
 
-    fn conn_request(&mut self, request: &HttpRequest) -> HttpResponse {
+    fn request(&mut self, request: &HttpRequest) -> Reply {
         // Connect-latency timeline: one line per RTSP request, elapsed since the
         // connection opened. `/feedback` is a ~2s keep-alive heartbeat, so it drops
         // to `debug` to keep the connect sequence readable; everything else at info.
@@ -306,74 +303,28 @@ impl ConnectionHandler for RaopConnectionHandler {
         } else {
             tracing::info!(elapsed_ms, method, url, "RTSP request");
         }
-        let resp = rtsp::dispatch(&mut self.conn, request);
+        #[allow(unused_mut)]
+        let mut reply = Reply::from(rtsp::dispatch(&mut self.conn, request));
 
-        // Queue encryption activation for AFTER this response is sent
+        // The pairing that gave the connection its secret finished with this response: encrypted after it
         #[cfg(feature = "ap2-core")]
-        if self.cipher.is_none()
+        if !self.encrypted
             && let Some(secret) = &self.conn.ap2_shared_secret
         {
-            self.pending_secret = Some(secret.clone());
+            self.encrypted = true;
+            match crate::crypto::chacha_transport::EncryptedChannel::control(secret) {
+                Ok(channel) => reply.encrypt = Some(channel),
+                Err(e) => {
+                    tracing::warn!("Failed to create cipher: {e}");
+                    reply.response.set_disconnect(true);
+                }
+            }
         }
-
-        resp
+        reply
     }
 
     fn close_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
         Some(self.conn.close.clone())
-    }
-
-    fn is_encrypted(&self) -> bool {
-        #[cfg(feature = "ap2-core")]
-        {
-            self.cipher.is_some()
-        }
-        #[cfg(not(feature = "ap2-core"))]
-        {
-            false
-        }
-    }
-
-    fn after_response(&mut self) {
-        #[cfg(feature = "ap2-core")]
-        if self.cipher.is_none()
-            && let Some(secret) = self.pending_secret.take()
-        {
-            tracing::debug!(
-                secret_len = secret.len(),
-                "Activating cipher from pending_secret"
-            );
-            match crate::crypto::chacha_transport::EncryptedChannel::control(&secret) {
-                Ok(ch) => {
-                    tracing::info!("Encrypted RTSP transport activated");
-                    self.cipher = Some(ch);
-                }
-                Err(e) => tracing::warn!("Failed to create cipher: {e}"),
-            }
-        }
-    }
-
-    fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-        #[cfg(feature = "ap2-core")]
-        if let Some(ch) = &mut self.cipher {
-            return ch.decrypt_ctx.decrypt(data).ok();
-        }
-        Some((data.to_vec(), data.len()))
-    }
-
-    fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
-        #[cfg(feature = "ap2-core")]
-        if let Some(ch) = &mut self.cipher {
-            // Once the channel is encrypted the peer expects ciphertext; never
-            // fall back to emitting plaintext (which would leak the response and
-            // desync the stream). On the practically-impossible AEAD encrypt
-            // failure, return no bytes so the connection tears down instead.
-            return ch.encrypt_ctx.encrypt(data).unwrap_or_else(|e| {
-                tracing::warn!("Outgoing encryption failed; dropping response: {e}");
-                Vec::new()
-            });
-        }
-        data.to_vec()
     }
 }
 

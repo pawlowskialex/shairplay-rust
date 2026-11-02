@@ -20,8 +20,6 @@ struct Observations {
 #[derive(Default)]
 struct BoundedHandler {
     observed: Arc<Observations>,
-    #[cfg(feature = "ap2-core")]
-    channel: Option<crate::crypto::chacha_transport::EncryptedChannel>,
 }
 
 impl ConnectionHandler for BoundedHandler {
@@ -43,7 +41,7 @@ impl ConnectionHandler for BoundedHandler {
         })
     }
 
-    fn conn_request(&mut self, request: &HttpRequest) -> HttpResponse {
+    fn request(&mut self, request: &HttpRequest) -> Reply {
         self.observed.dispatches.fetch_add(1, Ordering::SeqCst);
         let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
         response.add_header(
@@ -51,36 +49,19 @@ impl ConnectionHandler for BoundedHandler {
             &request.data().map_or(0, <[u8]>::len).to_string(),
         );
         response.finish(None);
-        response
-    }
-
-    #[cfg(feature = "ap2-core")]
-    fn is_encrypted(&self) -> bool {
-        self.channel.is_some()
-    }
-
-    #[cfg(feature = "ap2-core")]
-    fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-        self.channel.as_mut().map_or_else(
-            || Some((data.to_vec(), data.len())),
-            |channel| channel.decrypt_ctx.decrypt(data).ok(),
-        )
-    }
-
-    #[cfg(feature = "ap2-core")]
-    fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
-        self.channel.as_mut().map_or_else(
-            || data.to_vec(),
-            |channel| channel.encrypt_ctx.encrypt(data).unwrap(),
-        )
+        response.into()
     }
 }
 
 fn spawn(handler: BoundedHandler) -> (DuplexStream, JoinHandle<()>) {
+    spawn_connection(Connection::new(Box::new(handler)))
+}
+
+fn spawn_connection(conn: Connection) -> (DuplexStream, JoinHandle<()>) {
     let (client, server) = tokio::io::duplex(256 * 1024);
-    let task = tokio::spawn(process_connection(
+    let task = tokio::spawn(run_connection(
         server,
-        Box::new(handler),
+        conn,
         "127.0.0.1:5000".parse().unwrap(),
         Arc::default(),
     ));
@@ -178,23 +159,18 @@ async fn absolute_body_deadline_does_not_slide_and_starts_after_headers() {
 async fn completed_body_clears_deadline_and_next_request_gets_its_own() {
     let handler = BoundedHandler::default();
     let observed = handler.observed.clone();
-    let mut pending = PendingRequest::default();
-    pending
-        .add_data(&handler, &headers("/bounded", 33))
-        .unwrap();
-    let first_deadline = pending.body_deadline.unwrap();
-    advance(Duration::from_secs(4)).await;
-    pending.add_data(&handler, &[1; 33]).unwrap();
-    assert!(pending.body_deadline.is_none());
+    let mut conn = Connection::new(Box::new(handler));
     let (mut client, mut server) = tokio::io::duplex(1024);
-    let mut handler = handler;
-    let accepted = send_completed_responses(&mut server, &mut handler, &mut pending).await;
+    assert!(conn.ingest(&mut server, &headers("/bounded", 33)).await);
+    let first_deadline = conn.pending.body_deadline.unwrap();
+    advance(Duration::from_secs(4)).await;
+    assert!(conn.ingest(&mut server, &[1; 33]).await);
+    assert!(conn.pending.body_deadline.is_none());
+    let accepted = conn.answer(&mut server).await;
     assert!(accepted);
-    pending
-        .add_data(&handler, &headers("/bounded", 33))
-        .unwrap();
+    assert!(conn.ingest(&mut server, &headers("/bounded", 33)).await);
     assert_eq!(
-        pending.body_deadline.unwrap(),
+        conn.pending.body_deadline.unwrap(),
         first_deadline + Duration::from_secs(4)
     );
     assert_eq!(observed.policies.load(Ordering::SeqCst), 2);
@@ -212,8 +188,6 @@ impl HttpdCallbacks for BoundedCallbacks {
     ) -> Option<Box<dyn ConnectionHandler>> {
         Some(Box::new(BoundedHandler {
             observed: self.0.clone(),
-            #[cfg(feature = "ap2-core")]
-            channel: None,
         }))
     }
 }
@@ -255,28 +229,36 @@ async fn deadline_releases_real_tcp_client_slot() {
     shutdown.send(true).unwrap();
 }
 
-#[tokio::test]
-async fn encrypted_buffer_limit_is_checked_before_copying() {
-    let mut handler = BoundedHandler::default();
-    let mut pending = PendingRequest::default();
-    let mut raw = vec![0; MAX_ENCRYPTED_BUFFER_LEN];
-    let mut sink = tokio::io::sink();
-    let accepted =
-        ingest_encrypted_data(&mut sink, &mut handler, &mut pending, &mut raw, b"x").await;
-    assert!(!accepted);
+#[cfg(feature = "ap2-core")]
+#[test]
+fn encrypted_buffer_limit_is_checked_before_copying() {
+    let (_, framing, _) = encrypted_pair();
+    let Framing::Encrypted { channel, .. } = framing else {
+        unreachable!()
+    };
+    let mut framing = Framing::Encrypted {
+        channel,
+        raw: vec![0; MAX_ENCRYPTED_BUFFER_LEN],
+    };
+    assert!(framing.open(b"x").is_none());
+    let Framing::Encrypted { raw, .. } = framing else {
+        unreachable!()
+    };
     assert_eq!(raw.len(), MAX_ENCRYPTED_BUFFER_LEN);
 }
 
+/// A connection already encrypted with a control channel from a fixed secret, and the peer's side of it.
 #[cfg(feature = "ap2-core")]
 fn encrypted_pair() -> (
-    BoundedHandler,
+    Arc<Observations>,
+    Framing,
     crate::crypto::chacha_transport::EncryptedChannel,
 ) {
     use crate::crypto::chacha_transport::EncryptedChannel;
     let secret = [42; 32];
-    let handler = BoundedHandler {
-        channel: Some(EncryptedChannel::control(&secret).unwrap()),
-        ..BoundedHandler::default()
+    let framing = Framing::Encrypted {
+        channel: Box::new(EncryptedChannel::control(&secret).unwrap()),
+        raw: Vec::new(),
     };
     let client = EncryptedChannel::new(
         &secret,
@@ -286,13 +268,23 @@ fn encrypted_pair() -> (
         "Control-Read-Encryption-Key",
     )
     .unwrap();
-    (handler, client)
+    (Arc::default(), framing, client)
+}
+
+#[cfg(feature = "ap2-core")]
+fn encrypted_connection(observed: &Arc<Observations>, framing: Framing) -> Connection {
+    let mut conn = Connection::new(Box::new(BoundedHandler {
+        observed: observed.clone(),
+    }));
+    conn.framing = framing;
+    conn
 }
 
 #[cfg(feature = "ap2-core")]
 #[tokio::test]
 async fn encrypted_fragments_and_pipeline_use_identical_policy() {
-    let (mut handler, mut peer) = encrypted_pair();
+    let (observed, framing, mut peer) = encrypted_pair();
+    let mut conn = encrypted_connection(&observed, framing);
     let mut wire = headers("/bounded", 33);
     wire.extend_from_slice(&[1; 33]);
     wire.extend_from_slice(&headers("/large", 2048));
@@ -300,17 +292,18 @@ async fn encrypted_fragments_and_pipeline_use_identical_policy() {
     wire.extend_from_slice(&headers("/bounded", 34));
     let ciphertext = peer.encrypt_ctx.encrypt(&wire).unwrap();
     let (mut client, mut server) = tokio::io::duplex(4096);
-    let mut pending = PendingRequest::default();
-    let mut raw = Vec::new();
     let mut accepted = true;
     for byte in ciphertext {
         assert!(accepted);
-        let ingested =
-            ingest_encrypted_data(&mut server, &mut handler, &mut pending, &mut raw, &[byte]).await;
-        assert!(ingested);
-        accepted = send_completed_responses(&mut server, &mut handler, &mut pending).await;
+        let ingested = conn.ingest(&mut server, &[byte]).await;
+        if !ingested {
+            accepted = false;
+            break;
+        }
+        accepted = conn.answer(&mut server).await;
     }
     assert!(!accepted);
+    drop(server);
     let response = read_closed(&mut client).await;
     let (plain, consumed) = peer.decrypt_ctx.decrypt(&response).unwrap();
     assert_eq!(consumed, response.len());
@@ -318,16 +311,15 @@ async fn encrypted_fragments_and_pipeline_use_identical_policy() {
     assert_eq!(plain.matches("RTSP/1.0 200").count(), 2);
     assert_eq!(plain.matches("RTSP/1.0 400").count(), 1);
     assert!(plain.contains("Body-Bytes: 2048\r\n"));
-    assert_eq!(handler.observed.policies.load(Ordering::SeqCst), 3);
-    assert_eq!(handler.observed.dispatches.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.policies.load(Ordering::SeqCst), 3);
+    assert_eq!(observed.dispatches.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(feature = "ap2-core")]
 #[tokio::test(start_paused = true)]
 async fn encrypted_partial_frame_cannot_extend_body_deadline() {
-    let (handler, mut peer) = encrypted_pair();
-    let observed = handler.observed.clone();
-    let (mut client, task) = spawn(handler);
+    let (observed, framing, mut peer) = encrypted_pair();
+    let (mut client, task) = spawn_connection(encrypted_connection(&observed, framing));
     let wire = peer.encrypt_ctx.encrypt(&headers("/bounded", 33)).unwrap();
     client.write_all(&wire).await.unwrap();
     observed.headers.notified().await;
