@@ -276,7 +276,9 @@ pub enum Samples<'a> {
 pub trait AudioSession: Send {
     /// Decoded audio, and the time its first frame should leave the speaker when the stream is on a timeline
     /// (AirPlay 2 with a PTP clock followed): nanoseconds on the receiver's monotonic clock ([`now_ns`]). Sessions
-    /// that can schedule their output play it then (multi-room sync); `None`: as it comes.
+    /// that can schedule their output play it then (multi-room sync); `None`: as it comes. On a timeline, audio
+    /// that was lost (a packet never resent in time, a frame that didn't decode) is a hole between play times, not
+    /// silence: the session fills it.
     ///
     /// [`now_ns`]: crate::now_ns
     fn audio(&mut self, samples: Samples<'_>, play_at_ns: Option<u64>);

@@ -28,7 +28,7 @@ pub(crate) struct Retransmit {
 
 impl Retransmit {
     /// Ask the sender for what `reorder` found missing.
-    pub(crate) async fn ask(&self, reorder: &mut Reorder) {
+    pub(crate) async fn ask<T>(&self, reorder: &mut Reorder<T>) {
         for (first, count) in reorder.take_requests() {
             let _ = self
                 .socket
@@ -58,17 +58,17 @@ struct ReorderStats {
     late: u32,       // arrived after their place was played (or twice)
 }
 
-/// Realtime packets in sequence order. A packet behind a gap is held while the gap is asked for again (`ASK_AGAIN`
+/// Realtime packets (or what was made of them: `T`) in sequence order. A packet behind a gap is held while the gap is asked for again (`ASK_AGAIN`
 /// later once more, then every `ASK_LATER`); after `GIVE_UP` (or the stream's longer [`wait`](Self::wait)), or with
 /// `max_held` packets waiting, the gap is played as silence (the output queue has to cover the wait). A jump of more
 /// than `MAX_GAP`, or than what may be held, is a new start (a flush), not a loss. Without retransmits (`hold` false)
 /// gaps are given up at once.
-pub(crate) struct Reorder {
+pub(crate) struct Reorder<T = Vec<u8>> {
     hold: bool,
     max_held: usize,
     give_up: std::time::Duration,
     next: Option<u64>, // extended sequence number of the next packet to play
-    held: std::collections::BTreeMap<u64, Vec<u8>>, // arrived beyond a gap
+    held: std::collections::BTreeMap<u64, T>, // arrived beyond a gap
     asked: std::collections::BTreeMap<u64, (std::time::Instant, std::time::Instant, u8)>, // missing: first, last ask, asks
     requests: Vec<(u16, u16)>,
     last_arrival: Option<std::time::Instant>,
@@ -80,7 +80,7 @@ const ASK_LATER: std::time::Duration = std::time::Duration::from_millis(250);
 const GIVE_UP: std::time::Duration = std::time::Duration::from_millis(120);
 const MAX_GAP: u64 = 64;
 
-impl Reorder {
+impl<T> Reorder<T> {
     pub(crate) fn new(hold: bool, max_held: usize) -> Self {
         Reorder {
             hold,
@@ -96,8 +96,8 @@ impl Reorder {
     }
 
     /// A stream that plays well after its packets arrive (on the sender's timeline) waits for a gap up to `wait`
-    /// instead of `GIVE_UP`, holding what comes behind it meanwhile (`packets_per_s`): a packet or a resend that is
-    /// late but still before its time plays.
+    /// instead of `GIVE_UP` (and gives it up sooner through [`tick_until`](Self::tick_until)), holding what comes
+    /// behind it meanwhile (`packets_per_s`): a packet or a resend that is late but still before its time plays.
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) fn wait(&mut self, wait: std::time::Duration, packets_per_s: u32) {
         self.give_up = wait.max(GIVE_UP);
@@ -118,9 +118,9 @@ impl Reorder {
     pub(crate) fn push(
         &mut self,
         seq: u16,
-        packet: &[u8],
+        packet: T,
         now: std::time::Instant,
-        out: &mut Vec<(u32, Vec<u8>)>,
+        out: &mut Vec<(u32, T)>,
     ) -> bool {
         self.stats.packets += 1;
         if let Some(t) = self.last_arrival.replace(now) {
@@ -148,7 +148,7 @@ impl Reorder {
             self.stats.wait_us += w;
             self.stats.wait_max_us = self.stats.wait_max_us.max(w);
         }
-        self.held.insert(ext, packet.to_vec());
+        self.held.insert(ext, packet);
         self.release(out);
         // newly missing: everything below the newest held packet that is neither held nor asked for
         if let Some(&top) = self.held.keys().next_back() {
@@ -179,7 +179,19 @@ impl Reorder {
     }
 
     /// Time passing: ask again, or give up on gaps that waited long enough.
-    pub(crate) fn tick(&mut self, now: std::time::Instant, out: &mut Vec<(u32, Vec<u8>)>) {
+    pub(crate) fn tick(&mut self, now: std::time::Instant, out: &mut Vec<(u32, T)>) {
+        self.tick_until(now, out, |_, _| false);
+    }
+
+    /// As [`tick`](Self::tick), and a gap is also given up once `due(first, missing)` says so: `first` is what is
+    /// held right behind it, `missing` how many are missing before that (a stream on a timeline gives up a gap
+    /// shortly before it plays).
+    pub(crate) fn tick_until(
+        &mut self,
+        now: std::time::Instant,
+        out: &mut Vec<(u32, T)>,
+        due: impl Fn(&T, u64) -> bool,
+    ) {
         let again: Vec<u64> = self
             .asked
             .iter()
@@ -196,14 +208,15 @@ impl Reorder {
             self.ask(m, m + 1);
         }
         while let Some(next) = self.next {
-            let Some((&first, _)) = self.held.iter().next() else {
+            let Some((&first, held)) = self.held.iter().next() else {
                 break;
             };
             let waited = self
                 .asked
                 .get(&next)
                 .map_or(self.give_up, |(t, _, _)| now.duration_since(*t));
-            if waited < self.give_up && self.held.len() <= self.max_held {
+            if waited < self.give_up && self.held.len() <= self.max_held && !due(held, first - next)
+            {
                 break;
             }
             self.skip_to(first, out);
@@ -218,7 +231,7 @@ impl Reorder {
     }
 
     /// Play the held packets that are next in line.
-    fn release(&mut self, out: &mut Vec<(u32, Vec<u8>)>) {
+    fn release(&mut self, out: &mut Vec<(u32, T)>) {
         while let Some(next) = self.next {
             let Some(p) = self.held.remove(&next) else {
                 break;
@@ -229,7 +242,7 @@ impl Reorder {
     }
 
     /// Give up on everything before `first` (held): silence for it, then play on.
-    fn skip_to(&mut self, first: u64, out: &mut Vec<(u32, Vec<u8>)>) {
+    fn skip_to(&mut self, first: u64, out: &mut Vec<(u32, T)>) {
         let next = self.next.unwrap();
         let fill = (first - next) as u32;
         self.stats.filled += fill;
@@ -279,7 +292,7 @@ impl Reorder {
         );
     }
 
-    fn give_up_all(&mut self, out: &mut Vec<(u32, Vec<u8>)>) {
+    fn give_up_all(&mut self, out: &mut Vec<(u32, T)>) {
         while let Some((&first, _)) = self.held.iter().next() {
             self.skip_to(first, out);
         }
@@ -310,7 +323,7 @@ mod tests {
     fn in_order_packets_pass_straight_through() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
         for s in 10..15u16 {
-            r.push(s, &[s as u8], t, &mut out);
+            r.push(s, vec![s as u8], t, &mut out);
         }
         assert_eq!(
             seqs(&out),
@@ -322,13 +335,13 @@ mod tests {
     #[test]
     fn a_gap_is_asked_for_and_filled_by_the_resent_packet() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(1, &[1], t, &mut out);
-        r.push(4, &[4], t, &mut out); // 2 and 3 missing
-        r.push(5, &[5], t, &mut out);
+        r.push(1, vec![1], t, &mut out);
+        r.push(4, vec![4], t, &mut out); // 2 and 3 missing
+        r.push(5, vec![5], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 1)]);
         assert_eq!(r.take_requests(), vec![(2, 2)]);
-        r.push(2, &[2], t + Duration::from_millis(10), &mut out);
-        r.push(3, &[3], t + Duration::from_millis(11), &mut out);
+        r.push(2, vec![2], t + Duration::from_millis(10), &mut out);
+        r.push(3, vec![3], t + Duration::from_millis(11), &mut out);
         assert_eq!(seqs(&out), vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
         assert_eq!(
             (r.stats.missing, r.stats.recovered, r.stats.filled),
@@ -340,8 +353,8 @@ mod tests {
     #[test]
     fn asks_once_more_then_gives_up_with_silence() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(1, &[1], t, &mut out);
-        r.push(3, &[3], t, &mut out);
+        r.push(1, vec![1], t, &mut out);
+        r.push(3, vec![3], t, &mut out);
         assert_eq!(r.take_requests(), vec![(2, 1)]);
         r.tick(t + ASK_AGAIN, &mut out);
         assert_eq!(r.take_requests(), vec![(2, 1)]);
@@ -350,15 +363,15 @@ mod tests {
         assert_eq!(seqs(&out), vec![(0, 1)]);
         r.tick(t + GIVE_UP, &mut out);
         assert_eq!(seqs(&out), vec![(0, 1), (1, 3)]);
-        r.push(2, &[2], t + GIVE_UP, &mut out); // too late now
+        r.push(2, vec![2], t + GIVE_UP, &mut out); // too late now
         assert_eq!((r.stats.filled, r.stats.late, r.stats.asked), (1, 1, 2));
     }
 
     #[test]
     fn without_retransmits_gaps_are_silence_at_once() {
         let (mut r, t, mut out) = (Reorder::new(false, MAX_HELD), Instant::now(), Vec::new());
-        r.push(1, &[1], t, &mut out);
-        r.push(4, &[4], t, &mut out);
+        r.push(1, vec![1], t, &mut out);
+        r.push(4, vec![4], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 1), (2, 4)]);
         assert!(r.take_requests().is_empty() && !r.holding());
     }
@@ -366,19 +379,19 @@ mod tests {
     #[test]
     fn sequence_numbers_wrap() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(65534, &[0xfe], t, &mut out);
-        r.push(0, &[0], t, &mut out); // 65535 missing
+        r.push(65534, vec![0xfe], t, &mut out);
+        r.push(0, vec![0], t, &mut out); // 65535 missing
         assert_eq!(r.take_requests(), vec![(65535, 1)]);
-        r.push(65535, &[0xff], t, &mut out);
-        r.push(1, &[1], t, &mut out);
+        r.push(65535, vec![0xff], t, &mut out);
+        r.push(1, vec![1], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 0xfe), (0, 0xff), (0, 0), (0, 1)]);
     }
 
     #[test]
     fn a_big_jump_is_a_new_start_not_a_loss() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(100, &[1], t, &mut out);
-        r.push(5000, &[2], t, &mut out);
+        r.push(100, vec![1], t, &mut out);
+        r.push(5000, vec![2], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 1), (0, 2)]);
         assert!(r.take_requests().is_empty());
         assert_eq!((r.stats.missing, r.stats.filled), (0, 0));
@@ -387,16 +400,16 @@ mod tests {
     #[test]
     fn a_flush_drops_what_is_held_before_its_point() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(1, &[1], t, &mut out);
-        r.push(3, &[3], t, &mut out); // 2 missing
-        r.push(6, &[6], t, &mut out); // 4, 5 missing
+        r.push(1, vec![1], t, &mut out);
+        r.push(3, vec![3], t, &mut out); // 2 missing
+        r.push(6, vec![6], t, &mut out); // 4, 5 missing
         r.take_requests();
         r.flush(Some(5));
         r.tick(t, &mut out); // 3 and the ask for 2 and 4 gone, 5 still awaited
         assert_eq!(seqs(&out), vec![(0, 1)]);
         r.tick(t + GIVE_UP, &mut out);
         assert_eq!(seqs(&out), vec![(0, 1), (1, 6)]);
-        r.push(7, &[7], t, &mut out);
+        r.push(7, vec![7], t, &mut out);
         assert_eq!(seqs(&out)[2..], [(0, 7)]);
     }
 
@@ -404,23 +417,23 @@ mod tests {
     fn a_flush_behind_what_went_out_changes_nothing() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
         for s in 10..13u16 {
-            r.push(s, &[s as u8], t, &mut out);
+            r.push(s, vec![s as u8], t, &mut out);
         }
         r.flush(Some(11));
-        r.push(13, &[13], t, &mut out);
+        r.push(13, vec![13], t, &mut out);
         assert!(r.take_requests().is_empty());
         assert_eq!(out.len(), 4);
-        assert!(!r.push(12, &[12], t, &mut out)); // a second packet under 12: not taken
+        assert!(!r.push(12, vec![12], t, &mut out)); // a second packet under 12: not taken
     }
 
     #[test]
     fn a_flush_without_a_point_starts_over() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(10, &[10], t, &mut out);
-        r.push(12, &[12], t, &mut out);
+        r.push(10, vec![10], t, &mut out);
+        r.push(12, vec![12], t, &mut out);
         r.flush(None);
         assert!(!r.holding());
-        r.push(3, &[3], t, &mut out);
+        r.push(3, vec![3], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 10), (0, 3)]);
     }
 
@@ -430,9 +443,9 @@ mod tests {
     fn a_stream_that_plays_later_waits_longer_for_a_gap() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
         r.wait(Duration::from_secs(1), 125);
-        r.push(0, &[0], t, &mut out);
+        r.push(0, vec![0], t, &mut out);
         for s in 2..=101u16 {
-            r.push(s, &[s as u8], t, &mut out);
+            r.push(s, vec![s as u8], t, &mut out);
         }
         assert_eq!(r.take_requests(), vec![(1, 1)]);
         let mut asks = 1;
@@ -442,24 +455,51 @@ mod tests {
         }
         assert_eq!(asks, 4, "at once, after 50 ms, then every 250 ms");
         assert_eq!(out.len(), 1, "still waiting for 1");
-        r.push(1, &[1], t + Duration::from_millis(600), &mut out);
+        r.push(1, vec![1], t + Duration::from_millis(600), &mut out);
         assert_eq!(out.len(), 102);
         assert!(out.iter().all(|(fill, _)| *fill == 0));
         assert_eq!((r.stats.recovered, r.stats.filled), (1, 0));
         // a gap nobody fills: silence at the wait
-        r.push(103, &[103], t + Duration::from_millis(600), &mut out);
+        r.push(103, vec![103], t + Duration::from_millis(600), &mut out);
         r.tick(t + Duration::from_millis(1500), &mut out);
         assert!(r.holding());
         r.tick(t + Duration::from_millis(1600), &mut out);
         assert_eq!(out.last().map(|(f, p)| (*f, p[0])), Some((1, 103)));
     }
 
+    /// A gap is given up as soon as its deadline says so, long before the wait runs out.
+    #[test]
+    fn a_gap_is_given_up_at_its_deadline() {
+        let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
+        r.wait(Duration::from_secs(2), 125);
+        r.push(0, vec![0], t, &mut out);
+        r.push(3, vec![3], t, &mut out); // 1 and 2 missing
+        // "due" once what is held right behind the gap is packet 3 with 2 missing before it, from 30 ms on
+        let due = |now: Instant| {
+            move |held: &Vec<u8>, missing: u64| {
+                held[0] == 3 && missing == 2 && now >= t + Duration::from_millis(30)
+            }
+        };
+        r.tick_until(
+            t + Duration::from_millis(20),
+            &mut out,
+            due(t + Duration::from_millis(20)),
+        );
+        assert!(r.holding());
+        r.tick_until(
+            t + Duration::from_millis(30),
+            &mut out,
+            due(t + Duration::from_millis(30)),
+        );
+        assert_eq!(seqs(&out), vec![(0, 0), (2, 3)]);
+    }
+
     #[test]
     fn too_many_held_gives_up_early() {
         let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
-        r.push(0, &[0], t, &mut out);
+        r.push(0, vec![0], t, &mut out);
         for s in 2..=(MAX_HELD as u16 + 2) {
-            r.push(s, &[s as u8], t, &mut out);
+            r.push(s, vec![s as u8], t, &mut out);
         }
         r.tick(t, &mut out); // well before GIVE_UP
         assert_eq!(out.len(), MAX_HELD + 2);

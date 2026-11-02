@@ -13,7 +13,7 @@ use crate::decoder::{Cipher, Codec, Framing, StreamInfo};
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::AudioHandler;
 use crate::raop::pipeline::{
-    Decoding, NONCE_TRAIL_LEN, Output, RTP_HEADER_LEN, Source, Timeline, notify_waker,
+    Decoding, NONCE_TRAIL_LEN, Output, RTP_HEADER_LEN, Source, Timeline, Unit, notify_waker,
 };
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
 
@@ -127,12 +127,17 @@ async fn run(
         "Realtime ALAC receiver started"
     );
 
-    // Packets go through `Reorder` in sequence order. Behind a gap the later ones are held while the missing ones are
-    // asked for again on the sender's control port (resent packets arrive on ours); a gap the sender doesn't fill in
-    // time, or a packet that fails to decrypt or decode, is played as silence of the same length: the sender paces the
-    // stream in real time, so audio that never arrives would otherwise shorten the output's queue for good until it
-    // runs dry (on Wi-Fi, ~1 % loss emptied a 250 ms prebuffer within a minute). Counts every 10 s.
-    let mut reorder = Reorder::new(ctrl.is_some(), MAX_HELD);
+    // Packets are decrypted and decoded as they arrive (ALAC packets stand alone), and their samples go through
+    // `Reorder` in sequence order. Behind a gap the later ones are held while the missing ones are asked for again on
+    // the sender's control port (resent packets arrive on ours); on the network timeline a gap waits until shortly
+    // before it plays (`PLAY_MARGIN_NS`), and as nothing is left to decode then, what was held goes straight out. A gap the
+    // sender doesn't fill in time, or a packet that fails to decrypt or decode, is no audio: on the timeline the
+    // next packet's play time leaves the hole (the session fills it); before it, silence of the same length takes
+    // its place, since the sender paces the stream in real time and audio that never arrives would otherwise shorten
+    // the output's queue for good (on Wi-Fi, ~1 % loss emptied a 250 ms prebuffer within a minute). Counts every
+    // 10 s.
+    let mut reorder: Reorder<Unit> = Reorder::new(ctrl.is_some(), MAX_HELD);
+    let mut gaps_wait = false;
     // The network timeline, from the sender's sync packets (0xd7 on the control port): an RTP time and the network
     // time (its PTP clock) it plays at. Packets go out with their play time once the clock is followed; until then,
     // as they arrive.
@@ -251,7 +256,8 @@ async fn run(
             if cipher.authentic(packet) {
                 output.get_or_insert_with(|| Output::new(handler.as_ref(), source, &config.output));
                 let seq = u16::from_be_bytes([packet[2], packet[3]]);
-                reorder.push(seq, packet, now, &mut out);
+                let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+                decoder.push(u32::from(seq), ts, 0, packet);
             } else {
                 forged += 1;
                 if forged.is_power_of_two() {
@@ -259,50 +265,49 @@ async fn run(
                 }
             }
         }
-        reorder.tick(now, &mut out);
+        // Decoded packets, in the order they arrived, into the reorder stage. Once they have play times, a gap waits
+        // until shortly before the first missing packet plays (the one held behind it, less the missing ones).
+        let play_at = |ts: u32| anchor.and_then(|a| a.timeline().play_at(ts, rate, offset_ns));
+        while let Some(unit) = decoder.pop() {
+            if !gaps_wait && play_at(unit.ts).is_some() {
+                gaps_wait = true;
+                reorder.wait(MAX_WAIT, rate / (frames as u32).max(1));
+            }
+            reorder.push(unit.seq as u16, unit, now, &mut out);
+        }
+        let now_ns = crate::util::now_ns() as i64;
+        reorder.tick_until(now, &mut out, |held, missing| {
+            let first = held
+                .ts
+                .wrapping_sub((missing as u32).wrapping_mul(frames as u32));
+            play_at(first).is_some_and(|at| at as i64 - now_ns < PLAY_MARGIN_NS)
+        });
         if let Some(c) = &ctrl {
             c.ask(&mut reorder).await;
         }
-        for (fill, packet) in &out {
-            let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-            if flushed(ts, floor, await_anchor) {
-                continue;
-            }
-            floor = None;
-            if !timed_logged
-                && let Some(at) = anchor.and_then(|a| a.timeline().play_at(ts, rate, offset_ns))
-            {
-                timed_logged = true;
-                let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
-                // a gap may wait for its packet until shortly before it plays
-                let wait = std::time::Duration::from_millis(lead_ms.max(0) as u64)
-                    .saturating_sub(PLAY_MARGIN)
-                    .min(MAX_WAIT);
-                reorder.wait(wait, rate / (frames as u32).max(1));
-                info!(
-                    ts,
-                    lead_ms,
-                    wait_ms = wait.as_millis() as u64,
-                    "Realtime playout on the network timeline"
-                );
-            }
-            let seq = u16::from_be_bytes([packet[2], packet[3]]);
-            decoder.push(u32::from(seq), ts, *fill, packet);
-        }
-        // Finished packets, in order: the silence owed before each, then it (a failed one as silence too)
-        while let Some(unit) = decoder.pop() {
-            let Some(o) = output.as_mut() else { break };
-            o.silence(unit.fill as usize * frames, None);
+        // In order: a gap's silence (untimed only), then the packet (a failed one as a gap too)
+        for (fill, unit) in out {
             if flushed(unit.ts, floor, await_anchor) {
                 continue;
             }
+            floor = None;
+            let Some(o) = output.as_mut() else { break };
+            let at = play_at(unit.ts);
+            if !timed_logged && let Some(at) = at {
+                timed_logged = true;
+                let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
+                info!(unit.ts, lead_ms, "Realtime playout on the network timeline");
+            }
+            if at.is_none() {
+                o.silence(fill as usize * frames, None);
+            }
             match unit.pcm {
                 Some(pcm) => {
-                    let at = anchor.and_then(|a| a.timeline().play_at(unit.ts, rate, offset_ns));
                     last_played = Some(unit.ts);
                     o.play(pcm, at);
                 }
-                None => o.silence(frames, None),
+                None if at.is_none() => o.silence(frames, None),
+                None => {}
             }
         }
         if report.elapsed() >= std::time::Duration::from_secs(10) {
@@ -368,11 +373,12 @@ const DEFAULT_LATENCY_FRAMES: u32 = 11025;
 const MAX_LATENCY_FRAMES: u32 = 88200;
 /// Packets held behind a gap at most (before the stream is on the network timeline).
 const MAX_HELD: usize = 48;
-/// On the network timeline, a gap waits for its packet until this long before it plays: room for what is held
-/// behind it to be decoded (on the ARM if the coprocessor is full) and reach the output in time.
-const PLAY_MARGIN: std::time::Duration = std::time::Duration::from_millis(750);
-/// ... and at most this long (a Mac sends realtime audio about 2 s ahead).
-const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// On the network timeline a gap waits for its packet until this long before it plays: room for it to reach the
+/// output and the device (the output's own buffering: ~300 ms here).
+const PLAY_MARGIN_NS: i64 = 400_000_000;
+/// ... and no longer than this, however far ahead the sender is (a Mac's realtime packets are ~1.95 s ahead).
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
