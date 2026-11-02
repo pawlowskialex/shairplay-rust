@@ -49,6 +49,26 @@ pub(crate) enum Pcm {
 }
 
 impl Pcm {
+    /// The first `frames` frames of `channels` faded in, linearly (integer samples without float).
+    pub(crate) fn fade_in(&mut self, channels: usize, frames: usize) {
+        let n = (self.len() / channels.max(1)).min(frames);
+        let gain = |i: usize| (i / channels.max(1) + 1) as i64;
+        match self {
+            Pcm::S16(v) => v[..n * channels]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, s)| *s = (i64::from(*s) * gain(i) / n as i64) as i16),
+            Pcm::S24(v) => v[..n * channels]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, s)| *s = (i64::from(*s) * gain(i) / n as i64) as i32),
+            Pcm::F32(v) => v[..n * channels]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, s)| *s *= gain(i) as f32 / n as f32),
+        }
+    }
+
     /// Samples (all channels).
     pub(crate) fn len(&self) -> usize {
         match self {
