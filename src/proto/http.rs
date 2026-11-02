@@ -46,7 +46,7 @@ impl HttpRequest {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     /// Feed data into the parser. Equivalent to http_request_add_data.
     pub fn add_data(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
         self.add_data_with_body_limit(data, |_| Ok(MAX_BODY_BYTES))
