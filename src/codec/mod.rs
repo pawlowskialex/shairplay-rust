@@ -150,12 +150,12 @@ pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) ->
     if in_channels == out_channels {
         return input.to_vec();
     }
-    if out_channels != 2 {
+    if !matches!(out_channels, 1 | 2) {
         return input.to_vec();
     }
 
     let frames = input.len() / in_channels;
-    let mut output = Vec::with_capacity(frames * 2);
+    let mut output = Vec::with_capacity(frames * out_channels);
     let k: f32 = DOWNMIX_3DB;
 
     for frame in input.chunks_exact(in_channels) {
@@ -180,8 +180,13 @@ pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) ->
             }
             _ => (frame[0], frame.get(1).copied().unwrap_or(frame[0])),
         };
-        output.push(l.clamp(-1.0, 1.0));
-        output.push(r.clamp(-1.0, 1.0));
+        if out_channels == 1 {
+            // a mono output (max_channels 1) gets both sides, not the stereo frames it wasn't announced
+            output.push(f32::midpoint(l, r).clamp(-1.0, 1.0));
+        } else {
+            output.push(l.clamp(-1.0, 1.0));
+            output.push(r.clamp(-1.0, 1.0));
+        }
     }
     output
 }
@@ -189,6 +194,13 @@ pub(crate) fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "ap2-core", feature = "resample"))]
+    #[test]
+    fn mixdown_to_mono_averages_the_sides() {
+        assert_eq!(mixdown(&[0.5, 0.1, -0.2, 0.4], 2, 1), vec![0.3, 0.1]);
+        assert_eq!(mixdown(&[0.5, 0.1], 2, 2), vec![0.5, 0.1]);
+    }
 
     #[derive(Default)]
     struct Got {
