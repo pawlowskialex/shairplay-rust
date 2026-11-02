@@ -50,6 +50,9 @@ pub(crate) struct RaopShared {
     /// The next pair-setup's SRP state, made ahead of time.
     #[cfg(feature = "ap2-core")]
     pub(crate) srp_spare: std::sync::Arc<crate::crypto::pairing_homekit::SrpSpare>,
+    /// Failed pair-setup proofs since the start: after [`MAX_PAIR_FAILURES`] pair-setup is refused (HAP's 100)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) pair_failures: std::sync::atomic::AtomicU32,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
     /// Shared video encryption keys — set by audio SETUP, read by video SETUP.
@@ -80,6 +83,11 @@ pub(crate) struct RaopShared {
     /// pairing can close that controller's sessions
     pub(crate) verified: std::sync::Mutex<Vec<(u64, String, Arc<tokio::sync::Notify>)>>,
 }
+
+/// Failed pair-setup attempts after which the server refuses pair-setup until it restarts: each costs an online
+/// guess of the PIN (HAP's limit).
+#[cfg(feature = "ap2-core")]
+pub(crate) const MAX_PAIR_FAILURES: u32 = 100;
 
 impl RaopShared {
     /// Connection `id` (sender `sender`) sets up an audio stream: if another sender's connection had the audio,

@@ -663,6 +663,67 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    /// A POST of a TLV body on `stream`: the TLV that comes back.
+    async fn post_tlv(stream: &mut TcpStream, path: &str, cseq: u32, tlv: &TlvValues) -> TlvValues {
+        let body = tlv.encode();
+        let req = format!(
+            "POST {path} RTSP/1.0\r\nCSeq: {cseq}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        let header_end = head.find("\r\n\r\n").unwrap() + 4;
+        TlvValues::decode(&buf[header_end..n]).unwrap()
+    }
+
+    fn transient_m1() -> TlvValues {
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::Method as u8, &[0]);
+        m1.add(TlvType::Flags as u8, &[0x10]);
+        m1
+    }
+
+    fn wrong_m3() -> TlvValues {
+        let mut m3 = TlvValues::new();
+        m3.add(TlvType::State as u8, &[3]);
+        m3.add(TlvType::PublicKey as u8, &[2]);
+        m3.add(TlvType::Proof as u8, &[0; 64]);
+        m3
+    }
+
+    /// One proof per M1, and a limit on failed proofs: each is an online guess at the PIN.
+    #[tokio::test]
+    #[serial]
+    async fn ap2_pair_setup_takes_one_proof_and_a_hundred_failures() {
+        let (mut server, port, _) = start_server().await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let error = |t: &TlvValues| t.get_type(TlvType::Error).map(<[u8]>::to_vec);
+        let mut cseq = 1;
+        for _ in 0..100 {
+            let m2 = post_tlv(&mut stream, "/pair-setup", cseq, &transient_m1()).await;
+            assert_eq!(m2.get_type(TlvType::State), Some(&[2u8][..]));
+            let m4 = post_tlv(&mut stream, "/pair-setup", cseq + 1, &wrong_m3()).await;
+            assert_eq!(error(&m4), Some(vec![2]), "a wrong proof: Authentication");
+            // the same M1's state is gone with the first proof
+            let again = post_tlv(&mut stream, "/pair-setup", cseq + 2, &wrong_m3()).await;
+            assert_eq!(error(&again), Some(vec![2]));
+            cseq += 3;
+        }
+        let refused = post_tlv(&mut stream, "/pair-setup", cseq, &transient_m1()).await;
+        assert_eq!(
+            error(&refused),
+            Some(vec![5]),
+            "MaxTries after 100 failures"
+        );
+        server.stop().await;
+    }
+
     #[test]
     fn ap2_pin_pairing_service_info_advertises_persistent_pairing() {
         let server = RaopServer::builder()

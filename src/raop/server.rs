@@ -411,6 +411,8 @@ impl RaopServerBuilder {
                 spare
             },
             #[cfg(feature = "ap2-core")]
+            pair_failures: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "ap2-core")]
             pin: self.pin,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,

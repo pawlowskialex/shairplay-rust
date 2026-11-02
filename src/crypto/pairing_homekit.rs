@@ -198,6 +198,13 @@ impl SrpServer {
                 "transient pair-setup is disabled when a PIN is configured".into(),
             ));
         }
+        // Without a PIN only transient pairing: a persistent one would prove only the well-known 3939 and leave
+        // whoever asked a stored (admin) controller.
+        if !self.is_transient && self.allow_transient {
+            return Err(CryptoError::PairingHandshake(
+                "persistent pair-setup needs a PIN".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -227,11 +234,16 @@ impl SrpServer {
             return Err(CryptoError::PairingHandshake("Invalid proof length".into()));
         }
 
+        // A is at most N's length (padded or not), and 0 < A < N (RFC 5054): one of any length was copied and
+        // divided several times over
+        if pk_bytes.len() > N_3072_LEN {
+            return Err(CryptoError::PairingHandshake(
+                "PublicKey longer than N".into(),
+            ));
+        }
         let big_a = BigUint::from_bytes_be(pk_bytes);
-
-        // Safety check: A mod N != 0
-        if (&big_a % &self.n) == BigUint::ZERO {
-            return Err(CryptoError::PairingHandshake("A mod N is zero".into()));
+        if big_a == BigUint::ZERO || big_a >= self.n {
+            return Err(CryptoError::PairingHandshake("A is not in 1..N".into()));
         }
 
         // u = H(pad(A) || pad(B))
@@ -705,9 +717,17 @@ pub(crate) type PairingKeyLookup<'a> = Option<&'a dyn Fn(&str) -> Option<[u8; 32
 
 /// Build a HomeKit pairing error TLV for request handlers.
 pub(crate) fn pairing_error_response(state: u8) -> Vec<u8> {
+    pairing_error(state, TLV_ERROR_AUTHENTICATION)
+}
+
+/// kTLVError_MaxTries: the accessory refuses pair-setup after too many failed attempts (HAP).
+pub(crate) const TLV_ERROR_MAX_TRIES: u8 = 5;
+
+/// A pairing response with `error` at `state`.
+pub(crate) fn pairing_error(state: u8, error: u8) -> Vec<u8> {
     let mut tlv = TlvValues::new();
     tlv.add(TlvType::State as u8, &[state]);
-    tlv.add(TlvType::Error as u8, &[TLV_ERROR_AUTHENTICATION]);
+    tlv.add(TlvType::Error as u8, &[error]);
     tlv.encode()
 }
 
@@ -1014,6 +1034,40 @@ mod tests {
         m1.add(TlvType::Method as u8, &[PAIRING_METHOD_PAIR_SETUP]);
         m1.add(TlvType::Flags as u8, &[PAIRING_FLAGS_TRANSIENT]);
         assert!(server.process_m1(&m1.encode()).is_err());
+    }
+
+    /// Without a PIN only transient pairing: a persistent one would only prove 3939 and store an admin.
+    #[test]
+    fn without_a_pin_persistent_pairing_is_refused() {
+        let mut server = SrpServer::new(None).unwrap();
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::Method as u8, &[PAIRING_METHOD_PAIR_SETUP]);
+        assert!(server.process_m1(&m1.encode()).is_err());
+    }
+
+    /// A is 1..N and at most N's length: one of any length was copied and divided several times over.
+    #[test]
+    fn m3_takes_only_an_a_in_range() {
+        let n = BigUint::parse_bytes(N_3072_HEX.as_bytes(), 16).unwrap();
+        for a in [
+            vec![0u8; N_3072_LEN],
+            to_bytes_be(&n),
+            to_bytes_be(&(&n + 1u32)),
+            vec![1u8; N_3072_LEN + 1],
+            vec![1u8; 1 << 20],
+        ] {
+            let mut server = SrpServer::new(None).unwrap();
+            let mut m3 = TlvValues::new();
+            m3.add(TlvType::State as u8, &[3]);
+            m3.add(TlvType::PublicKey as u8, &a);
+            m3.add(TlvType::Proof as u8, &[0; 64]);
+            assert!(
+                server.process_m3(&m3.encode()).is_err(),
+                "A of {} bytes",
+                a.len()
+            );
+        }
     }
 
     /// C-verified: HKDF-SHA512 with known IKM (0x00..0x3f), salt, info.

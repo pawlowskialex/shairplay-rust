@@ -6,8 +6,12 @@ use crate::crypto::pairing_homekit::{self, PairVerifyServer};
 use crate::error::CryptoError;
 use crate::error::{ProtocolError, ShairplayError};
 use crate::proto::http::{HttpRequest, HttpResponse};
+#[cfg(feature = "ap2-core")]
+use crate::raop::connection::MAX_PAIR_FAILURES;
 #[cfg(feature = "video")]
 use crate::raop::rtp::RaopRtp;
+#[cfg(feature = "ap2-core")]
+use std::sync::atomic::Ordering;
 
 use super::handlers_ap1::{RaopConnection, bind_addr_for, local_ip_from};
 
@@ -70,6 +74,13 @@ pub(crate) fn handle_pair_setup(
     match state {
         1 => {
             tracing::info!("AP2 pair-setup M1 received");
+            if conn.shared.pair_failures.load(Ordering::Relaxed) >= MAX_PAIR_FAILURES {
+                tracing::warn!("pair-setup refused: too many failed attempts since the start");
+                return Some(pairing_homekit::pairing_error(
+                    2,
+                    pairing_homekit::TLV_ERROR_MAX_TRIES,
+                ));
+            }
             let mut srp = match conn.shared.srp_spare.take() {
                 Ok(srp) => srp,
                 Err(e) => {
@@ -88,19 +99,46 @@ pub(crate) fn handle_pair_setup(
             Some(m2)
         }
         3 => {
-            let srp = conn.srp_server.as_mut()?;
-            let ok = srp.process_m3(data).ok()?;
+            // one proof per M1: the SRP state (b, B) goes with it, so a wrong PIN can't be tried again against it
+            let Some(mut srp) = conn.srp_server.take() else {
+                return Some(pairing_homekit::pairing_error_response(4));
+            };
+            if !srp.process_m3(data).unwrap_or(false) {
+                conn.shared.pair_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("pair-setup M3: the proof didn't check");
+                return Some(pairing_homekit::pairing_error_response(4));
+            }
             let m4 = srp.build_m4().ok()?;
-            if ok && srp.is_transient() {
+            if srp.is_transient() {
                 conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
                 conn.is_ap2 = true;
                 tracing::info!("AP2 transient pair-setup complete");
+            } else {
+                // M5 follows
+                conn.srp_server = Some(srp);
             }
             Some(m4)
         }
         5 => {
-            let srp = conn.srp_server.as_mut()?;
+            let Some(mut srp) = conn.srp_server.take() else {
+                return Some(pairing_homekit::pairing_error_response(6));
+            };
             match srp.process_m5(data) {
+                // a pairing doesn't replace another controller's key under the same identifier (HAP: as AddPairing);
+                // forget that pairing first
+                Ok((client_id, client_pk))
+                    if conn
+                        .shared
+                        .pairing_store
+                        .get(&client_id)
+                        .is_some_and(|known| known != client_pk) =>
+                {
+                    tracing::warn!(
+                        client_id,
+                        "pair-setup M5: identifier already paired with another key"
+                    );
+                    Some(pairing_homekit::pairing_error_response(6))
+                }
                 Ok((client_id, client_pk)) => {
                     let m6 = srp
                         .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
