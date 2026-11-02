@@ -470,8 +470,11 @@ pub(crate) fn handle_set_parameter(
         "text/parameters" => {
             let text = std::str::from_utf8(data).ok()?;
             if let Some(rest) = text.strip_prefix("volume: ") {
-                if let Ok(vol) = rest.trim().parse::<f32>() {
-                    conn.shared.handler.on_volume(vol);
+                // dB, -144 (mute) to 0; "nan" and "inf" parse as f32 too
+                if let Ok(vol) = rest.trim().parse::<f32>()
+                    && vol.is_finite()
+                {
+                    conn.shared.handler.on_volume(vol.clamp(-144.0, 0.0));
                 }
             } else if let Some(rest) = text.strip_prefix("progress: ") {
                 let parts: Vec<&str> = rest.trim().split('/').collect();
