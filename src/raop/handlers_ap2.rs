@@ -143,11 +143,7 @@ pub(crate) fn handle_pair_setup(
                     let m6 = srp
                         .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
                         .ok()?;
-                    if !conn
-                        .shared
-                        .pairing_store
-                        .put_controller(&client_id, client_pk, true)
-                    {
+                    if !conn.shared.pairing_store.put(&client_id, client_pk, true) {
                         tracing::warn!(client_id, "pairing store full: controller not stored");
                     }
                     tracing::info!(
@@ -310,7 +306,7 @@ pub(crate) fn pairings(
             if store.get(&id).is_some_and(|k| k != pk) {
                 return error(resp, UNKNOWN);
             }
-            if !store.put_controller(&id, pk, admin_perm) {
+            if !store.put(&id, pk, admin_perm) {
                 return error(resp, MAX_PEERS);
             }
             tracing::info!(
@@ -382,8 +378,8 @@ mod pairings_tests {
     #[test]
     fn only_an_admin_manages_pairings() {
         let s = MemoryPairingStore::default();
-        s.put_controller("admin", [1; 32], true);
-        s.put_controller("user", [2; 32], false);
+        s.put("admin", [1; 32], true);
+        s.put("user", [2; 32], false);
         assert_eq!(
             err(&pairings(&s, None, &req(5, None, None, None)).0),
             Some(2)
@@ -405,7 +401,7 @@ mod pairings_tests {
     #[test]
     fn add_list_and_remove() {
         let s = MemoryPairingStore::default();
-        s.put_controller("admin", [1; 32], true);
+        s.put("admin", [1; 32], true);
         let (r, _) = pairings(
             &s,
             Some("admin"),
@@ -436,8 +432,8 @@ mod pairings_tests {
     #[test]
     fn removing_the_last_admin_removes_everyone() {
         let s = MemoryPairingStore::default();
-        s.put_controller("admin", [1; 32], true);
-        s.put_controller("user", [2; 32], false);
+        s.put("admin", [1; 32], true);
+        s.put("user", [2; 32], false);
         let (r, mut removed) = pairings(&s, Some("admin"), &req(4, Some("admin"), None, None));
         removed.sort();
         assert_eq!(

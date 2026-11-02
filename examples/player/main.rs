@@ -198,7 +198,8 @@ struct PersistState {
     identity_seed: Option<[u8; 32]>,
     #[cfg(feature = "ap2-core")]
     #[serde(default)]
-    paired_keys: std::collections::HashMap<String, [u8; 32]>,
+    /// controller -> (public key, admin)
+    paired_keys: std::collections::HashMap<String, ([u8; 32], bool)>,
 }
 
 impl PersistState {
@@ -237,19 +238,32 @@ impl FilePairingStore {
 #[cfg(feature = "ap2-core")]
 impl PairingStore for FilePairingStore {
     fn get(&self, device_id: &str) -> Option<[u8; 32]> {
-        self.state.lock().ok()?.paired_keys.get(device_id).copied()
-    }
-    fn put(&self, device_id: &str, public_key: [u8; 32]) {
-        if let Ok(mut state) = self.state.lock() {
-            state.paired_keys.insert(device_id.to_string(), public_key);
-            state.save(&self.path);
-        }
-    }
-    fn has_any_pairing(&self) -> bool {
         self.state
             .lock()
-            .map(|s| !s.paired_keys.is_empty())
-            .unwrap_or(false)
+            .ok()?
+            .paired_keys
+            .get(device_id)
+            .map(|k| k.0)
+    }
+    fn put(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .paired_keys
+                .insert(device_id.to_string(), (public_key, admin));
+            state.save(&self.path);
+        }
+        true
+    }
+    fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+        self.state
+            .lock()
+            .map(|s| {
+                s.paired_keys
+                    .iter()
+                    .map(|(id, (pk, admin))| (id.clone(), *pk, *admin))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     fn remove(&self, device_id: &str) {
         if let Ok(mut state) = self.state.lock() {
