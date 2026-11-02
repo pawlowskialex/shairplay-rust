@@ -1096,7 +1096,7 @@ fn setup_stream_realtime(
         let output_config = crate::raop::realtime_audio::OutputConfig {
             alac,
             output: conn.shared.output(),
-            offload: conn.shared.offload.clone(),
+            decoders: conn.shared.decoders.clone(),
             latency_min: stream0
                 .get("latencyMin")
                 .and_then(|v| v.as_unsigned_integer())
@@ -1141,7 +1141,7 @@ fn setup_stream_realtime(
                     }),
                     output: conn.shared.output(),
                     remote_socket: conn.remote_socket,
-                    offload: None,
+                    decoders: None,
                 },
             );
             if let Some(mut rtp) = rtp {
@@ -1211,7 +1211,7 @@ fn setup_stream_buffered(
         sample_rate: conn.shared.output_sample_rate,
         max_channels: conn.shared.output_max_channels,
         format: conn.shared.output_format,
-        offload: conn.shared.offload.clone(),
+        decoders: conn.shared.decoders.clone(),
         offset_ns: conn.shared.buffered_offset_ns,
     };
 

@@ -41,6 +41,7 @@ server.start().await?;
 # Architecture
 
 - [`raop`] — RAOP/AirPlay server, RTSP handlers, RTP streaming, audio buffering
+- [`decoder`] — the decoder every stream goes through: the library's, or the application's (a coprocessor's)
 - [`crypto`] — RSA, Ed25519/Curve25519 pairing, AES-CTR, FairPlay DRM, ChaCha20-Poly1305
 - `codec` — Audio decoders (ALAC, AAC) and resampling (internal)
 - [`proto`] — SDP, HTTP/RTSP, binary plist, HTTP Digest auth
@@ -59,6 +60,7 @@ mod c_vectors;
 pub(crate) mod codec;
 mod crypto;
 mod dacp;
+pub mod decoder;
 pub mod error;
 mod net;
 mod proto;
@@ -90,15 +92,14 @@ pub mod fuzzing {
         let _ = crate::crypto::tlv::TlvValues::decode(data);
     }
 
-    /// An AirPlay 1 stream from its SDP `rtpmap` and `fmtp`, and a packet of it decoded as the library does.
+    /// An AirPlay 1 stream from its SDP `rtpmap` and `fmtp`, and a packet of it decoded by the library's decoder.
     pub fn rtp(rtpmap: &str, fmtp: &str, packet: &[u8]) {
-        use crate::codec::Decode;
-        if let Some(format) = crate::raop::rtp::Ap1Format::parse(rtpmap, fmtp) {
-            let mut decode = crate::raop::pipeline::RtpDecode {
-                cipher: crate::raop::pipeline::RtpCipher::None,
-                codec: format.codec(),
-            };
-            let _ = decode.decode(packet);
+        if let Some(format) = crate::raop::rtp::Ap1Format::parse(rtpmap, fmtp)
+            && let Some(mut d) =
+                crate::decoder::builtin(&format.info(&crate::decoder::Cipher::None))
+        {
+            d.send(packet);
+            let _ = d.receive();
         }
     }
 }
@@ -108,7 +109,6 @@ pub use net::mdns::AirPlayServiceInfo;
 pub use net::server::BindConfig;
 #[cfg(feature = "hls")]
 pub use raop::hls::{HlsHandler, HlsSession};
-pub use raop::offload::{Decoded, Offload, OffloadAlac, OffloadCipher, OffloadFactory, OffloadJob};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 #[cfg(feature = "ap2-core")]

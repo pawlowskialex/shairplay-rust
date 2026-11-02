@@ -83,7 +83,7 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     output_format: crate::raop::SampleFormat,
     audio_buffer_size: u32,
-    offload: Option<crate::raop::offload::OffloadFactory>,
+    decoders: Option<crate::decoder::DecoderFactory>,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
     #[cfg(feature = "ap2-core")]
@@ -127,7 +127,7 @@ impl RaopServerBuilder {
             output_max_channels: None,
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
-            offload: None,
+            decoders: None,
             ap1_codecs: None,
             ap1_encryption: None,
             #[cfg(feature = "ap2-core")]
@@ -285,12 +285,11 @@ impl RaopServerBuilder {
         self
     }
 
-    /// Hand streams' audio to the application ([`Offload`](crate::Offload)): `factory` is asked for each
-    /// stream with its [`OffloadJob`](crate::OffloadJob) (realtime packets, buffered ALAC frames, buffered AAC
-    /// access units) and may decline it, and the offload any unit; what is declined is processed in software. An
-    /// AAC offload replaces the library's AAC decoder for the stream.
-    pub fn offload(mut self, factory: crate::raop::offload::OffloadFactory) -> Self {
-        self.offload = Some(factory);
+    /// The application's decoders ([`crate::decoder`]): `factory` is asked for each stream with its
+    /// [`StreamInfo`](crate::decoder::StreamInfo) and makes its decoder, or leaves the stream to the library's
+    /// ([`builtin`](crate::decoder::builtin)), which it may also use inside its own (a fallback).
+    pub fn decoders(mut self, factory: crate::decoder::DecoderFactory) -> Self {
+        self.decoders = Some(factory);
         self
     }
 
@@ -431,7 +430,7 @@ impl RaopServerBuilder {
             realtime_latency_ns: self.realtime_latency_ns,
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
-            offload: self.offload.clone(),
+            decoders: self.decoders.clone(),
             #[cfg(feature = "ap2-core")]
             srp_spare: {
                 let spare = crate::crypto::pairing_homekit::SrpSpare::new(self.pin.clone());

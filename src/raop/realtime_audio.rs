@@ -2,18 +2,18 @@
 //!
 //! Packets are authenticated as they arrive (their ChaCha20-Poly1305 tag; another host's, or a forged one, never
 //! reaches the reorder stage), put in sequence order (lost ones asked for again), decrypted and decoded (the
-//! offload, or here), and delivered with their play time on the sender's network timeline.
+//! stream's decoder: the application's, or the library's), and delivered with their play time on the sender's network timeline.
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::codec::alac::AlacConfig;
+use crate::decoder::{Cipher, Codec, Framing, StreamInfo};
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::AudioHandler;
 use crate::raop::pipeline::{
-    Decoder, Library, NONCE_TRAIL_LEN, Output, RTP_HEADER_LEN, RtpCipher, RtpDecode, Source,
-    Timeline, notify_waker,
+    Decoding, NONCE_TRAIL_LEN, Output, RTP_HEADER_LEN, Source, Timeline, notify_waker,
 };
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
 
@@ -23,8 +23,8 @@ pub(crate) struct OutputConfig {
     pub(crate) alac: AlacConfig,
     /// What the samples go out as.
     pub(crate) output: crate::raop::pipeline::OutputConfig,
-    /// Coprocessor decrypt + decode.
-    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
+    /// The application's decoders.
+    pub(crate) decoders: Option<crate::decoder::DecoderFactory>,
     /// The receiver latency the sender asks for (SETUP `latencyMin`, frames), if it does.
     pub(crate) latency_min: Option<u32>,
     /// The sender: datagrams from other hosts are dropped (sync packets aren't authenticated). None: any (tests).
@@ -91,7 +91,7 @@ async fn run(
     config: OutputConfig,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<RealtimeCommand>,
 ) {
-    let cipher = RtpCipher::ChaCha20Poly1305 { key: shk };
+    let cipher = Cipher::ChaCha20Poly1305 { key: shk };
     let alac = &config.alac;
     let rate = alac.sample_rate;
     let source = Source {
@@ -99,17 +99,17 @@ async fn run(
         channels: alac.num_channels,
         bits: alac.bit_depth,
     };
-    let offload = config.offload.as_ref().and_then(|f| {
-        f(&crate::raop::offload::OffloadJob::Packets {
-            cipher: &cipher.offload(),
-            alac: Some(&alac.offload()),
-        })
-    });
-    let mut decoder = Decoder::new(
-        offload,
-        Library::Packets(RtpDecode {
-            cipher: cipher.clone(),
-            codec: Box::new(alac.decoder()),
+    let info = StreamInfo {
+        codec: Codec::Alac(alac.params()),
+        sample_rate: rate,
+        channels: alac.num_channels,
+        bit_depth: alac.bit_depth,
+        framing: Framing::Rtp(cipher.clone()),
+    };
+    let mut decoder = Decoding::new(
+        crate::decoder::for_stream(&info, config.decoders.as_ref()).unwrap_or_else(|| {
+            warn!(?info, "No decoder for this stream: it plays nothing");
+            crate::decoder::nothing()
         }),
     );
     let frames = alac.frame_length as usize;
@@ -121,7 +121,6 @@ async fn run(
         .latency_ns
         .unwrap_or_else(|| realtime_offset_ns(config.latency_min, rate));
     info!(
-        offload = decoder.has_offload(),
         retransmit = ctrl.is_some(),
         latency_min = ?config.latency_min,
         offset_ms = offset_ns / 1_000_000,
@@ -154,7 +153,7 @@ async fn run(
     let waker = notify_waker(&ready);
 
     loop {
-        // Look again when the offload says (or shortly) while packets are out on it, or shortly while packets are
+        // Look again when the decoder says (or shortly) while packets are out on it, or shortly while packets are
         // held behind a gap, even if nothing arrives.
         let wakes = decoder.waiting() && decoder.wake_on_done(&waker);
         let poll = (decoder.waiting() && !wakes) || reorder.holding();
@@ -417,7 +416,7 @@ mod tests {
                 max_channels: None,
                 format: crate::raop::SampleFormat::S16,
             },
-            offload: None,
+            decoders: None,
             latency_min: None,
             peer: None,
             latency_ns: None,

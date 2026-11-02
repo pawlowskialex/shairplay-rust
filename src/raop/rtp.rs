@@ -18,11 +18,10 @@ use tokio::sync::{mpsc, watch};
 use tracing::info;
 
 use crate::codec::alac::AlacConfig;
+use crate::decoder::{Cipher, Codec, Framing, StreamInfo};
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::AudioHandler;
-use crate::raop::pipeline::{
-    Decoder, Library, Output, OutputConfig, RtpCipher, RtpDecode, Source, Unit, notify_waker,
-};
+use crate::raop::pipeline::{Decoding, Output, OutputConfig, Source, Unit, notify_waker};
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
 
 /// Packets held behind a gap at most.
@@ -120,13 +119,18 @@ impl Ap1Format {
         }
     }
 
-    /// The library's decoder for a packet's payload.
-    pub(crate) fn codec(&self) -> Box<dyn crate::codec::Decode> {
-        match self {
-            Ap1Format::Alac(c) => Box::new(c.decoder()),
-            Ap1Format::L16 { channels, .. } => Box::new(crate::codec::L16 {
-                channels: *channels,
-            }),
+    /// What a decoder is told of the stream, its packets encrypted with `cipher`.
+    pub(crate) fn info(&self, cipher: &Cipher) -> StreamInfo {
+        let source = self.source();
+        StreamInfo {
+            codec: match self {
+                Ap1Format::Alac(c) => Codec::Alac(c.params()),
+                Ap1Format::L16 { .. } => Codec::Pcm,
+            },
+            sample_rate: source.sample_rate,
+            channels: source.channels,
+            bit_depth: source.bits,
+            framing: Framing::Rtp(cipher.clone()),
         }
     }
 
@@ -155,8 +159,8 @@ pub(crate) struct RtpConfig {
     pub(crate) output: OutputConfig,
     /// Full socket address of the remote peer (preserves scope_id for link-local IPv6).
     pub(crate) remote_socket: std::net::SocketAddr,
-    /// Coprocessor decrypt + decode (UDP streams only).
-    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
+    /// The application's decoders.
+    pub(crate) decoders: Option<crate::decoder::DecoderFactory>,
 }
 
 /// Validated AES-CBC parameters for an encrypted RTP session.
@@ -177,7 +181,7 @@ pub(crate) struct RaopRtp {
     /// Local IP address to bind sockets to (matches the RTSP connection's interface).
     local_addr: IpAddr,
     format: Ap1Format,
-    cipher: RtpCipher,
+    cipher: Cipher,
     output: OutputConfig,
     /// Send `true` to shut down the receive task.
     shutdown_tx: Option<watch::Sender<bool>>,
@@ -186,12 +190,12 @@ pub(crate) struct RaopRtp {
     flush_rx: Option<mpsc::UnboundedReceiver<Option<u16>>>,
     /// Full socket address of the remote peer.
     remote_socket: std::net::SocketAddr,
-    offload: Option<crate::raop::offload::OffloadFactory>,
+    decoders: Option<crate::decoder::DecoderFactory>,
 }
 
 /// One stream's playing end: the decoder in front of the session, and the silence a missing packet is owed.
 struct Playout {
-    decoder: Decoder,
+    decoding: Decoding,
     output: Output,
     /// A unit has come out with audio (until then a repeated packet starts the stream over: see `arrive`)
     started: bool,
@@ -203,7 +207,7 @@ struct Playout {
 impl Playout {
     /// Every unit the decoder has done, in order, into the session.
     fn drain(&mut self) {
-        while let Some(Unit { fill, pcm, .. }) = self.decoder.pop() {
+        while let Some(Unit { fill, pcm, .. }) = self.decoding.pop() {
             self.output.silence(fill as usize * self.frames, None);
             match pcm {
                 Some(pcm) => {
@@ -241,7 +245,7 @@ impl Playout {
     /// FLUSH: what is in the decoder from `next` on stays (a sender streams right after RECORD, so its first packets
     /// can come before the flush RECORD asks for); without one, all of it goes. What the session holds goes.
     fn flush(&mut self, next: Option<u16>) {
-        self.decoder
+        self.decoding
             .flush(|seq, _| next.is_none_or(|n| ((seq as u16).wrapping_sub(n) as i16) < 0));
         self.output.flush();
     }
@@ -263,11 +267,11 @@ impl RaopRtp {
     pub(crate) fn new(callbacks: Arc<dyn AudioHandler>, config: RtpConfig) -> Option<Self> {
         let format = Ap1Format::parse(&config.rtpmap, config.fmtp.as_deref().unwrap_or_default())?;
         let cipher = match config.encryption {
-            Some(e) => RtpCipher::Aes128Cbc {
+            Some(e) => Cipher::Aes128Cbc {
                 key: e.key,
                 iv: e.iv,
             },
-            None => RtpCipher::None,
+            None => Cipher::None,
         };
         let (flush_tx, flush_rx) = mpsc::unbounded_channel();
         Some(Self {
@@ -278,32 +282,25 @@ impl RaopRtp {
             cipher,
             output: config.output,
             remote_socket: config.remote_socket,
-            offload: config.offload,
+            decoders: config.decoders,
             shutdown_tx: None,
             flush_tx,
             flush_rx: Some(flush_rx),
         })
     }
 
-    /// The stream's decoder and session. The offload (UDP, ALAC) decrypts and decodes what it takes.
-    fn playout(&self, offload: bool) -> Playout {
-        let offload = match (&self.format, self.offload.as_ref().filter(|_| offload)) {
-            (Ap1Format::Alac(alac), Some(factory)) => {
-                factory(&crate::raop::offload::OffloadJob::Packets {
-                    cipher: &self.cipher.offload(),
-                    alac: Some(&alac.offload()),
-                })
-            }
-            _ => None,
-        };
-        let library = Library::Packets(RtpDecode {
-            cipher: self.cipher.clone(),
-            codec: self.format.codec(),
-        });
+    /// The stream's decoder (the application's, or the library's) and session.
+    fn playout(&self) -> Playout {
+        let info = self.format.info(&self.cipher);
         Playout {
-            decoder: Decoder::new(offload, library),
-            started: false,
+            decoding: Decoding::new(
+                crate::decoder::for_stream(&info, self.decoders.as_ref()).unwrap_or_else(|| {
+                    tracing::warn!(?info, "No decoder for this stream: it plays nothing");
+                    crate::decoder::nothing()
+                }),
+            ),
             output: Output::new(self.handler.as_ref(), self.format.source(), &self.output),
+            started: false,
             frames: self.format.frames(),
             pcm_channels: matches!(self.format, Ap1Format::L16 { .. })
                 .then(|| self.format.source().channels as usize),
@@ -362,7 +359,7 @@ impl RaopRtp {
             } else {
                 (None, Some(csock))
             };
-            let playout = self.playout(true);
+            let playout = self.playout();
             let peer = self.remote_socket.ip();
             tokio::spawn(async move {
                 let _unread = unread;
@@ -372,7 +369,7 @@ impl RaopRtp {
         } else {
             let listener = bind_tcp(bind_addr)?;
             let data_lport = listener.local_addr().map_err(NetworkError::Io)?.port();
-            let playout = self.playout(false);
+            let playout = self.playout();
             tokio::spawn(receive_tcp(listener, playout, flushes, shutdown_rx));
             Ok((0, 0, data_lport))
         }
@@ -402,10 +399,10 @@ async fn receive_udp(
     let ready = Arc::new(tokio::sync::Notify::new());
     let waker = notify_waker(&ready);
     loop {
-        // Packets with the offload, or held behind a gap: look again when the offload says (or shortly) even if
+        // Packets with the decoder, or held behind a gap: look again when the decoder says (or shortly) even if
         // nothing arrives.
-        let wakes = playout.decoder.waiting() && playout.decoder.wake_on_done(&waker);
-        let poll = (playout.decoder.waiting() && !wakes) || reorder.holding();
+        let wakes = playout.decoding.waiting() && playout.decoding.wake_on_done(&waker);
+        let poll = (playout.decoding.waiting() && !wakes) || reorder.holding();
         let received = tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if poll => None,
             _ = ready.notified(), if wakes => None,
@@ -445,7 +442,7 @@ async fn receive_udp(
         }
         for (fill, packet) in &out {
             playout
-                .decoder
+                .decoding
                 .push(u32::from(rtp_seq(packet)), rtp_ts(packet), *fill, packet);
         }
         playout.drain();
@@ -509,7 +506,7 @@ async fn receive_tcp(
             let packet = &packet_buf[4..4 + rtp_len];
             if packet.len() >= 12 {
                 playout
-                    .decoder
+                    .decoding
                     .push(u32::from(rtp_seq(packet)), rtp_ts(packet), 0, packet);
             }
             packet_buf.drain(..4 + rtp_len);
@@ -521,8 +518,8 @@ async fn receive_tcp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raop::offload::{Decoded, Offload, OffloadCipher, OffloadJob};
     use crate::raop::{AudioFormat, AudioSession, SampleFormat, Samples};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     #[test]
@@ -568,29 +565,34 @@ mod tests {
         }
     }
 
-    type Jobs = Arc<Mutex<Vec<(u32, Option<i16>, bool)>>>;
+    type Jobs = Arc<Mutex<VecDeque<(i16, bool)>>>; // (value, finished)
 
-    /// Finishes packets only when told; "decodes" one to 4 samples of its RTP sequence number (a placeholder, a
-    /// packet shorter than 40 bytes, to nothing).
-    struct Mock(Jobs);
-    impl Offload for Mock {
-        fn submit(&mut self, tag: u32, packet: &[u8]) -> bool {
-            let v = (packet.len() >= 40).then(|| rtp_seq(packet) as i16);
-            self.0.lock().unwrap().push((tag, v, false));
-            true
+    /// Works in the background: a packet is done when the test says; "decodes" one to 4 samples of its RTP
+    /// sequence number, a placeholder (shorter than 40 bytes) to nothing.
+    struct Background(Jobs);
+    impl crate::decoder::Decoder for Background {
+        fn send(&mut self, packet: &[u8]) {
+            let v = if packet.len() < 40 {
+                i16::MIN
+            } else {
+                rtp_seq(packet) as i16
+            };
+            self.0.lock().unwrap().push_back((v, false));
         }
-        fn collect(&mut self, done: &mut dyn FnMut(u32, Decoded<'_>)) {
+        fn receive(&mut self) -> Option<crate::decoder::Decoded> {
             let mut q = self.0.lock().unwrap();
-            while let Some(&(tag, v, true)) = q.first() {
-                match v {
-                    Some(v) => done(tag, Decoded::S16(&[v; 4])),
-                    None => done(tag, Decoded::Failed),
-                }
-                q.remove(0);
+            let &(v, true) = q.front()? else {
+                return None;
+            };
+            q.pop_front();
+            drop(q);
+            if v == i16::MIN {
+                return Some(crate::decoder::Decoded::Failed);
             }
+            Some(crate::decoder::Decoded::S16(vec![v; 4]))
         }
-        fn in_flight(&self) -> usize {
-            self.0.lock().unwrap().len()
+        fn background(&self) -> bool {
+            true
         }
     }
 
@@ -600,19 +602,18 @@ mod tests {
         p
     }
 
-    /// An ALAC stream with the mock offload, playing into `got`.
+    /// An ALAC stream with the background decoder, playing into `got`.
     fn playout(got: &Got) -> (Playout, Jobs) {
         let q = Jobs::default();
         let q2 = q.clone();
-        let factory: crate::raop::offload::OffloadFactory =
-            Arc::new(move |job: &OffloadJob<'_>| {
-                let OffloadJob::Packets { cipher, alac } = job else {
-                    panic!("an AP1 stream asked for another job");
-                };
-                assert!(matches!(cipher, OffloadCipher::None));
-                assert_eq!(alac.unwrap().frame_length, 352);
-                Some(Box::new(Mock(q2.clone())) as Box<dyn Offload>)
-            });
+        let factory: crate::decoder::DecoderFactory = Arc::new(move |info: &StreamInfo| {
+            assert_eq!(info.framing, Framing::Rtp(Cipher::None));
+            let Codec::Alac(p) = info.codec else {
+                panic!("not the ALAC stream it is");
+            };
+            assert_eq!(p.frame_length, 352);
+            Some(Box::new(Background(q2.clone())) as Box<dyn crate::decoder::Decoder>)
+        });
         let rtp = RaopRtp::new(
             Arc::new(got.clone()),
             RtpConfig {
@@ -627,16 +628,16 @@ mod tests {
                     format: SampleFormat::S16,
                 },
                 remote_socket: "127.0.0.1:5000".parse().unwrap(),
-                offload: Some(factory),
+                decoders: Some(factory),
             },
         )
         .unwrap();
-        (rtp.playout(true), q)
+        (rtp.playout(), q)
     }
 
     fn finish(q: &Jobs) {
         for e in q.lock().unwrap().iter_mut() {
-            e.2 = true;
+            e.1 = true;
         }
     }
 
@@ -653,7 +654,7 @@ mod tests {
             reorder.push(seq, &packet(seq, 40), t, &mut out);
         }
         for (fill, pk) in &out {
-            p.decoder.push(u32::from(rtp_seq(pk)), 0, *fill, pk);
+            p.decoding.push(u32::from(rtp_seq(pk)), 0, *fill, pk);
         }
         p.drain();
         assert!(got.0.lock().unwrap().is_empty(), "nothing back yet");
@@ -675,7 +676,7 @@ mod tests {
         let mut send = |p: &mut Playout, seq: u16, len: usize| {
             p.arrive(&mut reorder, &packet(seq, len), t, &mut out);
             for (fill, pk) in out.drain(..) {
-                p.decoder.push(u32::from(rtp_seq(&pk)), 0, fill, &pk);
+                p.decoding.push(u32::from(rtp_seq(&pk)), 0, fill, &pk);
             }
         };
         for (seq, len) in [(7u16, 20), (8, 20), (7, 40), (8, 40), (9, 40)] {
@@ -698,7 +699,7 @@ mod tests {
         let got = Got::default();
         let (mut p, q) = playout(&got);
         for seq in 30..33u16 {
-            p.decoder.push(u32::from(seq), 0, 0, &packet(seq, 40));
+            p.decoding.push(u32::from(seq), 0, 0, &packet(seq, 40));
         }
         p.flush(Some(31));
         finish(&q);

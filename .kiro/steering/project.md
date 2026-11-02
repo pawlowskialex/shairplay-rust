@@ -22,7 +22,7 @@ src/
 │   ├── handlers_ap2.rs AP2 RTSP handlers
 │   ├── rtp.rs          AP1 RTP streaming (UDP + reorder, TCP)
 │   ├── ntp.rs          NTP timing responder
-│   ├── pipeline.rs     What every stream shares: decrypt, in-order decode (offload or library), output, timeline
+│   ├── pipeline.rs     What every stream shares: in-order decoding through its decoder, output, timeline
 │   ├── reorder.rs      RTP packets in sequence order, lost ones asked for again
 │   ├── buffered_audio  AP2 timed playout buffer
 │   ├── realtime_audio  AP2 realtime ALAC
@@ -30,6 +30,7 @@ src/
 ├── video/          Screen mirroring (experimental)
 ├── hls/            HLS video playback (YouTube)
 ├── crypto/         RSA, Ed25519, AES, FairPlay, SRP-6a, ChaCha20
+├── decoder.rs      The Decoder trait every stream goes through, the library's decoders (builtin)
 ├── codec/          ALAC decoder, AAC decoder, resampler
 ├── proto/          SDP, HTTP/RTSP, DMAP, binary plist, HTTP Digest
 ├── net/            Async TCP server, mDNS, PTP timing, feature flags

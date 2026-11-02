@@ -133,20 +133,13 @@ pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
     out
 }
 
-/// The AAC decoder compiled in: symphonia's with `aac-symphonia` (raw frames, no ADTS).
+/// symphonia's AAC decoder for a stream (raw frames, no ADTS).
+#[cfg(feature = "aac-symphonia")]
 pub(crate) fn new_decoder(
     sample_rate: u32,
     channels: u8,
 ) -> Result<Box<dyn crate::codec::Decode>, String> {
-    #[cfg(feature = "aac-symphonia")]
-    {
-        Ok(Box::new(AacDecoder::new(sample_rate, channels)?))
-    }
-    #[cfg(not(feature = "aac-symphonia"))]
-    {
-        let _ = (sample_rate, channels);
-        Err("no AAC decoder compiled in (enable aac-symphonia)".into())
-    }
+    Ok(Box::new(AacDecoder::new(sample_rate, channels)?))
 }
 
 /// symphonia's AAC decoder (floating point).

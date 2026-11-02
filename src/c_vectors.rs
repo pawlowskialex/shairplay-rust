@@ -1,14 +1,13 @@
 //! Test vectors generated from the original C implementation (shairplay).
 
-use crate::codec::Decode;
 use crate::crypto::aes::AesCtr;
 use crate::crypto::fairplay::FairPlay;
 use crate::crypto::pairing::Pairing;
+use crate::decoder::{Cipher, Decoded, Decoder};
 use crate::net::mdns::AirPlayServiceInfo;
 use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::proto::sdp::Sdp;
-use crate::raop::pipeline::{RtpCipher, RtpDecode};
 use crate::raop::rtp::Ap1Format;
 
 // ============================================================
@@ -303,11 +302,17 @@ fn fairplay_reject_bad_version() {
 // ============================================================
 
 /// The library's decoding of an AirPlay 1 stream's packets.
-fn ap1_decode(rtpmap: &str, fmtp: &str, cipher: RtpCipher) -> Option<RtpDecode> {
-    Ap1Format::parse(rtpmap, fmtp).map(|f| RtpDecode {
-        cipher,
-        codec: f.codec(),
-    })
+fn ap1_decode(rtpmap: &str, fmtp: &str, cipher: Cipher) -> Option<Box<dyn Decoder>> {
+    Ap1Format::parse(rtpmap, fmtp).and_then(|f| crate::decoder::builtin(&f.info(&cipher)))
+}
+
+/// One packet through `d`: its 16-bit samples, or `None` if it didn't decode.
+fn one(d: &mut Box<dyn Decoder>, packet: &[u8]) -> Option<Vec<i16>> {
+    d.send(packet);
+    match d.receive()? {
+        Decoded::S16(s) => Some(s),
+        _ => None,
+    }
 }
 
 fn rtp_packet(payload: &[u8]) -> Vec<u8> {
@@ -323,18 +328,18 @@ fn rtp_dummy_alac_payload_decodes_to_nothing_without_panicking() {
     let mut d = ap1_decode(
         "96 AppleLossless",
         "96 352 0 16 40 10 14 2 255 0 0 44100",
-        RtpCipher::Aes128Cbc {
+        Cipher::Aes128Cbc {
             key: [0; 16],
             iv: [0; 16],
         },
     )
     .expect("valid fmtp");
-    let _ = d.decode(&rtp_packet(&[0u8; 256]));
+    let _ = one(&mut d, &rtp_packet(&[0u8; 256]));
 }
 
 #[test]
 fn rtp_rejects_short_packet() {
-    assert!(RtpCipher::None.open(&[0u8; 4]).is_none()); // too short
+    assert!(Cipher::None.open(&[0u8; 4]).is_none()); // too short
 }
 
 #[test]
@@ -366,13 +371,12 @@ fn rtp_rejects_unsupported_or_malformed_rtpmap() {
 /// big-endian S16 samples decode straight to S16 without an ALAC decoder.
 #[test]
 fn rtp_pcm_l16_decodes_big_endian_s16() {
-    let mut d = ap1_decode("96 L16/44100/2", "", RtpCipher::None)
-        .expect("L16 rtpmap is valid without fmtp");
+    let mut d =
+        ap1_decode("96 L16/44100/2", "", Cipher::None).expect("L16 rtpmap is valid without fmtp");
     // two big-endian S16 samples: 0x4000 (+0.5), 0xC000 (-0.5)
-    let pcm = d
-        .decode(&rtp_packet(&[0x40, 0x00, 0xC0, 0x00]))
-        .expect("L16 packet should decode");
-    assert_eq!(pcm.into_s16(), [0x4000, -0x4000]);
+    let pcm =
+        one(&mut d, &rtp_packet(&[0x40, 0x00, 0xC0, 0x00])).expect("L16 packet should decode");
+    assert_eq!(pcm, [0x4000, -0x4000]);
 }
 
 /// `L16` without an explicit channel count defaults to mono (RFC 3551).
@@ -385,15 +389,15 @@ fn rtp_pcm_l16_mono_default() {
             sample_rate: 44100
         })
     );
-    let mut d = ap1_decode("96 L16/44100", "", RtpCipher::None).expect("mono L16 valid");
-    let pcm = d.decode(&rtp_packet(&[0x00, 0x00, 0x7F, 0xFF])).unwrap();
-    assert_eq!(pcm.into_s16(), [0, 0x7FFF]);
+    let mut d = ap1_decode("96 L16/44100", "", Cipher::None).expect("mono L16 valid");
+    let pcm = one(&mut d, &rtp_packet(&[0x00, 0x00, 0x7F, 0xFF])).unwrap();
+    assert_eq!(pcm, [0, 0x7FFF]);
 }
 
 #[test]
 fn rtp_pcm_l16_rejects_incomplete_frames() {
-    let mut d = ap1_decode("96 L16/44100/2", "", RtpCipher::None).expect("valid stereo L16");
-    assert!(d.decode(&rtp_packet(&[0x00, 0x01])).is_none());
+    let mut d = ap1_decode("96 L16/44100/2", "", Cipher::None).expect("valid stereo L16");
+    assert!(one(&mut d, &rtp_packet(&[0x00, 0x01])).is_none());
 }
 
 // ============================================================
@@ -504,9 +508,9 @@ mod ap2_tests {
     #[test]
     fn c_vector_audio_packet_tag_checks() {
         let packet = hex_decode(AUDIO_PACKET_HEX);
-        use crate::raop::pipeline::RtpCipher;
-        assert!(RtpCipher::ChaCha20Poly1305 { key: [0x42; 32] }.authentic(&packet));
-        assert!(!RtpCipher::ChaCha20Poly1305 { key: [0; 32] }.authentic(&packet));
+        use crate::decoder::Cipher;
+        assert!(Cipher::ChaCha20Poly1305 { key: [0x42; 32] }.authentic(&packet));
+        assert!(!Cipher::ChaCha20Poly1305 { key: [0; 32] }.authentic(&packet));
     }
 
     #[test]

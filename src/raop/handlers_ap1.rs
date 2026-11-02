@@ -315,7 +315,7 @@ pub(crate) fn handle_announce(
             encryption,
             output: conn.shared.output(),
             remote_socket: conn.remote_socket,
-            offload: conn.shared.offload.clone(),
+            decoders: conn.shared.decoders.clone(),
         },
     );
 
