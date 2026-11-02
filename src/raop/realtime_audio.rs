@@ -1,61 +1,36 @@
-//! Realtime ALAC audio receiver (stream type 96).
+//! Realtime ALAC audio receiver (stream type 96): the UDP source in front of the shared pipeline.
 //!
-//! Receives UDP packets with RTP headers, puts them in sequence order (asking the sender to resend lost ones),
-//! decrypts with ChaCha20-Poly1305, decodes ALAC, resamples/mixes down if asked, and delivers PCM in the session's
-//! sample format.
+//! Packets are authenticated as they arrive (their ChaCha20-Poly1305 tag; another host's, or a forged one, never
+//! reaches the reorder stage), put in sequence order (lost ones asked for again), decrypted and decoded (the
+//! offload, or here), and delivered with their play time on the sender's network timeline.
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
-
+use crate::codec::alac::AlacConfig;
 use crate::error::{NetworkError, ShairplayError};
-use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
+use crate::raop::AudioHandler;
+use crate::raop::pipeline::{
+    Decoder, Library, NONCE_TRAIL_LEN, Output, RTP_HEADER_LEN, RtpCipher, RtpDecode, Source,
+    Timeline, notify_waker,
+};
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
-use crate::raop::{AudioFormat, AudioHandler};
 
-#[cfg(feature = "resample")]
-use crate::codec::resample::StreamResampler;
-
-/// Output configuration for resampling/mixdown.
+/// A realtime stream's parameters (its SETUP) and the output's.
 pub(crate) struct OutputConfig {
-    /// Source sample rate from the stream SETUP.
-    pub(crate) source_sample_rate: u32,
-    /// Source samples per ALAC frame from the stream SETUP.
-    pub(crate) samples_per_frame: u32,
-    /// Source channel count.
-    pub(crate) channels: u8,
-    /// Source bit depth.
-    pub(crate) bit_depth: u8,
-    /// Target sample rate, or None for source native rate.
-    pub(crate) sample_rate: Option<u32>,
-    /// Maximum output channels, or None to pass through.
-    pub(crate) max_channels: Option<u8>,
-    /// Sample format of the PCM handed to the session.
-    pub(crate) format: crate::raop::SampleFormat,
+    /// The stream's ALAC parameters (SETUP `spf`, `audioFormat` or `sr`; Apple's defaults for the rest).
+    pub(crate) alac: AlacConfig,
+    /// What the samples go out as.
+    pub(crate) output: crate::raop::pipeline::OutputConfig,
     /// Coprocessor decrypt + decode.
     pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
     /// The receiver latency the sender asks for (SETUP `latencyMin`, frames), if it does.
     pub(crate) latency_min: Option<u32>,
-    /// The sender: datagrams from other hosts are dropped (sync packets aren't authenticated, and audio packets
-    /// would go through the reorder stage before their tag is checked). None: any (tests).
+    /// The sender: datagrams from other hosts are dropped (sync packets aren't authenticated). None: any (tests).
     pub(crate) peer: Option<std::net::IpAddr>,
     /// The latency instead of the sender's (the builder's realtime_latency_ms)
     pub(crate) latency_ns: Option<i64>,
-}
-
-fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
-    let mut info = [0u8; 48];
-    info[24..28].copy_from_slice(&config.samples_per_frame.to_be_bytes());
-    info[29] = config.bit_depth;
-    info[30] = 40; // pb
-    info[31] = 10; // mb
-    info[32] = 14; // kb
-    info[33] = config.channels;
-    info[34..36].copy_from_slice(&255u16.to_be_bytes());
-    info[44..48].copy_from_slice(&config.source_sample_rate.to_be_bytes());
-    info
 }
 
 /// What the connection tells a running realtime stream.
@@ -98,50 +73,57 @@ impl Drop for RealtimeStream {
     }
 }
 
+/// What came in on the sockets, or that the loop should look again.
+enum Event {
+    Look,
+    Data(usize),
+    Control(usize),
+    Failed(std::io::Error),
+    Command(Option<RealtimeCommand>),
+}
+
 /// Run the realtime audio receiver loop.
 async fn run(
     socket: UdpSocket,
     ctrl: Option<Retransmit>,
     shk: [u8; 32],
     handler: Arc<dyn AudioHandler>,
-    output_config: OutputConfig,
+    config: OutputConfig,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<RealtimeCommand>,
 ) {
-    let cipher = ChaCha20Poly1305::new((&shk).into());
-    let mut buf = vec![0u8; 4096];
-    let mut decoder: Option<crate::codec::alac::AlacDecoder> = None;
-    #[cfg(feature = "resample")]
-    let mut resampler: Option<StreamResampler> = None;
-    // flushed when the stream ends, however it ends (TEARDOWN aborts this task): what it queued for later doesn't play
-    let mut session = Ending(None);
-    #[allow(unused_assignments)]
-    let mut src_sr: u32 = 44100;
-    let mut src_ch: u8 = 2;
-    let mut out_ch: u8 = 2;
-
-    let offload_cipher = crate::raop::offload::OffloadCipher::ChaCha20Poly1305 { key: shk };
-    let alac = crate::raop::offload::OffloadAlac {
-        frame_length: output_config.samples_per_frame,
-        bit_depth: output_config.bit_depth,
-        pb: 40,
-        mb: 10,
-        kb: 14,
-        channels: output_config.channels,
+    let cipher = RtpCipher::ChaCha20Poly1305 { key: shk };
+    let alac = &config.alac;
+    let rate = alac.sample_rate;
+    let source = Source {
+        sample_rate: rate,
+        channels: alac.num_channels,
+        bits: alac.bit_depth,
     };
-    let mut offload = output_config.offload.as_ref().and_then(|f| {
+    let offload = config.offload.as_ref().and_then(|f| {
         f(&crate::raop::offload::OffloadJob::Packets {
-            cipher: &offload_cipher,
-            alac: Some(&alac),
+            cipher: &cipher.offload(),
+            alac: Some(&alac.offload()),
         })
     });
+    let mut decoder = Decoder::new(
+        offload,
+        Library::Packets(RtpDecode {
+            cipher: cipher.clone(),
+            codec: Box::new(alac.decoder()),
+        }),
+    );
+    let frames = alac.frame_length as usize;
+    // made at the first packet; flushed when the stream ends, however it ends (TEARDOWN aborts this task): what it
+    // queued for later doesn't play
+    let mut output: Option<Output> = None;
 
-    let offset_ns = output_config.latency_ns.unwrap_or_else(|| {
-        realtime_offset_ns(output_config.latency_min, output_config.source_sample_rate)
-    });
+    let offset_ns = config
+        .latency_ns
+        .unwrap_or_else(|| realtime_offset_ns(config.latency_min, rate));
     info!(
-        offload = offload.is_some(),
+        offload = decoder.has_offload(),
         retransmit = ctrl.is_some(),
-        latency_min = ?output_config.latency_min,
+        latency_min = ?config.latency_min,
         offset_ms = offset_ns / 1_000_000,
         "Realtime ALAC receiver started"
     );
@@ -164,201 +146,95 @@ async fn run(
     let flushed = |ts: u32, floor: Option<u32>, await_anchor: bool| {
         await_anchor || floor.is_some_and(|f| (ts.wrapping_sub(f) as i32) < 0)
     };
-    // RTP times of the packets out on the offload, in order
-    let mut offload_ts: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     let mut report = std::time::Instant::now();
+    let mut buf = vec![0u8; 4096];
     let mut cbuf = vec![0u8; 4096];
-    let mut ctrl_logged = 0u32;
-    // `packets` packets of silence, in the stream's layout, to the session
-    macro_rules! silence {
-        ($packets:expr) => {
-            let packets = $packets as usize;
-            if packets > 0 {
-                if let Some(ref mut sess) = *session {
-                    let n = packets * output_config.samples_per_frame as usize * src_ch as usize;
-                    let pcm = crate::codec::shape(
-                        crate::codec::Pcm::S16(vec![0; n]),
-                        src_ch,
-                        out_ch,
-                        #[cfg(feature = "resample")]
-                        &mut resampler,
-                    );
-                    pcm.deliver(sess.as_mut(), output_config.format, None);
-                }
-            }
-        };
-    }
-
-    // Finished offload packets, in order: decode a plaintext one here if need be, then shape and deliver.
-    macro_rules! drain_offload {
-        () => {
-            if let Some(off) = offload.as_mut() {
-                off.collect(&mut |fill, out| {
-                    silence!(fill);
-                    // each packet out takes its timestamp, whatever became of it
-                    let ts = offload_ts.pop_front();
-                    let pcm = match out {
-                        crate::raop::offload::Decoded::S16(s) => crate::codec::Pcm::S16(s.to_vec()),
-                        crate::raop::offload::Decoded::S24(s) => crate::codec::Pcm::S24(s.to_vec()),
-                        crate::raop::offload::Decoded::Plain(p) => {
-                            match decoder.as_mut().and_then(|d| d.decode_frame_pcm(p)) {
-                                Some(pcm) => pcm,
-                                None => {
-                                    silence!(1);
-                                    return;
-                                }
-                            }
-                        }
-                        crate::raop::offload::Decoded::Failed => {
-                            silence!(1);
-                            return;
-                        }
-                    };
-                    let pcm = crate::codec::shape(
-                        pcm,
-                        src_ch,
-                        out_ch,
-                        #[cfg(feature = "resample")]
-                        &mut resampler,
-                    );
-                    if ts.is_some_and(|t| flushed(t, floor, await_anchor)) {
-                        return;
-                    }
-                    let at =
-                        ts.and_then(|ts| anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)));
-                    if ts.is_some() {
-                        last_played = ts;
-                    }
-                    if let Some(ref mut sess) = *session {
-                        pcm.deliver(sess.as_mut(), output_config.format, at);
-                    }
-                });
-            }
-        };
-    }
-
-    // One packet in order, after `fill` packets' worth of silence for the ones before it that never came.
-    macro_rules! play {
-        ($fill:expr, $packet:expr) => {
-            'play: {
-                let (fill, packet): (u32, &[u8]) = ($fill, $packet);
-                let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-                if flushed(ts, floor, await_anchor) {
-                    break 'play;
-                }
-                floor = None;
-                if !timed_logged && let Some(at) = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns)) {
-                    timed_logged = true;
-                    let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
-                    info!(ts, lead_ms, "Realtime playout on the network timeline");
-                }
-                if let Some(off) = offload.as_mut() {
-                    if off.submit(fill, packet) {
-                        offload_ts.push_back(ts);
-                        drain_offload!();
-                        break 'play;
-                    }
-                    // Processed here instead: let the packets before it out first, so the order holds.
-                    while offload.as_ref().is_some_and(|o| o.in_flight() > 0) {
-                        drain_offload!();
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                }
-                silence!(fill);
-                // Decrypt the ChaCha20-Poly1305 RTP frame.
-                let Some(alac_data) = decrypt_rtp_chacha(&cipher, packet) else {
-                    debug!("Realtime audio decrypt failed");
-                    silence!(1);
-                    break 'play;
-                };
-                // Decode ALAC → PCM (16-bit streams stay integer)
-                let Some(pcm) = decoder.as_mut().and_then(|d| d.decode_frame_pcm(&alac_data)) else {
-                    silence!(1);
-                    break 'play;
-                };
-                // Mix down + resample, only if the output needs it.
-                let pcm = crate::codec::shape(
-                    pcm,
-                    src_ch,
-                    out_ch,
-                    #[cfg(feature = "resample")]
-                    &mut resampler,
-                );
-                let at = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns));
-                last_played = Some(ts);
-                if let Some(ref mut sess) = *session {
-                    pcm.deliver(sess.as_mut(), output_config.format, at);
-                }
-            }
-        };
-    }
+    let (mut ctrl_logged, mut forged) = (0u32, 0u32);
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let waker = notify_waker(&ready);
 
     loop {
-        // Look again shortly while packets are out on the offload or held behind a gap, even if nothing arrives.
-        let waiting = offload.as_ref().is_some_and(|o| o.in_flight() > 0) || reorder.holding();
+        // Look again when the offload says (or shortly) while packets are out on it, or shortly while packets are
+        // held behind a gap, even if nothing arrives.
+        let wakes = decoder.waiting() && decoder.wake_on_done(&waker);
+        let poll = (decoder.waiting() && !wakes) || reorder.holding();
         // another host's datagram counts as empty: ignored
         let from_peer = |(n, from): (usize, std::net::SocketAddr)| {
-            if output_config.peer.is_none_or(|p| p == from.ip()) {
+            if config.peer.is_none_or(|p| p == from.ip()) {
                 n
             } else {
                 0
             }
         };
-        let received = tokio::select! {
-            r = socket.recv_from(&mut buf) => Some(r.map(|r| (from_peer(r), false))),
+        let event = tokio::select! {
+            r = socket.recv_from(&mut buf) => match r {
+                Ok(r) => Event::Data(from_peer(r)),
+                Err(e) => Event::Failed(e),
+            },
             r = async {
                 match &ctrl {
                     Some(c) => c.socket.recv_from(&mut cbuf).await,
                     None => std::future::pending().await,
                 }
-            } => Some(r.map(|r| (from_peer(r), true))),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
-            c = commands.recv() => {
-                // the connection is gone (its end of the channel with it): so is the stream
-                let Some(RealtimeCommand::Flush { before }) = c else { break };
-                // queued audio goes if it is all before the flush point (it can't be cut in part), and without a
-                // point all of it
-                let older = before.is_none_or(|n| last_played.is_none_or(|l| (l.wrapping_sub(n) as i32) < 0));
-                if older && let Some(ref mut sess) = *session {
-                    sess.audio_flush();
-                }
-                floor = before;
-                await_anchor = before.is_none();
-                info!(?before, ?last_played, dropped_queued = older, "Realtime FLUSH");
-                continue;
-            }
+            } => match r {
+                Ok(r) => Event::Control(from_peer(r)),
+                Err(e) => Event::Failed(e),
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if poll => Event::Look,
+            _ = ready.notified(), if wakes => Event::Look,
+            c = commands.recv() => Event::Command(c),
         };
         let now = std::time::Instant::now();
         let mut out = Vec::new();
-        match received {
-            None => {}
-            Some(Err(e)) => {
+        let packet: Option<&[u8]> = match event {
+            Event::Look => None,
+            // the connection is gone (its end of the channel with it): so is the stream
+            Event::Command(None) => break,
+            Event::Command(Some(RealtimeCommand::Flush { before })) => {
+                // queued audio goes if it is all before the flush point (it can't be cut in part), and without a
+                // point all of it
+                let older = before
+                    .is_none_or(|n| last_played.is_none_or(|l| (l.wrapping_sub(n) as i32) < 0));
+                if older && let Some(o) = output.as_mut() {
+                    o.flush();
+                }
+                floor = before;
+                await_anchor = before.is_none();
+                info!(
+                    ?before,
+                    ?last_played,
+                    dropped_queued = older,
+                    "Realtime FLUSH"
+                );
+                continue;
+            }
+            Event::Failed(e) => {
                 warn!("Realtime audio recv error: {e}");
                 handler.on_error(&ShairplayError::Network(NetworkError::Io(e)));
                 break;
             }
             // an empty datagram is no packet (UDP has no end of stream)
-            Some(Ok((0, _))) => {}
-            Some(Ok((n, resent))) => {
-                // A resend answer is the original packet behind 4 bytes (0x80 0xd6 seq); anything else on the
-                // control port (sync packets) isn't audio.
-                let packet = if resent {
-                    if let Some(a) = Anchor::parse(&cbuf[..n]) {
-                        if anchor.is_none_or(|o| o.clock != a.clock) {
-                            info!(
-                                clock = format!("{:016x}", a.clock),
-                                rtp = a.rtp,
-                                latency = a.latency,
-                                "Realtime sync: the sender's timeline"
-                            );
-                        }
-                        anchor = Some(a);
-                        await_anchor = false;
-                        continue;
+            Event::Data(0) | Event::Control(0) => None,
+            Event::Data(n) => Some(&buf[..n]),
+            // A resend answer is the original packet behind 4 bytes (0x80 0xd6 seq); sync packets (0xd7) anchor the
+            // stream on the sender's timeline; anything else on the control port isn't audio.
+            Event::Control(n) => {
+                if let Some(a) = Anchor::parse(&cbuf[..n]) {
+                    if anchor.is_none_or(|o| o.clock != a.clock) {
+                        info!(
+                            clock = format!("{:016x}", a.clock),
+                            rtp = a.rtp,
+                            latency = a.latency,
+                            "Realtime sync: the sender's timeline"
+                        );
                     }
-                    let Some(p) = resent_packet(&cbuf[..n]) else {
-                        // not a resent packet: sync packets (0xd7: RTP time <-> the sender's network time) and the
-                        // like; the first few go to the log until the realtime path uses them
+                    anchor = Some(a);
+                    await_anchor = false;
+                    continue;
+                }
+                match resent_packet(&cbuf[..n]) {
+                    Some(p) => Some(p),
+                    None => {
                         if ctrl_logged < 8 {
                             ctrl_logged += 1;
                             info!(
@@ -368,57 +244,20 @@ async fn run(
                             );
                         }
                         continue;
-                    };
-                    p
-                } else {
-                    &buf[..n]
-                };
-                if packet.len() <= RTP_HEADER_LEN + NONCE_TRAIL_LEN {
-                    continue;
-                }
-                // Lazy init decoder + session on first packet
-                if session.is_none() {
-                    src_sr = output_config.source_sample_rate;
-                    src_ch = output_config.channels;
-                    let target_sr = output_config.sample_rate.unwrap_or(src_sr);
-                    out_ch = output_config
-                        .max_channels
-                        .map(|m| src_ch.min(m))
-                        .unwrap_or(src_ch);
-
-                    let mut alac = crate::codec::alac::AlacDecoder::new(
-                        output_config.bit_depth as i32,
-                        src_ch as i32,
-                    );
-                    let decoder_info = alac_decoder_info(&output_config);
-                    alac.set_info(&decoder_info);
-                    decoder = Some(alac);
-                    #[cfg(feature = "resample")]
-                    if target_sr != src_sr {
-                        resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
                     }
-                    #[cfg(not(feature = "resample"))]
-                    let target_sr = {
-                        if target_sr != src_sr {
-                            warn!(
-                                from = src_sr,
-                                to = target_sr,
-                                "Resampling needs the resample feature; playing at the stream's rate"
-                            );
-                        }
-                        src_sr
-                    };
-
-                    let format = AudioFormat {
-                        format: output_config.format.resolve(output_config.bit_depth),
-                        channels: out_ch,
-                        sample_rate: target_sr,
-                    };
-                    info!(?format, "Realtime audio session initialized");
-                    *session = Some(handler.audio_init(format));
                 }
+            }
+        };
+        if let Some(packet) = packet.filter(|p| p.len() > RTP_HEADER_LEN + NONCE_TRAIL_LEN) {
+            if cipher.authentic(packet) {
+                output.get_or_insert_with(|| Output::new(handler.as_ref(), source, &config.output));
                 let seq = u16::from_be_bytes([packet[2], packet[3]]);
                 reorder.push(seq, packet, now, &mut out);
+            } else {
+                forged += 1;
+                if forged.is_power_of_two() {
+                    debug!(forged, "Realtime packets whose tag doesn't check");
+                }
             }
         }
         reorder.tick(now, &mut out);
@@ -426,10 +265,36 @@ async fn run(
             c.ask(&mut reorder).await;
         }
         for (fill, packet) in &out {
-            play!(*fill, packet);
+            let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+            if flushed(ts, floor, await_anchor) {
+                continue;
+            }
+            floor = None;
+            if !timed_logged
+                && let Some(at) = anchor.and_then(|a| a.timeline().play_at(ts, rate, offset_ns))
+            {
+                timed_logged = true;
+                let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
+                info!(ts, lead_ms, "Realtime playout on the network timeline");
+            }
+            let seq = u16::from_be_bytes([packet[2], packet[3]]);
+            decoder.push(u32::from(seq), ts, *fill, packet);
         }
-        if out.is_empty() {
-            drain_offload!();
+        // Finished packets, in order: the silence owed before each, then it (a failed one as silence too)
+        while let Some(unit) = decoder.pop() {
+            let Some(o) = output.as_mut() else { break };
+            o.silence(unit.fill as usize * frames, None);
+            if flushed(unit.ts, floor, await_anchor) {
+                continue;
+            }
+            match unit.pcm {
+                Some(pcm) => {
+                    let at = anchor.and_then(|a| a.timeline().play_at(unit.ts, rate, offset_ns));
+                    last_played = Some(unit.ts);
+                    o.play(pcm, at);
+                }
+                None => o.silence(frames, None),
+            }
         }
         if report.elapsed() >= std::time::Duration::from_secs(10) {
             reorder.report("realtime");
@@ -438,32 +303,6 @@ async fn run(
     }
 
     debug!("Realtime ALAC receiver ended");
-}
-
-/// The stream's session, flushed when it is dropped: a realtime stream ends at its TEARDOWN (a pause: iOS and macOS
-/// tear the stream down and set up a new one to resume), and on the network timeline its last ~2 s are still
-/// queued, waiting for their time.
-struct Ending(Option<Box<dyn crate::raop::AudioSession>>);
-
-impl Drop for Ending {
-    fn drop(&mut self) {
-        if let Some(s) = self.0.as_mut() {
-            s.audio_flush();
-        }
-    }
-}
-
-impl std::ops::Deref for Ending {
-    type Target = Option<Box<dyn crate::raop::AudioSession>>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Ending {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
 }
 
 /// A sync packet's anchor (0xd7, 28 bytes: 0x80|0x90, 0xd7, 2 bytes, then the RTP time that plays at the network
@@ -492,13 +331,13 @@ impl Anchor {
         })
     }
 
-    /// Local time (`util::now_ns`'s clock) at which RTP time `ts` leaves the speaker, once the clock is followed.
-    fn play_at(self, ts: u32, rate: u32, offset_ns: i64) -> Option<u64> {
-        let frames = i128::from(ts.wrapping_sub(self.rtp) as i32);
-        let net = i128::from(self.net_ns)
-            + i128::from(offset_ns)
-            + frames * 1_000_000_000 / i128::from(rate.max(1));
-        crate::net::ptp::follower().to_local(self.clock, net.max(0) as u64)
+    /// The sender's network timeline: this anchor's RTP time plays at its network time.
+    fn timeline(self) -> Timeline {
+        Timeline::Network {
+            clock: self.clock,
+            net_ns: self.net_ns,
+            rtp: self.rtp,
+        }
     }
 }
 
@@ -554,39 +393,13 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn alac_decoder_info_uses_realtime_setup_values() {
-        let info = alac_decoder_info(&OutputConfig {
-            source_sample_rate: 48_000,
-            samples_per_frame: 352,
-            channels: 2,
-            bit_depth: 16,
-            sample_rate: None,
-            max_channels: None,
-            format: crate::raop::SampleFormat::F32,
-            offload: None,
-            latency_min: None,
-            peer: None,
-            latency_ns: None,
-        });
-
-        assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);
-        assert_eq!(info[29], 16);
-        assert_eq!(info[30], 40);
-        assert_eq!(info[31], 10);
-        assert_eq!(info[32], 14);
-        assert_eq!(info[33], 2);
-        assert_eq!(u16::from_be_bytes(info[34..36].try_into().unwrap()), 255);
-        assert_eq!(u32::from_be_bytes(info[44..48].try_into().unwrap()), 48_000);
-    }
-
     struct Silent;
     impl crate::raop::AudioSession for Silent {
         fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
     }
     struct NoAudio;
     impl AudioHandler for NoAudio {
-        fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+        fn audio_init(&self, _: crate::raop::AudioFormat) -> Box<dyn crate::raop::AudioSession> {
             Box::new(Silent)
         }
     }
@@ -598,13 +411,12 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let config = OutputConfig {
-            source_sample_rate: 44100,
-            samples_per_frame: 352,
-            channels: 2,
-            bit_depth: 16,
-            sample_rate: None,
-            max_channels: None,
-            format: crate::raop::SampleFormat::S16,
+            alac: AlacConfig::defaults(352, 16, 2, 44100).unwrap(),
+            output: crate::raop::pipeline::OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+                format: crate::raop::SampleFormat::S16,
+            },
             offload: None,
             latency_min: None,
             peer: None,

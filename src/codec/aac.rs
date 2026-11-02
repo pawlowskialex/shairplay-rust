@@ -3,6 +3,7 @@
 //! Raw AAC packets from the buffered audio stream need ADTS headers
 //! prepended before they can be decoded. Ported from ap2_buffered_audio_processor.c.
 
+#[cfg(feature = "aac-symphonia")]
 use super::Pcm;
 
 /// SSRC values identifying the audio format (from shairport-sync player.h).
@@ -132,13 +133,11 @@ pub(crate) fn wrap_adts(raw_aac: &[u8], rate: u32, channels: u8) -> Vec<u8> {
     out
 }
 
-/// An AAC-LC decoder: raw frames (no ADTS) in, interleaved PCM out, in the decoder's native format.
-pub(crate) trait AacBackend {
-    fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm>;
-}
-
-/// The AAC decoder compiled in: symphonia's with `aac-symphonia`.
-pub(crate) fn new_decoder(sample_rate: u32, channels: u8) -> Result<Box<dyn AacBackend>, String> {
+/// The AAC decoder compiled in: symphonia's with `aac-symphonia` (raw frames, no ADTS).
+pub(crate) fn new_decoder(
+    sample_rate: u32,
+    channels: u8,
+) -> Result<Box<dyn crate::codec::Decode>, String> {
     #[cfg(feature = "aac-symphonia")]
     {
         Ok(Box::new(AacDecoder::new(sample_rate, channels)?))
@@ -157,7 +156,7 @@ pub(crate) struct AacDecoder {
 }
 
 #[cfg(feature = "aac-symphonia")]
-impl AacBackend for AacDecoder {
+impl crate::codec::Decode for AacDecoder {
     fn decode(&mut self, raw_aac: &[u8]) -> Option<Pcm> {
         let bytes = self.decode_bytes(raw_aac)?;
         Some(Pcm::F32(

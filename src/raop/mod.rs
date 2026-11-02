@@ -2,11 +2,8 @@
 
 pub use crate::proto::dmap::TrackMetadata;
 
-#[cfg(feature = "ap2-core")]
-pub mod audio_pipeline;
 #[cfg(feature = "pipewire-auth-setup-compat")]
 mod auth_setup;
-pub mod buffer;
 #[cfg(feature = "ap2-core")]
 pub mod buffered_audio;
 #[cfg(feature = "ap2-core")]
@@ -20,6 +17,7 @@ pub(crate) mod handlers_hls;
 pub mod hls;
 pub(crate) mod ntp;
 pub mod offload;
+pub(crate) mod pipeline;
 #[cfg(feature = "ap2-core")]
 pub(crate) mod realtime_audio;
 pub(crate) mod reorder;

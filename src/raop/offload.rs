@@ -101,6 +101,12 @@ pub trait Offload: Send {
     fn decode(&mut self, _unit: &[u8]) -> Option<Vec<i16>> {
         None
     }
+    /// Wake `waker` once a unit has finished (at once if one has), if the offload can tell: a coprocessor's
+    /// interrupt, a decoder thread of its own. `false`, the default: it can't, and the stream looks again every few
+    /// milliseconds while units are out.
+    fn wake_on_done(&mut self, _waker: &std::task::Waker) -> bool {
+        false
+    }
 }
 
 /// Makes a stream's offload for its job, or `None` to process the stream in software.

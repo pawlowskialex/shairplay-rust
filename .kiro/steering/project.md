@@ -16,12 +16,14 @@ src/
 │   ├── types.rs        Public API types and traits
 │   ├── server.rs       RaopServer builder + lifecycle
 │   ├── connection.rs   Per-connection state + dispatch
+│   ├── sessions.rs     Every connection and the stream it plays
 │   ├── rtsp.rs         Route-table RTSP dispatch
 │   ├── handlers_ap1.rs AP1 RTSP handlers
 │   ├── handlers_ap2.rs AP2 RTSP handlers
-│   ├── rtp.rs          AP1 RTP streaming
+│   ├── rtp.rs          AP1 RTP streaming (UDP + reorder, TCP)
 │   ├── ntp.rs          NTP timing responder
-│   ├── buffer.rs       RTP packet buffer + AES-CBC decrypt + ALAC decode
+│   ├── pipeline.rs     What every stream shares: decrypt, in-order decode (offload or library), output, timeline
+│   ├── reorder.rs      RTP packets in sequence order, lost ones asked for again
 │   ├── buffered_audio  AP2 timed playout buffer
 │   ├── realtime_audio  AP2 realtime ALAC
 │   └── event_channel   AP2 encrypted event channel
