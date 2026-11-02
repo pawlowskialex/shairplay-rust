@@ -137,7 +137,7 @@ impl SrpServer {
 
         // v = g^x mod N
         let m = group();
-        let v = m.out_of_mont(&m.pow(&m.to_mont(&g), &x));
+        let v = m.out_of_mont(&m.pow(&m.to_mont(&g), &x, 512));
 
         // k = H(pad(N) || pad(g))
         let k = h_nn_pad(&n, &g, N_3072_LEN);
@@ -149,7 +149,7 @@ impl SrpServer {
             let mut b_bytes = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
             let b = BigUint::from_bytes_be(&b_bytes);
-            let big_b = (&kv + m.out_of_mont(&m.pow(&m.to_mont(&g), &b))) % &n;
+            let big_b = (&kv + m.out_of_mont(&m.pow(&m.to_mont(&g), &b, 256))) % &n;
             if to_bytes_be(&big_b).len() == N_3072_LEN {
                 break (b, big_b);
             }
@@ -252,10 +252,10 @@ impl SrpServer {
         // S = (A * v^u)^b mod N, in Montgomery form throughout
         let t0 = std::time::Instant::now();
         let m = group();
-        let vu =
-            fixed_base_pow(m, &self.v_table, &u).unwrap_or_else(|| m.pow(&m.to_mont(&self.v), &u));
+        let vu = fixed_base_pow(m, &self.v_table, &u)
+            .unwrap_or_else(|| m.pow(&m.to_mont(&self.v), &u, 512));
         let avu = m.mul(&m.to_mont(&big_a), &vu);
-        let big_s = m.out_of_mont(&m.pow(&avu, &self.b));
+        let big_s = m.out_of_mont(&m.pow(&avu, &self.b, 256));
         tracing::debug!(ms = t0.elapsed().as_secs_f64() * 1e3, "SRP M3: (A v^u)^b");
 
         // session_key = H(S), and the expected client proof M1. Implementations disagree on whether S (in K)

@@ -84,8 +84,9 @@ impl Mont {
             d[j] = s as u32;
             borrow = (s >> 63) & 1;
         }
-        // t >= n iff the top word carries or the subtraction didn't borrow
-        let keep_t = u32::from(t[WORDS] == 0 && borrow == 1).wrapping_neg();
+        // t >= n iff the top word carries or the subtraction didn't borrow: keep t iff neither, as arithmetic (a
+        // comparison chain may compile to a branch)
+        let keep_t = ((borrow as u32) & (t[WORDS] ^ 1)).wrapping_neg();
         let mut out = [0u32; WORDS];
         for j in 0..WORDS {
             out[j] = (t[j] & keep_t) | (d[j] & !keep_t);
@@ -115,14 +116,18 @@ impl Mont {
         self.one
     }
 
-    /// base^e (Montgomery form in and out), four bits of e at a time from the top: a squaring for each bit and a
-    /// multiplication for each four (also by 1 for a zero digit).
-    pub(crate) fn pow(&self, base: &Words, e: &BigUint) -> Words {
+    /// base^e (Montgomery form in and out) for an e of at most `bits` bits, four bits at a time from the top: a
+    /// squaring for each bit and a multiplication for each four (also by 1 for a zero digit). The exponents are
+    /// secrets (SRP's b, x): the work is the same for every e of that size (`bits` sets the digits, not e's
+    /// length), and each digit's table entry is read by a scan of all 16 under a mask, not by its index (the cache
+    /// would tell which).
+    pub(crate) fn pow(&self, base: &Words, e: &BigUint, bits: u64) -> Words {
+        debug_assert!(e.bits() <= bits);
         let mut table = [self.one; 16];
         for k in 1..16 {
             table[k] = self.mul(&table[k - 1], base);
         }
-        let digits = e.bits().div_ceil(4);
+        let digits = bits.div_ceil(4);
         let mut acc = self.one;
         for k in (0..digits).rev() {
             if k + 1 != digits {
@@ -130,11 +135,24 @@ impl Mont {
                     acc = self.mul(&acc, &acc);
                 }
             }
-            let d = (0..4).fold(0usize, |d, b| d | usize::from(e.bit(4 * k + b)) << b);
-            acc = self.mul(&acc, &table[d]);
+            let d = (0..4).fold(0u32, |d, b| d | u32::from(e.bit(4 * k + b)) << b);
+            acc = self.mul(&acc, &select(&table, d));
         }
         acc
     }
+}
+
+/// `table[d]`, read by touching every entry: a mask of all ones for the one where k == d.
+fn select(table: &[Words; 16], d: u32) -> Words {
+    let mut out = [0u32; WORDS];
+    for (k, entry) in (0u32..).zip(table) {
+        // (k ^ d) - 1 has its top bit set only for k == d (both below 16)
+        let mask = ((k ^ d).wrapping_sub(1) >> 31).wrapping_neg();
+        for (o, &w) in out.iter_mut().zip(entry) {
+            *o |= w & mask;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -182,11 +200,15 @@ mod tests {
         let s = samples(&n);
         for (i, base) in s.iter().enumerate() {
             let e = &s[(i * 7 + 3) % s.len()] >> (i * 97 % 2800);
-            let got = m.out_of_mont(&m.pow(&m.to_mont(base), &e));
-            assert_eq!(got, base.modpow(&e, &n), "base={base:x} e={e:x}");
+            let want = base.modpow(&e, &n);
+            // exactly e's length, and the fixed length of a secret of up to 3072 bits
+            for bits in [e.bits().max(1), 3072] {
+                let got = m.out_of_mont(&m.pow(&m.to_mont(base), &e, bits));
+                assert_eq!(got, want, "base={base:x} e={e:x} bits={bits}");
+            }
         }
         assert_eq!(
-            m.out_of_mont(&m.pow(&m.to_mont(&s[4]), &BigUint::from(0u32))),
+            m.out_of_mont(&m.pow(&m.to_mont(&s[4]), &BigUint::from(0u32), 256)),
             BigUint::from(1u32)
         );
     }
