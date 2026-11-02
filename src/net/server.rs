@@ -1,4 +1,4 @@
-//! Async TCP server with TLS-like encrypt/decrypt hooks for RTSP connections.
+//! Async TCP server for the RTSP connections: reading, request bodies within their limits, plain or encrypted framing, answers off the runtime thread.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -12,7 +12,11 @@ use tokio::time::{Instant, timeout_at};
 use crate::error::{NetworkError, ProtocolError};
 use crate::proto::http::{HttpRequest, HttpResponse, MAX_BODY_BYTES};
 
+#[cfg(feature = "ap2-core")]
 const MAX_ENCRYPTED_BUFFER_LEN: usize = 1024 * 1024;
+
+/// How long a response may take to go out: a sender that stops reading doesn't hold the connection for good.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 mod ingestion_tests;
@@ -94,19 +98,80 @@ impl PendingRequest {
     }
 }
 
-async fn write_bad_request_and_close<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    handler: Option<&mut dyn ConnectionHandler>,
-) {
-    let mut response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
-    response.add_header("Connection", "close");
-    response.finish(None);
-    let wire_out = match handler {
-        Some(handler) if handler.is_encrypted() => handler.encrypt_outgoing(response.get_data()),
-        _ => response.get_data().to_vec(),
-    };
-    let _ = stream.write_all(&wire_out).await;
-    let _ = stream.shutdown().await;
+/// How the connection's bytes are framed: plain, until a pairing turns on HAP's encryption (ChaCha20-Poly1305
+/// frames, both ways, from the byte after the response that finished it).
+enum Framing {
+    Plain,
+    #[cfg(feature = "ap2-core")]
+    Encrypted {
+        channel: Box<crate::crypto::chacha_transport::EncryptedChannel>,
+        /// What came that isn't a whole frame yet
+        raw: Vec<u8>,
+    },
+}
+
+impl Framing {
+    /// The plaintext in what was read: all of it, or with encryption the whole frames so far (the rest waits for
+    /// more). `None`: a frame that doesn't decrypt, or more than [`MAX_ENCRYPTED_BUFFER_LEN`] waiting.
+    fn open<'a>(&mut self, data: &'a [u8]) -> Option<std::borrow::Cow<'a, [u8]>> {
+        match self {
+            Framing::Plain => Some(data.into()),
+            #[cfg(feature = "ap2-core")]
+            Framing::Encrypted { channel, raw } => {
+                if data.len() > MAX_ENCRYPTED_BUFFER_LEN.saturating_sub(raw.len()) {
+                    tracing::warn!("Encrypted buffer exceeded 1 MB, dropping connection");
+                    return None;
+                }
+                raw.extend_from_slice(data);
+                let Ok((plain, consumed)) = channel.decrypt_ctx.decrypt(raw) else {
+                    tracing::warn!(raw_len = raw.len(), "Decryption failed");
+                    return None;
+                };
+                raw.drain(..consumed.min(raw.len()));
+                Some(plain.into())
+            }
+        }
+    }
+
+    /// `data` as it goes on the wire. `None` (encryption failed): nothing may go out, the connection ends; plaintext
+    /// on an encrypted connection would leak the response and desync the stream.
+    fn seal(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Framing::Plain => Some(data.to_vec()),
+            #[cfg(feature = "ap2-core")]
+            Framing::Encrypted { channel, .. } => channel
+                .encrypt_ctx
+                .encrypt(data)
+                .inspect_err(|e| tracing::warn!("Outgoing encryption failed: {e}"))
+                .ok(),
+        }
+    }
+}
+
+/// What a handler answers a request with: the response, and whether the connection is encrypted from then on.
+pub(crate) struct Reply {
+    pub(crate) response: HttpResponse,
+    /// A pairing finished with this response: the connection's bytes after it are encrypted with this channel.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) encrypt: Option<crate::crypto::chacha_transport::EncryptedChannel>,
+}
+
+impl From<HttpResponse> for Reply {
+    fn from(response: HttpResponse) -> Self {
+        Reply {
+            response,
+            #[cfg(feature = "ap2-core")]
+            encrypt: None,
+        }
+    }
+}
+
+/// `data` to the peer, within [`WRITE_TIMEOUT`].
+async fn send<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> bool {
+    matches!(
+        tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(data)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Default RTSP listening port for AirPlay receivers.
@@ -191,9 +256,10 @@ pub(crate) trait HttpdCallbacks: Send + Sync + 'static {
 }
 
 /// Per-connection request handler. Equivalent to conn_request + conn_destroy.
-pub(crate) trait ConnectionHandler: Send {
-    /// Handle an HTTP/RTSP request and return the response.
-    fn conn_request(&mut self, request: &HttpRequest) -> HttpResponse;
+pub(crate) trait ConnectionHandler: Send + 'static {
+    /// Answer a complete request. Runs on the blocking pool, not the runtime's thread: answering may sign, decrypt
+    /// and pair (RSA, SRP: up to a second on a small CPU), which would hold up every other connection and stream.
+    fn request(&mut self, request: &HttpRequest) -> Reply;
 
     /// Select bounds or reject header metadata before any request body is retained.
     /// Routing and authentication remain the handler's responsibility.
@@ -210,29 +276,10 @@ pub(crate) trait ConnectionHandler: Send {
         false
     }
 
-    /// Decrypt incoming raw bytes. Returns decrypted data and bytes consumed.
-    /// Default: passthrough (no encryption).
-    fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-        Some((data.to_vec(), data.len()))
-    }
-
-    /// Encrypt outgoing response bytes. Default: passthrough.
-    fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
-        data.to_vec()
-    }
-
-    /// Whether the connection is in encrypted mode.
-    fn is_encrypted(&self) -> bool {
-        false
-    }
-
     /// A signal that closes the connection (another sender took over).
     fn close_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
         None
     }
-
-    /// Called after a response is written. Activates pending encryption.
-    fn after_response(&mut self) {}
 }
 
 /// Async TCP server supporting IPv4 and IPv6. Equivalent to httpd_t.
@@ -361,130 +408,144 @@ async fn bind_listener(
         }
     }
 }
-/// Dispatch every complete request currently buffered and write its response.
-async fn send_completed_responses<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    handler: &mut dyn ConnectionHandler,
-    pending: &mut PendingRequest,
-) -> bool {
-    while pending.request.is_complete() {
-        let request = &mut pending.request;
-        let method = request.method().unwrap_or("?").to_string();
-        let url = request.url().unwrap_or("?").to_string();
-        tracing::debug!(%method, %url, body_len = request.data().map_or(0, <[u8]>::len), "RTSP request");
-        let response = handler.conn_request(request);
-        let status = response.status_code();
-        tracing::debug!(%method, %url, status, "RTSP response");
-        let response_encrypted = handler.is_encrypted();
-        let disconnect = response.get_disconnect();
-        let wire_out = if response_encrypted {
-            handler.encrypt_outgoing(response.get_data())
-        } else {
-            response.get_data().to_vec()
+/// One connection between reads: its handler (on the blocking pool while it answers), how its bytes are framed, and
+/// the request coming in.
+struct Connection {
+    handler: Option<Box<dyn ConnectionHandler>>,
+    framing: Framing,
+    pending: PendingRequest,
+}
+
+impl Connection {
+    fn new(handler: Box<dyn ConnectionHandler>) -> Self {
+        Connection {
+            handler: Some(handler),
+            framing: Framing::Plain,
+            pending: PendingRequest::default(),
+        }
+    }
+
+    fn handler(&self) -> &dyn ConnectionHandler {
+        self.handler
+            .as_deref()
+            .expect("the handler is back after each answer")
+    }
+
+    /// Bytes read, into the request coming in. False: the connection ends (a request refused on its headers is
+    /// answered 400 first).
+    async fn ingest<S: AsyncWrite + Unpin>(&mut self, stream: &mut S, data: &[u8]) -> bool {
+        let Some(plain) = self.framing.open(data) else {
+            return false;
         };
-        if wire_out.is_empty() {
-            tracing::warn!("Response encryption produced no output");
-            return false;
-        }
-        if stream.write_all(&wire_out).await.is_err() {
-            return false;
-        }
-        handler.after_response();
-        if disconnect {
-            let _ = stream.shutdown().await;
-            return false;
-        }
-        let leftover = request.take_leftover();
-        *pending = PendingRequest::default();
-        if !leftover.is_empty() && pending.add_data(handler, &leftover).is_err() {
-            write_bad_request_and_close(stream, Some(handler)).await;
-            return false;
-        }
+        tracing::trace!(n = plain.len(), "Read request data");
+        self.add_plain(stream, &plain).await
     }
-    true
-}
 
-async fn add_request_data<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    handler: &mut dyn ConnectionHandler,
-    pending: &mut PendingRequest,
-    data: &[u8],
-) -> bool {
-    if pending.add_data(handler, data).is_ok() {
-        tracing::trace!(
-            complete = pending.request.is_complete(),
-            headers_complete = pending.request.headers_complete(),
-            "Parsed request data"
-        );
-        return true;
+    async fn add_plain<S: AsyncWrite + Unpin>(&mut self, stream: &mut S, plain: &[u8]) -> bool {
+        if plain.is_empty() {
+            return true;
+        }
+        let handler = self
+            .handler
+            .as_deref()
+            .expect("the handler is back after each answer");
+        if self.pending.add_data(handler, plain).is_ok() {
+            return true;
+        }
+        tracing::warn!(data_len = plain.len(), "HTTP parse error");
+        let mut response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+        response.add_header("Connection", "close");
+        response.finish(None);
+        if let Some(wire) = self.framing.seal(response.get_data()) {
+            let _ = send(stream, &wire).await;
+        }
+        let _ = stream.shutdown().await;
+        false
     }
-    tracing::warn!(data_len = data.len(), "HTTP parse error");
-    write_bad_request_and_close(stream, Some(handler)).await;
-    false
-}
 
-async fn ingest_encrypted_data<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    handler: &mut dyn ConnectionHandler,
-    request: &mut PendingRequest,
-    raw_buf: &mut Vec<u8>,
-    data: &[u8],
-) -> bool {
-    if data.len() > MAX_ENCRYPTED_BUFFER_LEN.saturating_sub(raw_buf.len()) {
-        tracing::warn!("Encrypted buffer exceeded 1 MB, dropping connection");
-        return false;
+    /// Answer every complete request buffered, each on the blocking pool, and write the responses. False: the
+    /// connection ends.
+    async fn answer<S: AsyncWrite + Unpin>(&mut self, stream: &mut S) -> bool {
+        while self.pending.request.is_complete() {
+            let mut done = std::mem::take(&mut self.pending);
+            let leftover = done.request.take_leftover();
+            let method = done.request.method().unwrap_or("?").to_string();
+            let url = done.request.url().unwrap_or("?").to_string();
+            tracing::debug!(%method, %url, body_len = done.request.data().map_or(0, <[u8]>::len), "RTSP request");
+            let Some(mut handler) = self.handler.take() else {
+                return false;
+            };
+            let answered = tokio::task::spawn_blocking(move || {
+                let reply = handler.request(&done.request);
+                (handler, reply)
+            })
+            .await;
+            let Ok((handler, reply)) = answered else {
+                return false;
+            };
+            self.handler = Some(handler);
+            let response = reply.response;
+            tracing::debug!(%method, %url, status = response.status_code(), "RTSP response");
+            let Some(wire) = self.framing.seal(response.get_data()) else {
+                return false;
+            };
+            if !send(stream, &wire).await {
+                return false;
+            }
+            #[cfg(feature = "ap2-core")]
+            if let Some(channel) = reply.encrypt {
+                tracing::info!("Encrypted RTSP transport activated");
+                self.framing = Framing::Encrypted {
+                    channel: Box::new(channel),
+                    raw: Vec::new(),
+                };
+            }
+            if response.get_disconnect() {
+                let _ = stream.shutdown().await;
+                return false;
+            }
+            if !self.add_plain(stream, &leftover).await {
+                return false;
+            }
+        }
+        true
     }
-    raw_buf.extend_from_slice(data);
-    tracing::trace!(
-        raw_len = raw_buf.len(),
-        new_bytes = data.len(),
-        "Read encrypted data"
-    );
-    let Some((plain, consumed)) = handler.decrypt_incoming(raw_buf) else {
-        tracing::warn!(raw_len = raw_buf.len(), "Decryption failed");
-        return false;
-    };
-    if consumed > raw_buf.len() {
-        tracing::warn!(
-            consumed,
-            available = raw_buf.len(),
-            "Decryptor reported invalid byte count"
-        );
-        return false;
-    }
-    tracing::trace!(plain_len = plain.len(), consumed, "Decrypted request data");
-    raw_buf.drain(..consumed);
-    plain.is_empty() || add_request_data(stream, handler, request, &plain).await
 }
 
 /// Drive one accepted connection until the peer closes or processing fails.
 async fn process_connection<S>(
-    mut stream: S,
-    mut handler: Box<dyn ConnectionHandler>,
+    stream: S,
+    handler: Box<dyn ConnectionHandler>,
     remote: SocketAddr,
     slot: Arc<Slot>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; 4096];
-    let mut request = PendingRequest::default();
-    let mut raw_buf = Vec::new(); // accumulates encrypted data
+    run_connection(stream, Connection::new(handler), remote, slot).await;
+}
 
+async fn run_connection<S>(mut stream: S, mut conn: Connection, remote: SocketAddr, slot: Arc<Slot>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 4096];
     let mut last_activity = Instant::now();
     loop {
-        if !send_completed_responses(&mut stream, handler.as_mut(), &mut request).await {
+        if !conn.answer(&mut stream).await {
             break;
         }
+        let has_session = conn.handler().has_session();
         slot.session
-            .store(handler.has_session(), std::sync::atomic::Ordering::Relaxed);
+            .store(has_session, std::sync::atomic::Ordering::Relaxed);
         // the one deadline that applies now: a request's headers, its body, or quiet without a session
+        let request = &conn.pending;
         let deadline = match request.started {
             Some(t) if !request.request.headers_complete() => Some(t + HEADER_TIMEOUT),
             _ if request.body_deadline.is_some() => request.body_deadline,
-            None if !handler.has_session() => Some(last_activity + IDLE_WITHOUT_SESSION),
+            None if !has_session => Some(last_activity + IDLE_WITHOUT_SESSION),
             _ => None,
         };
-        let close = handler.close_signal();
+        let close = conn.handler().close_signal();
         let closed = async {
             match &close {
                 Some(c) => c.notified().await,
@@ -520,20 +581,7 @@ async fn process_connection<S>(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let accepted = if handler.is_encrypted() {
-            ingest_encrypted_data(
-                &mut stream,
-                handler.as_mut(),
-                &mut request,
-                &mut raw_buf,
-                &buf[..n],
-            )
-            .await
-        } else {
-            tracing::trace!(n, "Read plaintext data");
-            add_request_data(&mut stream, handler.as_mut(), &mut request, &buf[..n]).await
-        };
-        if !accepted {
+        if !conn.ingest(&mut stream, &buf[..n]).await {
             break;
         }
     }
@@ -609,12 +657,12 @@ mod tests {
         disconnect: bool,
     }
     impl ConnectionHandler for OkHandler {
-        fn conn_request(&mut self, _req: &HttpRequest) -> HttpResponse {
+        fn request(&mut self, _req: &HttpRequest) -> Reply {
             let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
             resp.add_header("CSeq", "1");
             resp.set_disconnect(self.disconnect);
             resp.finish(None);
-            resp
+            resp.into()
         }
     }
 
@@ -743,35 +791,84 @@ mod tests {
         task.await.unwrap();
     }
 
-    struct InvalidConsumptionHandler;
-
-    impl ConnectionHandler for InvalidConsumptionHandler {
-        fn conn_request(&mut self, _req: &HttpRequest) -> HttpResponse {
-            unreachable!("invalid encrypted input must not reach request dispatch")
-        }
-
-        fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-            Some((Vec::new(), data.len() + 1))
-        }
-
-        fn is_encrypted(&self) -> bool {
-            true
+    /// Answers after `delay` with `body`.
+    struct SlowHandler {
+        delay: Duration,
+        body: usize,
+    }
+    impl ConnectionHandler for SlowHandler {
+        fn request(&mut self, _req: &HttpRequest) -> Reply {
+            std::thread::sleep(self.delay);
+            let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+            resp.finish(Some(&vec![b'x'; self.body]));
+            resp.into()
         }
     }
 
+    /// A slow answer (RSA, SRP on a small CPU) doesn't hold the runtime's thread: another connection is answered
+    /// meanwhile, on the same current-thread runtime.
     #[tokio::test]
-    async fn rejects_invalid_decryptor_consumption_without_panicking() {
-        let (mut client, server) = tokio::io::duplex(4096);
+    async fn a_slow_answer_does_not_hold_up_other_connections() {
         let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let task = tokio::spawn(process_connection(
+        let (mut slow, server) = tokio::io::duplex(4096);
+        let slow_task = tokio::spawn(process_connection(
             server,
-            Box::new(InvalidConsumptionHandler),
+            Box::new(SlowHandler {
+                delay: Duration::from_millis(800),
+                body: 1,
+            }),
             remote,
             Arc::default(),
         ));
+        slow.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (mut quick, server) = tokio::io::duplex(4096);
+        let quick_task = tokio::spawn(process_connection(
+            server,
+            Box::new(OkHandler { disconnect: true }),
+            remote,
+            Arc::default(),
+        ));
+        let started = std::time::Instant::now();
+        quick
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut tmp = [0u8; 256];
+        assert!(quick.read(&mut tmp).await.unwrap() > 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "waited for the slow one: {:?}",
+            started.elapsed()
+        );
+        quick_task.await.unwrap();
+        assert!(slow.read(&mut tmp).await.unwrap() > 0);
+        drop(slow);
+        slow_task.await.unwrap();
+    }
 
-        client.write_all(b"encrypted").await.unwrap();
-        drop(client);
-        task.await.unwrap();
+    /// A peer that stops reading: the response's write gives up after WRITE_TIMEOUT and the connection ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_is_dropped() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(process_connection(
+            server,
+            Box::new(SlowHandler {
+                delay: Duration::ZERO,
+                body: 1 << 20,
+            }),
+            "127.0.0.1:5000".parse().unwrap(),
+            Arc::default(),
+        ));
+        client
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(WRITE_TIMEOUT + Duration::from_secs(1), task)
+            .await
+            .expect("still writing")
+            .unwrap();
     }
 }
