@@ -116,6 +116,33 @@ impl<T> Reorder<T> {
         std::mem::take(&mut self.requests)
     }
 
+    /// Whether a packet arriving now still has a place (it isn't played, given up or held already): one that hasn't
+    /// is counted as a late arrival, and isn't worth decrypting or decoding (a stream that decodes before ordering
+    /// asks first: in a catch-up after a stall most of what arrives is late, or a resend of what came meanwhile).
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
+    pub(crate) fn wants(&mut self, seq: u16, now: std::time::Instant) -> bool {
+        let Some(next) = self.next else {
+            return true;
+        };
+        let ext = nearest(next, seq);
+        if ext >= next && !self.held.contains_key(&ext) {
+            return true;
+        }
+        self.arrived(now);
+        self.stats.late += 1;
+        false
+    }
+
+    fn arrived(&mut self, now: std::time::Instant) {
+        self.stats.packets += 1;
+        if let Some(t) = self.last_arrival.replace(now) {
+            self.stats.gap_max_us = self
+                .stats
+                .gap_max_us
+                .max(now.duration_since(t).as_micros() as u64);
+        }
+    }
+
     /// An arriving packet; whatever can be played now (with the silence before it) goes to `out`. False when it
     /// came too late (its place was played) or twice: not taken.
     pub(crate) fn push(
@@ -125,16 +152,9 @@ impl<T> Reorder<T> {
         now: std::time::Instant,
         out: &mut Vec<(u32, T)>,
     ) -> bool {
-        self.stats.packets += 1;
-        if let Some(t) = self.last_arrival.replace(now) {
-            self.stats.gap_max_us = self
-                .stats
-                .gap_max_us
-                .max(now.duration_since(t).as_micros() as u64);
-        }
+        self.arrived(now);
         let next = *self.next.get_or_insert(seq as u64 + 0x10000);
-        // the extended number nearest to `next`
-        let ext = (next as i64 + (seq.wrapping_sub(next as u16) as i16) as i64) as u64;
+        let ext = nearest(next, seq);
         if ext < next || self.held.contains_key(&ext) {
             self.stats.late += 1;
             return false;
@@ -313,6 +333,11 @@ impl<T> Reorder<T> {
             self.skip_to(first, out);
         }
     }
+}
+
+/// The extended sequence number of `seq` nearest to `next`.
+fn nearest(next: u64, seq: u16) -> u64 {
+    (next as i64 + (seq.wrapping_sub(next as u16) as i16) as i64) as u64
 }
 
 #[cfg(test)]
@@ -508,6 +533,18 @@ mod tests {
             due(t + Duration::from_millis(30)),
         );
         assert_eq!(seqs(&out), vec![(0, 0), (2, 3)]);
+    }
+
+    /// What was played, given up or is held has no place any more: not wanted, counted late.
+    #[test]
+    fn only_packets_with_a_place_are_wanted() {
+        let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
+        assert!(r.wants(5, t), "nothing seen yet");
+        r.push(5, vec![5], t, &mut out);
+        r.push(7, vec![7], t, &mut out); // 6 missing, 7 held
+        assert!(!r.wants(5, t) && !r.wants(7, t));
+        assert!(r.wants(6, t) && r.wants(8, t));
+        assert_eq!((r.stats.packets, r.stats.late), (4, 2));
     }
 
     /// A run of missing packets is asked for again in one request, and no more than `MAX_ASKS` times.

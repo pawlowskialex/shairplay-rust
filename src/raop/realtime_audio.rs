@@ -138,6 +138,8 @@ async fn run(
     // 10 s.
     let mut reorder: Reorder<Unit> = Reorder::new(ctrl.is_some(), MAX_HELD);
     let mut gaps_wait = false;
+    // sequence numbers in the decoder (a resend of one of them isn't decoded twice)
+    let mut decoding = std::collections::HashSet::<u16>::new();
     // The network timeline, from the sender's sync packets (0xd7 on the control port): an RTP time and the network
     // time (its PTP clock) it plays at. Packets go out with their play time once the clock is followed; until then,
     // as they arrive.
@@ -257,7 +259,11 @@ async fn run(
                 output.get_or_insert_with(|| Output::new(handler.as_ref(), source, &config.output));
                 let seq = u16::from_be_bytes([packet[2], packet[3]]);
                 let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-                decoder.push(u32::from(seq), ts, 0, packet);
+                // only what still has a place is decrypted and decoded
+                if !decoding.contains(&seq) && reorder.wants(seq, now) {
+                    decoding.insert(seq);
+                    decoder.push(u32::from(seq), ts, 0, packet);
+                }
             } else {
                 forged += 1;
                 if forged.is_power_of_two() {
@@ -269,6 +275,7 @@ async fn run(
         // until shortly before the first missing packet plays (the one held behind it, less the missing ones).
         let play_at = |ts: u32| anchor.and_then(|a| a.timeline().play_at(ts, rate, offset_ns));
         while let Some(unit) = decoder.pop() {
+            decoding.remove(&(unit.seq as u16));
             if !gaps_wait && play_at(unit.ts).is_some() {
                 gaps_wait = true;
                 reorder.wait(MAX_WAIT, rate / (frames as u32).max(1));
