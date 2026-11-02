@@ -806,8 +806,13 @@ fn pairing_store_identity_methods_default_and_roundtrip() {
         fn get(&self, _: &str) -> Option<[u8; 32]> {
             None
         }
-        fn put(&self, _: &str, _: [u8; 32]) {}
+        fn put(&self, _: &str, _: [u8; 32], _: bool) -> bool {
+            true
+        }
         fn remove(&self, _: &str) {}
+        fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+            Vec::new()
+        }
         fn load_identity(&self) -> Option<[u8; 32]> {
             *self.0.lock().unwrap()
         }
@@ -844,8 +849,13 @@ fn server_build_generates_and_persists_random_identity() {
         fn get(&self, _: &str) -> Option<[u8; 32]> {
             None
         }
-        fn put(&self, _: &str, _: [u8; 32]) {}
+        fn put(&self, _: &str, _: [u8; 32], _: bool) -> bool {
+            true
+        }
         fn remove(&self, _: &str) {}
+        fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+            Vec::new()
+        }
         fn load_identity(&self) -> Option<[u8; 32]> {
             None
         }

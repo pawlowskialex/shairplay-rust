@@ -170,43 +170,27 @@ pub trait AudioHandler: Send + Sync + 'static {
 /// on connect and fail because the server has no cached keys.
 #[cfg(feature = "ap2-core")]
 pub trait PairingStore: Send + Sync + 'static {
-    /// Look up a paired device's Ed25519 public key by device ID.
+    /// A paired controller's Ed25519 public key, by its identifier.
     fn get(&self, device_id: &str) -> Option<[u8; 32]>;
-    /// Save a paired device's Ed25519 public key.
-    fn put(&self, device_id: &str, public_key: [u8; 32]);
-    /// Remove a paired device.
+    /// Save a controller with its permission (HAP: one paired by pair-setup is an admin; one an admin adds through
+    /// `/pairings` may not be). `false`: the store has no room (pair-setup and `/pairings` answer MaxPeers).
+    fn put(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool;
+    /// Remove a controller.
     fn remove(&self, device_id: &str);
+    /// Every controller: (identifier, public key, admin), for `/pairings`' ListPairings.
+    fn list(&self) -> Vec<(String, [u8; 32], bool)>;
 
-    /// Returns `true` once at least one controller is paired.
-    ///
-    /// Used to advertise `OneTimePairingRequired` (statusFlags bit 9) only until
-    /// the first successful pairing, so already-paired controllers reconnect via
-    /// pair-verify instead of being nudged back into setup. The default returns
-    /// `false` (always advertise setup-required when a PIN is configured); the
-    /// built-in [`MemoryPairingStore`] overrides it, and persistent stores should
-    /// too.
+    /// Whether any controller is paired: the status flags advertise `OneTimePairingRequired` (bit 9) only until
+    /// then, so paired controllers reconnect with pair-verify. By default from [`list`](Self::list).
     fn has_any_pairing(&self) -> bool {
-        false
+        !self.list().is_empty()
     }
 
-    /// Save a controller with its permission (HAP: a controller paired by pair-setup is an admin; one added by an
-    /// admin through `/pairings` may not be). `false`: the store has no room (`/pairings` answers MaxPeers). The
-    /// default ignores the permission and always has room.
-    fn put_controller(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
-        let _ = admin;
-        self.put(device_id, public_key);
-        true
-    }
-
-    /// Whether a paired controller may manage pairings. The default: every paired controller is an admin.
+    /// Whether a controller may manage pairings. By default from [`list`](Self::list).
     fn is_admin(&self, device_id: &str) -> bool {
-        self.get(device_id).is_some()
-    }
-
-    /// Every paired controller: (identifier, public key, admin), for `/pairings`' ListPairings. The default lists
-    /// none (listing then answers with no controllers).
-    fn list(&self) -> Vec<(String, [u8; 32], bool)> {
-        Vec::new()
+        self.list()
+            .iter()
+            .any(|(id, _, admin)| id == device_id && *admin)
     }
 
     /// Load the accessory's persistent Ed25519 **identity** seed, if one was saved.
@@ -243,10 +227,7 @@ impl PairingStore for MemoryPairingStore {
     fn get(&self, device_id: &str) -> Option<[u8; 32]> {
         self.keys.lock().ok()?.get(device_id).map(|k| k.0)
     }
-    fn put(&self, device_id: &str, public_key: [u8; 32]) {
-        self.put_controller(device_id, public_key, true);
-    }
-    fn put_controller(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
+    fn put(&self, device_id: &str, public_key: [u8; 32], admin: bool) -> bool {
         if let Ok(mut keys) = self.keys.lock() {
             keys.insert(device_id.to_string(), (public_key, admin));
         }
