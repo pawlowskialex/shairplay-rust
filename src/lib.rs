@@ -65,6 +65,44 @@ mod proto;
 mod raop;
 pub(crate) mod util;
 
+/// Entry points for the fuzz targets (`fuzz/`): the parsers that take a sender's bytes, each as the server calls it.
+/// Not a stable API; only with the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::proto::http::HttpRequest;
+
+    /// An SDP body (AirPlay 1's ANNOUNCE) and what the server reads of it.
+    pub fn sdp(text: &str) {
+        let sdp = crate::proto::sdp::Sdp::parse(text);
+        let _ = (sdp.connection(), sdp.rtpmap(), sdp.fmtp());
+        let _ = (sdp.rsaaeskey(), sdp.fpaeskey(), sdp.aesiv());
+    }
+
+    /// DMAP metadata (AirPlay 1's SET_PARAMETER).
+    pub fn dmap(data: &[u8]) {
+        let _ = crate::proto::dmap::TrackMetadata::from_dmap(data);
+    }
+
+    /// A pairing message's TLV8.
+    #[cfg(feature = "ap2-core")]
+    pub fn tlv(data: &[u8]) {
+        let _ = crate::crypto::tlv::TlvValues::decode(data);
+    }
+
+    /// An AirPlay 1 stream from its SDP `rtpmap` and `fmtp`, and a packet of it decoded as the library does.
+    pub fn rtp(rtpmap: &str, fmtp: &str, packet: &[u8]) {
+        use crate::codec::Decode;
+        if let Some(format) = crate::raop::rtp::Ap1Format::parse(rtpmap, fmtp) {
+            let mut decode = crate::raop::pipeline::RtpDecode {
+                cipher: crate::raop::pipeline::RtpCipher::None,
+                codec: format.codec(),
+            };
+            let _ = decode.decode(packet);
+        }
+    }
+}
+
 pub use error::ShairplayError;
 pub use net::mdns::AirPlayServiceInfo;
 pub use net::server::BindConfig;

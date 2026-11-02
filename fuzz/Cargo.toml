@@ -2,7 +2,7 @@
 name = "shairplay-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -14,6 +14,7 @@ plist = "1"
 
 [dependencies.shairplay]
 path = ".."
+features = ["fuzzing", "ap2"]
 
 [workspace]
 members = ["."]
@@ -36,4 +37,14 @@ doc = false
 [[bin]]
 name = "fuzz_rtp"
 path = "fuzz_targets/fuzz_rtp.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_dmap"
+path = "fuzz_targets/fuzz_dmap.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tlv"
+path = "fuzz_targets/fuzz_tlv.rs"
 doc = false

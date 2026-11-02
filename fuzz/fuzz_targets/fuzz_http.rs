@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use shairplay::proto::http::HttpRequest;
+use shairplay::fuzzing::HttpRequest;
 
 fuzz_target!(|data: &[u8]| {
     let mut whole = HttpRequest::new();
