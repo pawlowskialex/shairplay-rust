@@ -52,6 +52,21 @@ jobs:
           tool: cargo-deny
       - run: cargo deny check
 
+  test-32bit:
+    name: Tests (32-bit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show && rustup target add i686-unknown-linux-gnu armv5te-unknown-linux-gnueabi
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the 32-bit C runtime
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      # a 32-bit usize: length arithmetic that wraps there, and every u32/usize conversion
+      - run: cargo test --target i686-unknown-linux-gnu --locked --lib --tests --all-features
+      - run: cargo test --target i686-unknown-linux-gnu --locked --lib --tests --no-default-features --features ap2-core,ptp-timestamps
+      # ARMv5: no 64-bit atomics
+      - run: cargo check --target armv5te-unknown-linux-gnueabi --locked --lib --all-features
+
   test:
     name: Tests (${{ matrix.name }})
     strategy:
