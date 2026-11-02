@@ -38,6 +38,9 @@ pub(crate) struct OutputConfig {
     pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
     /// The receiver latency the sender asks for (SETUP `latencyMin`, frames), if it does.
     pub(crate) latency_min: Option<u32>,
+    /// The sender: datagrams from other hosts are dropped (sync packets aren't authenticated, and audio packets
+    /// would go through the reorder stage before their tag is checked). None: any (tests).
+    pub(crate) peer: Option<std::net::IpAddr>,
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -256,14 +259,22 @@ pub(crate) async fn run(
     loop {
         // Look again shortly while packets are out on the offload or held behind a gap, even if nothing arrives.
         let waiting = offload.as_ref().is_some_and(|o| o.in_flight() > 0) || reorder.holding();
+        // another host's datagram counts as empty: ignored
+        let from_peer = |(n, from): (usize, std::net::SocketAddr)| {
+            if output_config.peer.is_none_or(|p| p == from.ip()) {
+                n
+            } else {
+                0
+            }
+        };
         let received = tokio::select! {
-            r = socket.recv(&mut buf) => Some(r.map(|n| (n, false))),
+            r = socket.recv_from(&mut buf) => Some(r.map(|r| (from_peer(r), false))),
             r = async {
                 match &ctrl {
-                    Some(c) => c.socket.recv(&mut cbuf).await,
+                    Some(c) => c.socket.recv_from(&mut cbuf).await,
                     None => std::future::pending().await,
                 }
-            } => Some(r.map(|n| (n, true))),
+            } => Some(r.map(|r| (from_peer(r), true))),
             _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
             c = commands.recv() => {
                 // the connection is gone (its end of the channel with it): so is the stream
@@ -525,6 +536,7 @@ mod tests {
             format: crate::raop::SampleFormat::F32,
             offload: None,
             latency_min: None,
+            peer: None,
         });
 
         assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);
@@ -564,6 +576,7 @@ mod tests {
             format: crate::raop::SampleFormat::S16,
             offload: None,
             latency_min: None,
+            peer: None,
         };
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(run(socket, None, [0; 32], Arc::new(NoAudio), config, rx));

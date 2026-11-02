@@ -305,6 +305,7 @@ impl RaopRtp {
                 (None, Some(csock))
             };
 
+            let peer = self.remote_socket.ip();
             tokio::spawn(async move {
                 let _unread = _unread;
                 let mut shutdown_rx = shutdown_rx;
@@ -331,8 +332,9 @@ impl RaopRtp {
                     let received = tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(5)), if waiting => None,
                         // Data channel: audio RTP packets.
+                        // only the sender's: anyone's packets went into the reorder stage and the buffer
                         result = dsock.recv_from(&mut data_packet) => match result {
-                            Ok((len, _)) if len >= 12 => Some(&data_packet[..len]),
+                            Ok((len, from)) if len >= 12 && from.ip() == peer => Some(&data_packet[..len]),
                             _ => None,
                         },
                         // Control channel: resent packets; sync packets aren't used.
@@ -342,8 +344,10 @@ impl RaopRtp {
                                 None => std::future::pending().await,
                             }
                         } => match result {
-                            Ok((len, _)) => resent_packet(&ctrl_packet[..len]).filter(|p| p.len() >= 12),
-                            Err(_) => None,
+                            Ok((len, from)) if from.ip() == peer => {
+                                resent_packet(&ctrl_packet[..len]).filter(|p| p.len() >= 12)
+                            }
+                            _ => None,
                         },
                         _ = shutdown_rx.changed() => break,
                     };
