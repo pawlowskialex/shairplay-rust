@@ -9,12 +9,14 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 #[derive(Clone, Copy)]
 pub enum TlvType {
     Method = 0,
+    Identifier = 1,
     Salt = 2,
     PublicKey = 3,
     Proof = 4,
     EncryptedData = 5,
     Error = 7,
     State = 6,
+    Signature = 10,
     Flags = 19,
 }
 
