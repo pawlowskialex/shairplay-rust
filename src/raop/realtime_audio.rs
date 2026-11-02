@@ -274,7 +274,17 @@ async fn run(
             {
                 timed_logged = true;
                 let lead_ms = (at as i64 - crate::util::now_ns() as i64) / 1_000_000;
-                info!(ts, lead_ms, "Realtime playout on the network timeline");
+                // a gap may wait for its packet until shortly before it plays
+                let wait = std::time::Duration::from_millis(lead_ms.max(0) as u64)
+                    .saturating_sub(PLAY_MARGIN)
+                    .min(MAX_WAIT);
+                reorder.wait(wait, rate / (frames as u32).max(1));
+                info!(
+                    ts,
+                    lead_ms,
+                    wait_ms = wait.as_millis() as u64,
+                    "Realtime playout on the network timeline"
+                );
             }
             let seq = u16::from_be_bytes([packet[2], packet[3]]);
             decoder.push(u32::from(seq), ts, *fill, packet);
@@ -356,8 +366,13 @@ fn realtime_offset_ns(latency_min: Option<u32>, rate: u32) -> i64 {
 const DEFAULT_LATENCY_FRAMES: u32 = 11025;
 /// A `latencyMin` beyond this (2 s at 44.1 kHz) is taken for a mistake.
 const MAX_LATENCY_FRAMES: u32 = 88200;
-/// Packets held behind a gap at most.
+/// Packets held behind a gap at most (before the stream is on the network timeline).
 const MAX_HELD: usize = 48;
+/// On the network timeline, a gap waits for its packet until this long before it plays: room for what is held
+/// behind it to be decoded (on the ARM if the coprocessor is full) and reach the output in time.
+const PLAY_MARGIN: std::time::Duration = std::time::Duration::from_millis(750);
+/// ... and at most this long (a Mac sends realtime audio about 2 s ahead).
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {
