@@ -7,6 +7,7 @@
 use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::raop::handlers_ap1::{self as handlers, RaopConnection};
+use crate::raop::sessions::Stream;
 
 /// HTTP Digest authentication realm advertised and validated for RTSP auth.
 const DIGEST_REALM: &str = "airplay";
@@ -139,8 +140,7 @@ fn pipewire_auth_setup_route(
     if !conn.shared.pipewire_auth_setup_compat {
         return None;
     }
-    #[cfg(feature = "ap2-core")]
-    if conn.is_ap2 {
+    if conn.paired() {
         return None;
     }
     (request.method() == Some(PIPEWIRE_AUTH_SETUP_ROUTE.method)
@@ -385,7 +385,8 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     // with it waits for pair-verify. Without this a plaintext SETUP (its own stream key) or an AirPlay 1 ANNOUNCE
     // played on a receiver with a PIN.
     #[cfg(feature = "ap2-core")]
-    if conn.shared.pin.is_some() && conn.controller.is_none() && !open_before_pairing(method, url) {
+    if conn.shared.pin.is_some() && conn.controller().is_none() && !open_before_pairing(method, url)
+    {
         tracing::info!(
             method,
             url,
@@ -500,7 +501,7 @@ fn resolve_setup(conn: &RaopConnection, request: &HttpRequest) -> Option<Handler
             .data()
             .map(|d| d.starts_with(b"bplist"))
             .unwrap_or(false);
-        if conn.is_ap2 || is_plist {
+        if conn.paired() || is_plist {
             return Some(handlers_ap2::handle_setup);
         }
     }
@@ -511,38 +512,40 @@ fn resolve_setup(conn: &RaopConnection, request: &HttpRequest) -> Option<Handler
 /// RECORD routing: AP2 has its own handler.
 fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     #[cfg(feature = "ap2-core")]
-    if conn.is_ap2 {
+    if conn.paired() {
         return Some(handlers_ap2::handle_record);
     }
     let _ = conn;
     Some(handlers::handle_record)
 }
 
-/// FLUSH: parse RTP-Info header and flush the buffer inline.
+/// FLUSH: RTP-Info `seq=N;rtptime=T`, to the stream the connection plays. AirPlay 1 flushes to the sequence number;
+/// AirPlay 2 realtime drops what is before the RTP time (a Mac's: 0.3 s after each stream's SETUP, at its first
+/// frame).
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
-    // AirPlay 2 realtime: RTP-Info `seq=N;rtptime=T` (a Mac's: 0.3 s after each stream's SETUP, at its first frame)
-    #[cfg(feature = "ap2-core")]
-    if let Some(tx) = &conn.realtime_cmd {
-        let before = request.header("RTP-Info").and_then(|i| {
-            i.split(';')
-                .find_map(|p| p.trim().strip_prefix("rtptime="))
-                .and_then(|t| t.parse::<u32>().ok())
-        });
-        let _ = tx.send(crate::raop::realtime_audio::RealtimeCommand::Flush { before });
-        return;
-    }
-    if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
-        && let Some(rtp) = &conn.raop_rtp
-    {
-        rtp.flush(next_seq);
-    }
+    let info = request.header("RTP-Info").unwrap_or("");
+    let field = |name: &str| {
+        info.split(';')
+            .find_map(|p| p.trim().strip_prefix(name))
+            .map(str::to_owned)
+    };
+    conn.shared.sessions.with(conn.id, |stream| match stream {
+        Stream::Ap1(rtp) => {
+            if let Some(seq) = field("seq=").and_then(|s| s.parse::<i32>().ok()) {
+                rtp.flush(seq);
+            }
+        }
+        #[cfg(feature = "ap2-core")]
+        Stream::Realtime(r) => r.flush(field("rtptime=").and_then(|t| t.parse::<u32>().ok())),
+        #[cfg(feature = "ap2-core")]
+        Stream::Buffered(_) => {}
+    });
 }
 
-/// TEARDOWN: stop RTP, stop buffered audio, close connection. An AirPlay 2 TEARDOWN whose plist lists `streams`
-/// removes only those streams (iOS sends it when a realtime stream is paused, and SETs UP a new one on resume): the
-/// audio stops, the session and its connection stay (closing it made the sender drop the speaker).
+/// TEARDOWN: the connection's stream stops, and the connection closes. An AirPlay 2 TEARDOWN whose plist lists
+/// `streams` removes only those streams (iOS sends it when a realtime stream is paused, and SETs UP a new one on
+/// resume): the audio stops, the session and its connection stay (closing it made the sender drop the speaker). A
+/// TEARDOWN stops only its own connection's stream, not whoever plays.
 fn handle_teardown(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
@@ -556,20 +559,11 @@ fn handle_teardown(
     #[cfg(not(feature = "ap2-core"))]
     let streams_only = false;
     tracing::info!(streams_only, "TEARDOWN");
-    if streams_only {
-        // this connection's stream only: a TEARDOWN from another connection doesn't stop who plays
-        #[cfg(feature = "ap2-core")]
-        conn.shared.stop_audio_of(conn.id);
-    } else {
+    if !streams_only {
         response.add_header("Connection", "close");
         response.set_disconnect(true);
     }
-    if let Some(mut rtp) = conn.raop_rtp.take() {
-        rtp.stop();
-    }
-    #[cfg(feature = "ap2-core")]
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
-    }
+    conn.announced = None;
+    conn.shared.sessions.stop(conn.id);
     Ok(None)
 }

@@ -52,6 +52,7 @@ md-5 = "0.10"
 hmac = "0.12"
 rand = "0.8"
 subtle = "2" # constant-time comparison of authenticators/proofs
+zeroize = "1" # pairing secrets wiped when they go
 
 # Encoding / parsing
 base64 = "0.22"

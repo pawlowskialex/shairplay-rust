@@ -13,59 +13,89 @@ use crate::raop::rtsp::{Handled, RtspError, bad};
 #[cfg(feature = "ap2-core")]
 use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 
-/// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
+/// Who the sender has shown itself to be on this connection (AirPlay 2's pairings).
+#[cfg(feature = "ap2-core")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Peer {
+    /// Not paired: AirPlay 1, or AirPlay 2 before its pairing
+    Plain,
+    /// Paired for this connection only (transient pair-setup)
+    Transient,
+    /// Verified as the paired controller with this identifier (pair-verify)
+    Controller(String),
+}
+
+/// The pairing under way on this connection: its state between two messages, gone (and wiped) when it ends.
+#[cfg(feature = "ap2-core")]
+pub(crate) enum PairingStep {
+    None,
+    /// pair-setup after M1 (M3 next), or after a normal M3 (M5 next)
+    Setup(Box<SrpServer>),
+    /// pair-verify after M1 (M3 next)
+    Verify(Box<PairVerifyServer>),
+}
+
+/// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t. What the connection plays is in the
+/// server's sessions ([`RaopShared::sessions`](crate::raop::connection::RaopShared)), under `id`.
 pub(crate) struct RaopConnection {
-    pub(crate) raop_rtp: Option<RaopRtp>,
-    pub(crate) fairplay: FairPlay,
-    pub(crate) pairing: PairingSession,
-    pub(crate) local_addr: Vec<u8>,
-    pub(crate) remote_socket: std::net::SocketAddr,
-    /// This connection started a session (`AudioHandler::on_session_setup`): its end is the session's end.
-    pub(crate) session: bool,
-    /// This connection's number, its close signal, and who the sender is (AP2: the SETUP's `deviceID`, else its
-    /// address): a stream from another sender closes the connection that has the current one
-    /// (`RaopShared::claim_stream`).
+    /// Cheap shared handle to server-wide config (identity, keys, handler, settings) and the sessions.
+    pub(crate) shared: Arc<crate::raop::connection::RaopShared>,
+    /// This connection's number in the sessions, and its close signal
     pub(crate) id: u64,
     pub(crate) close: std::sync::Arc<tokio::sync::Notify>,
-    pub(crate) sender_id: String,
-    /// The paired controller pair-verify verified on this connection (none: transient or unverified)
-    #[cfg(feature = "ap2-core")]
-    pub(crate) controller: Option<String>,
+    pub(crate) local_addr: Vec<u8>,
+    pub(crate) remote_socket: std::net::SocketAddr,
     pub(crate) nonce: String,
     /// Apple-Challenges signed on this connection (each an RSA-2048 private-key operation)
     pub(crate) challenges: u8,
-    /// Cheap shared handle to server-wide config (identity, keys, handler, settings).
-    /// Replaces the ~17 fields that were previously deep-copied into every connection.
-    pub(crate) shared: Arc<crate::raop::connection::RaopShared>,
-    // AirPlay 2 state
+    /// This connection started a session (`AudioHandler::on_session_setup`): its end is the session's end.
+    pub(crate) session: bool,
+    /// AirPlay 1: the stream ANNOUNCE described, until SETUP starts it
+    pub(crate) announced: Option<RaopRtp>,
+    pub(crate) fairplay: FairPlay,
+    /// AirPlay 1's pair-verify
+    pub(crate) pairing: PairingSession,
     #[cfg(feature = "ap2-core")]
-    pub(crate) srp_server: Option<SrpServer>,
+    pub(crate) peer: Peer,
     #[cfg(feature = "ap2-core")]
-    pub(crate) pair_verify: Option<PairVerifyServer>,
+    pub(crate) pairing_step: PairingStep,
+    /// The secret the pairing left: it keys the encrypted RTSP and event channels
     #[cfg(feature = "ap2-core")]
-    pub(crate) ap2_shared_secret: Option<Vec<u8>>,
-    /// X25519 shared secret from pair-verify (32 bytes). Used for video key derivation.
-    #[cfg(feature = "ap2-core")]
-    pub(crate) pair_verify_secret: Option<[u8; 32]>,
-    #[cfg(feature = "ap2-core")]
-    pub(crate) is_ap2: bool,
-    #[cfg(feature = "ap2-core")]
-    pub(crate) playout_cmd:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::raop::buffered_audio::PlayoutCommand>>,
-    #[cfg(feature = "ap2-core")]
-    pub(crate) event_sender: Option<crate::raop::event_channel::EventSender>,
+    pub(crate) secret: Option<zeroize::Zeroizing<Vec<u8>>>,
+    /// pair-verify's X25519 secret (from M1 on: video keys need it even when M3 never comes)
+    #[cfg(feature = "video")]
+    pub(crate) ecdh: Option<zeroize::Zeroizing<[u8; 32]>>,
     /// What the sender says it takes (`updateMRSupportedCommands`), shared with the session's remote control.
     #[cfg(feature = "ap2-core")]
     pub(crate) mr_supported: std::sync::Arc<crate::raop::SupportedCommands>,
+    /// Tasks that end with the connection: the event channel, a data channel's wait
     #[cfg(feature = "ap2-core")]
-    pub(crate) realtime_cmd:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::raop::realtime_audio::RealtimeCommand>>,
+    pub(crate) tasks: Vec<crate::util::OwnedTask>,
     #[cfg(feature = "video")]
     pub(crate) ekey: Option<[u8; 16]>,
     #[cfg(feature = "video")]
     pub(crate) eiv: Option<[u8; 16]>,
     #[cfg(feature = "hls")]
     pub(crate) hls_state: std::sync::Arc<std::sync::Mutex<crate::raop::hls::HlsState>>,
+}
+
+impl RaopConnection {
+    /// Paired (AirPlay 2): transient, or a verified controller.
+    pub(crate) fn paired(&self) -> bool {
+        #[cfg(feature = "ap2-core")]
+        return self.peer != Peer::Plain;
+        #[cfg(not(feature = "ap2-core"))]
+        false
+    }
+
+    /// The paired controller this connection was verified as.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn controller(&self) -> Option<&str> {
+        match &self.peer {
+            Peer::Controller(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// Returns the connection's local IP address.
@@ -275,10 +305,7 @@ pub(crate) fn handle_announce(
         None => None,
     };
 
-    // Destroy existing RTP session if any
-    conn.raop_rtp = None;
-
-    conn.raop_rtp = RaopRtp::new(
+    conn.announced = RaopRtp::new(
         conn.shared.handler.clone(),
         crate::raop::rtp::RtpConfig {
             remote: remote.to_string(),
@@ -293,7 +320,7 @@ pub(crate) fn handle_announce(
         },
     );
 
-    if conn.raop_rtp.is_none() {
+    if conn.announced.is_none() {
         let fmtp = fmtp.unwrap_or("<missing>");
         return Err(
             RtspError::unsupported(format!("ANNOUNCE: rtpmap {rtpmap} fmtp {fmtp}"))
@@ -343,14 +370,15 @@ pub(crate) fn handle_setup(
         }
     }
 
-    let Some(rtp) = &mut conn.raop_rtp else {
+    let Some(mut rtp) = conn.announced.take() else {
         return Err(RtspError::not_now("AP1 SETUP before ANNOUNCE").closing());
     };
-    conn.shared
-        .claim_stream(conn.id, &conn.sender_id, &conn.close);
     let (cport, tport, dport) = rtp
         .start(use_udp, remote_cport, remote_tport)
         .map_err(|e| RtspError::internal("AP1 SETUP: the RTP ports").report(e))?;
+    conn.shared
+        .sessions
+        .play(conn.id, crate::raop::sessions::Stream::Ap1(rtp));
 
     let transport_resp = if use_udp {
         format!(
@@ -489,12 +517,11 @@ mod tests {
             audio_buffer_size: 0x10_0000,
             offload: None,
             identity: crate::raop::DeviceIdentity::default(),
-            stream_owner: Mutex::new(None),
-            verified: Mutex::new(Vec::new()),
+            sessions: Default::default(),
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {
-            raop_rtp: None,
+            announced: None,
             fairplay: FairPlay::new(),
             pairing,
             local_addr: vec![127, 0, 0, 1],
@@ -505,7 +532,6 @@ mod tests {
             shared,
             id: 0,
             close: Arc::new(tokio::sync::Notify::new()),
-            sender_id: String::new(),
         }
     }
 

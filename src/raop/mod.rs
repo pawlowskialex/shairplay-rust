@@ -25,6 +25,7 @@ pub(crate) mod realtime_audio;
 pub(crate) mod reorder;
 pub(crate) mod rtp;
 mod rtsp;
+pub(crate) mod sessions;
 #[cfg(feature = "video")]
 pub mod video;
 #[cfg(feature = "video")]

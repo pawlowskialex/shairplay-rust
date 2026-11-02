@@ -112,6 +112,25 @@ pub(crate) struct SrpServer {
     verified: bool,
 }
 
+/// `n`'s digits overwritten with zeros where they are (num-bigint keeps the allocation when the value shrinks).
+fn wipe(n: &mut BigUint) {
+    let digits = n.iter_u32_digits().len();
+    n.assign_from_slice(&vec![0; digits]);
+}
+
+impl Drop for SrpServer {
+    /// The secrets go with the pairing: b, the verifier (and its table), the session key.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        wipe(&mut self.b);
+        wipe(&mut self.v);
+        for w in &mut self.v_table {
+            w.zeroize();
+        }
+        self.session_key.zeroize();
+    }
+}
+
 impl SrpServer {
     /// Create a new SRP server for the given PIN.
     ///
@@ -750,6 +769,15 @@ pub(crate) struct PairVerifyServer {
     controller: Option<String>,
 }
 
+impl Drop for PairVerifyServer {
+    /// The ephemeral key and the shared secret go with the pairing (the signing key wipes itself).
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.server_eph_sk.zeroize();
+        self.shared_secret.zeroize();
+    }
+}
+
 impl PairVerifyServer {
     /// Create a new pair-verify server for the given device ID.
     ///
@@ -916,6 +944,7 @@ impl PairVerifyServer {
     /// Exposed before M3 completes specifically for AP2 *video* key derivation,
     /// where it is hashed together with a FairPlay key. It is not authenticated on
     /// its own — never use it directly as a confidential key.
+    #[cfg(feature = "video")]
     pub(crate) fn ecdh_shared_secret(&self) -> &[u8; 32] {
         &self.shared_secret
     }

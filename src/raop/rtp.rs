@@ -109,8 +109,8 @@ pub(crate) struct RtpEncryption {
 /// Created when the iPhone sends the SDP ANNOUNCE. Started during RTSP SETUP,
 /// which binds ports and spawns the receive task.
 ///
-/// Dropped when the RTSP connection closes, which sends a shutdown signal
-/// to the receive task via the [`watch`] channel.
+/// Dropped when it stops (TEARDOWN, another stream, the connection's end): the [`watch`] channel's sender goes, and
+/// with it the receive task and the NTP responder.
 pub(crate) struct RaopRtp {
     handler: Arc<dyn AudioHandler>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
@@ -487,13 +487,5 @@ impl RaopRtp {
         tokio::spawn(async move {
             state.lock().await.flush = next_seq;
         });
-    }
-
-    /// Stop the receive task and flush the buffer.
-    pub(crate) fn stop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
-        }
-        self.flush(-1);
     }
 }

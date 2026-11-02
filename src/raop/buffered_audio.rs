@@ -231,14 +231,66 @@ pub(crate) struct BufferedAudioProcessor {
     pub(crate) peer: std::net::IpAddr,
 }
 
+/// A running buffered stream: what the connection tells it (SETRATEANCHORTIME, FLUSHBUFFERED). When it goes, the
+/// stream stops: the receiver ends, the delivery thread with the command task.
+pub(crate) struct BufferedStream {
+    commands: tokio::sync::mpsc::UnboundedSender<PlayoutCommand>,
+    receiver: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BufferedStream {
+    pub(crate) fn command(&self, command: PlayoutCommand) {
+        let _ = self.commands.send(command);
+    }
+
+    /// A stream with no tasks, and what it was told: for tests.
+    #[cfg(test)]
+    pub(crate) fn probe() -> (Self, Probe) {
+        let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            BufferedStream {
+                commands,
+                receiver: None,
+            },
+            Probe(rx),
+        )
+    }
+}
+
+impl Drop for BufferedStream {
+    fn drop(&mut self) {
+        let _ = self.commands.send(PlayoutCommand::Stop);
+        if let Some(r) = self.receiver.take() {
+            r.abort();
+        }
+    }
+}
+
+/// What a [`BufferedStream::probe`] was told.
+#[cfg(test)]
+pub(crate) struct Probe(tokio::sync::mpsc::UnboundedReceiver<PlayoutCommand>);
+
+#[cfg(test)]
+impl Probe {
+    /// Whether the stream was stopped.
+    pub(crate) fn stopped(&mut self) -> bool {
+        while let Ok(c) = self.0.try_recv() {
+            if matches!(c, PlayoutCommand::Stop) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 impl BufferedAudioProcessor {
-    /// Start the processing pipeline. Returns a command sender for playback control.
+    /// Start the processing pipeline.
     pub(crate) fn start(
         self,
         shk: [u8; 32],
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
-    ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
+    ) -> BufferedStream {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = Arc::new((Mutex::new(PlayoutState::new()), Condvar::new()));
 
@@ -365,7 +417,7 @@ impl BufferedAudioProcessor {
         // Receiver task
         let state4 = state.clone();
 
-        tokio::spawn(async move {
+        let receiver = tokio::spawn(async move {
             let Some((stream, addr)) = crate::net::accept_from(&self.listener, self.peer).await
             else {
                 return;
@@ -375,7 +427,10 @@ impl BufferedAudioProcessor {
             receive_loop(stream, &shk, output_config, state4, &handler).await;
         });
 
-        cmd_tx
+        BufferedStream {
+            commands: cmd_tx,
+            receiver: Some(receiver),
+        }
     }
 }
 
@@ -1301,6 +1356,37 @@ mod decode_ahead_tests {
                 "asynchronous: {asynchronous}"
             );
         }
+    }
+
+    /// A stream that stops (another took over, TEARDOWN) ends its receiver: the sender's connection closes, it
+    /// doesn't stay open until the sender lets go.
+    #[tokio::test]
+    async fn a_stopped_streams_receiver_ends() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proc = BufferedAudioProcessor {
+            listener,
+            peer: addr.ip(),
+        };
+        let config = OutputConfig {
+            sample_rate: None,
+            max_channels: None,
+            format: crate::raop::SampleFormat::S16,
+            offload: None,
+            offset_ns: 0,
+        };
+        let out = Arc::new(StdMutex::new(Vec::new()));
+        let stream = proc.start([0; 32], config, Arc::new(Handler(out)));
+        let mut sender = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(stream);
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), sender.read(&mut b))
+            .await
+            .expect("the receiver still holds the connection")
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

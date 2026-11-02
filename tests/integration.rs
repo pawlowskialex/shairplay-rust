@@ -590,6 +590,25 @@ async fn multiple_connections() {
     server.stop().await;
 }
 
+/// The server's stop closes the connections it has, not only its listeners.
+#[tokio::test]
+#[serial]
+async fn stop_closes_the_connections() {
+    let (mut server, port, _) = start_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let resp = send_rtsp(&mut stream, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").await;
+    assert!(resp.contains("200 OK"));
+    server.stop().await;
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("the connection outlived the server")
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
 #[tokio::test]
 #[serial]
 async fn teardown_closes_connection() {

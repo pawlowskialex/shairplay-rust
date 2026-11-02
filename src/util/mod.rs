@@ -27,6 +27,31 @@ pub fn wall_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// A task that ends when its owner does (a connection's event channel, a stream's receiver): aborted on drop.
+#[cfg(feature = "ap2-core")]
+pub(crate) struct OwnedTask(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "ap2-core")]
+impl OwnedTask {
+    pub(crate) fn spawn(task: impl Future<Output = ()> + Send + 'static) -> Self {
+        OwnedTask(tokio::spawn(task))
+    }
+}
+
+#[cfg(feature = "ap2-core")]
+impl From<tokio::task::JoinHandle<()>> for OwnedTask {
+    fn from(handle: tokio::task::JoinHandle<()>) -> Self {
+        OwnedTask(handle)
+    }
+}
+
+#[cfg(feature = "ap2-core")]
+impl Drop for OwnedTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Format a hardware address for RAOP service name: "AABBCCDDEEFF" (uppercase hex, no separators).
 /// Equivalent to utils_hwaddr_raop.
 pub fn hwaddr_raop(hwaddr: &[u8]) -> String {
