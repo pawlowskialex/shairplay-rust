@@ -930,7 +930,8 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         let timing_rport = dict
             .get("timingPort")
             .and_then(|v| v.as_unsigned_integer())
-            .unwrap_or(0) as u16;
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(0);
         let tport = bind_udp(bind_addr_for(conn))
             .and_then(|tsock| {
                 let local_port = tsock.local_addr().ok()?.port();
@@ -1100,7 +1101,8 @@ fn setup_stream_realtime(
                 let control_port = stream0
                     .get("controlPort")
                     .and_then(|v| v.as_unsigned_integer())
-                    .unwrap_or(0) as u16;
+                    .and_then(|p| u16::try_from(p).ok())
+                    .unwrap_or(0);
                 let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
                 stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
@@ -1233,8 +1235,8 @@ fn setup_stream_video(
 ) -> Option<()> {
     let stream_connection_id = stream0
         .get("streamConnectionID")
-        .and_then(|v| v.as_signed_integer())
-        .unwrap_or(0) as u64;
+        .and_then(plist_u64)
+        .unwrap_or(0);
     tracing::info!(
         stream_type = 110,
         stream_connection_id,
@@ -1255,11 +1257,7 @@ fn setup_stream_video(
             let eaes_key = crate::crypto::video_key::derive_eaes_key(&fp_key, ecdh);
             let (key, iv) =
                 crate::crypto::video_key::derive_stream_key_iv(&eaes_key, stream_connection_id);
-            tracing::debug!(
-                derived_key = %hex::encode(key),
-                derived_iv = %hex::encode(iv),
-                "Video key: 3-step derivation (FairPlay + ECDH)"
-            );
+            tracing::debug!("Video key: 3-step derivation (FairPlay + ECDH)");
             (key, iv)
         } else {
             // iOS 18+ with HomeKit pairing does not send ekey; derivation is unsolved
