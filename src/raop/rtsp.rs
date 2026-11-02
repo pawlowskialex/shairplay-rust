@@ -17,8 +17,95 @@ use crate::raop::handlers_ap2;
 #[cfg(feature = "hls")]
 use crate::raop::handlers_hls;
 
-/// Handler function signature — all RTSP handlers share this type.
-type Handler = fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Option<Vec<u8>>;
+/// Handler function signature — all RTSP handlers share this type: `Ok` with the body to send (`None`: none), or
+/// why the request failed, answered in one place ([`dispatch`]).
+pub(crate) type Handled = Result<Option<Vec<u8>>, RtspError>;
+type Handler = fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Handled;
+
+/// A request that failed: the status it is answered with, what went wrong (for the log), whether the connection
+/// closes after it, and the error the application hears of ([`AudioHandler::on_error`]), if it should.
+///
+/// [`AudioHandler::on_error`]: crate::AudioHandler::on_error
+#[derive(Debug)]
+pub(crate) struct RtspError {
+    status: u16,
+    detail: std::borrow::Cow<'static, str>,
+    close: bool,
+    report: Option<crate::error::ShairplayError>,
+}
+
+impl RtspError {
+    fn new(status: u16, detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            close: false,
+            report: None,
+        }
+    }
+
+    /// 400: the request is malformed or lacks what the method needs.
+    pub(crate) fn bad_request(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(400, detail)
+    }
+
+    /// 415: a stream or format the receiver doesn't take.
+    pub(crate) fn unsupported(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(415, detail)
+    }
+
+    /// 455: the method isn't valid in the connection's state (a SETUP before its ANNOUNCE).
+    pub(crate) fn not_now(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(455, detail)
+    }
+
+    /// 470: the sender isn't authorized (a failed pairing).
+    pub(crate) fn unauthorized(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(470, detail)
+    }
+
+    /// 500: the receiver failed (a socket that wouldn't bind).
+    pub(crate) fn internal(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(500, detail)
+    }
+
+    /// The connection closes after the answer.
+    pub(crate) fn closing(mut self) -> Self {
+        self.close = true;
+        self
+    }
+
+    /// The application hears of it (`on_error`).
+    pub(crate) fn report(mut self, error: impl Into<crate::error::ShairplayError>) -> Self {
+        self.report = Some(error.into());
+        self
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.status {
+            400 => "Bad Request",
+            415 => "Unsupported Media Type",
+            455 => "Method Not Valid in This State",
+            470 => "Connection Authorization Required",
+            _ => "Internal Server Error",
+        }
+    }
+}
+
+/// `option.ok_or(bad("what"))?`: a missing or malformed part of the request.
+pub(crate) fn bad(detail: &'static str) -> RtspError {
+    RtspError::bad_request(detail)
+}
+
+/// A binary plist body as a dictionary.
+#[cfg(feature = "ap2-core")]
+pub(crate) fn plist_body(request: &HttpRequest) -> Result<plist::Dictionary, RtspError> {
+    let data = request.data().ok_or(bad("no body"))?;
+    plist::from_bytes::<plist::Value>(data)
+        .ok()
+        .and_then(plist::Value::into_dictionary)
+        .ok_or(bad("the body isn't a plist dictionary"))
+}
 
 /// Result of route resolution.
 enum RouteResolution {
@@ -325,9 +412,9 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     }
 
     // --- Route resolution ---
-    let response_data = match resolve_handler(conn, request, method, url) {
+    let handled = match resolve_handler(conn, request, method, url) {
         Some(RouteResolution::Handler(handler)) => handler(conn, request, &mut response),
-        Some(RouteResolution::NoBody) => None,
+        Some(RouteResolution::NoBody) => Ok(None),
         None => {
             tracing::debug!(method, url, "Unhandled RTSP request");
             response = new_response(404, "Not Found", cseq);
@@ -335,7 +422,29 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             return response;
         }
     };
-    response.finish(response_data.as_deref());
+    match handled {
+        Ok(body) => response.finish(body.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                method,
+                url,
+                status = e.status,
+                close = e.close,
+                "{}",
+                e.detail
+            );
+            if let Some(error) = &e.report {
+                conn.shared.handler.on_error(error);
+            }
+            response = new_response(e.status, e.reason(), cseq);
+            if e.close {
+                response.add_header("Connection", "close");
+                response.set_disconnect(true);
+            }
+            response.add_header("Content-Length", "0");
+            response.finish(None);
+        }
+    }
     response
 }
 
@@ -438,7 +547,7 @@ fn handle_teardown(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     #[cfg(feature = "ap2-core")]
     let streams_only = _request
         .data()
@@ -462,5 +571,5 @@ fn handle_teardown(
     if let Some(cmd) = &conn.playout_cmd {
         let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
     }
-    None
+    Ok(None)
 }

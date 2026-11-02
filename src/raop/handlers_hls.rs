@@ -1,6 +1,7 @@
 //! HLS HTTP handlers — /play, /playback-info, /scrub, /rate, /stop, /server-info.
 
 use super::handlers_ap1::RaopConnection;
+use super::rtsp::{Handled, RtspError, bad, plist_body};
 use crate::proto::http::{HttpRequest, HttpResponse};
 
 /// `GET /server-info` — server capabilities for HLS mode.
@@ -8,7 +9,7 @@ pub(crate) fn handle_server_info(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     let mac = conn
         .shared
         .hwaddr
@@ -37,10 +38,7 @@ pub(crate) fn handle_server_info(
     dict.insert("vv".into(), plist::Value::Integer(2_i64.into()));
     dict.insert("deviceid".into(), plist::Value::String(mac));
 
-    let mut buf = Vec::new();
-    plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(dict)).ok()?;
-    response.add_header("Content-Type", "text/x-apple-plist+xml");
-    Some(buf)
+    xml_reply(response, dict)
 }
 
 /// `POST /play` — iPhone sends m3u8 URL to start HLS playback.
@@ -48,12 +46,13 @@ pub(crate) fn handle_play(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
-    let dict = plist_val.as_dictionary()?;
+) -> Handled {
+    let dict = plist_body(request)?;
 
-    let url = dict.get("Content-Location").and_then(|v| v.as_string())?;
+    let url = dict
+        .get("Content-Location")
+        .and_then(|v| v.as_string())
+        .ok_or(bad("no Content-Location"))?;
     let start_pos = dict
         .get("Start-Position")
         .and_then(|v| v.as_real())
@@ -63,14 +62,18 @@ pub(crate) fn handle_play(
 
     tracing::info!(%url, start_pos, "HLS play request");
 
-    let hls_handler = conn.shared.hls_handler.as_ref()?;
+    let hls_handler = conn
+        .shared
+        .hls_handler
+        .as_ref()
+        .ok_or_else(|| RtspError::unsupported("no HLS handler"))?;
     let session = hls_handler.on_play(url, start_pos);
 
     if let Ok(mut state) = conn.hls_state.lock() {
         state.session = Some(session);
         state.session_id = session_id;
     }
-    None
+    Ok(None)
 }
 
 /// `GET /playback-info` — iPhone polls for playback state.
@@ -78,9 +81,13 @@ pub(crate) fn handle_playback_info(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let state = conn.hls_state.lock().ok()?;
-    let session = state.session.as_ref()?;
+) -> Handled {
+    let Ok(state) = conn.hls_state.lock() else {
+        return Ok(None);
+    };
+    let Some(session) = state.session.as_ref() else {
+        return Ok(None);
+    };
 
     let duration = session.duration() as f64;
     let position = session.position() as f64;
@@ -126,10 +133,7 @@ pub(crate) fn handle_playback_info(
         plist::Value::Array(vec![plist::Value::Dictionary(seekable)]),
     );
 
-    let mut buf = Vec::new();
-    plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(dict)).ok()?;
-    response.add_header("Content-Type", "text/x-apple-plist+xml");
-    Some(buf)
+    xml_reply(response, dict)
 }
 
 /// `POST /scrub?position=X` — seek to position.
@@ -137,16 +141,18 @@ pub(crate) fn handle_scrub(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let url = request.url()?;
-    let pos = parse_query_float(url, "position")?;
+) -> Handled {
+    let pos = request
+        .url()
+        .and_then(|url| parse_query_float(url, "position"))
+        .ok_or(bad("no position"))?;
     tracing::debug!(pos, "HLS scrub");
     if let Ok(mut state) = conn.hls_state.lock()
         && let Some(session) = state.session.as_mut()
     {
         session.seek(pos);
     }
-    None
+    Ok(None)
 }
 
 /// `POST /rate?value=X` — set playback rate (0=pause, 1=play).
@@ -154,16 +160,18 @@ pub(crate) fn handle_rate(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let url = request.url()?;
-    let rate = parse_query_float(url, "value")?;
+) -> Handled {
+    let rate = request
+        .url()
+        .and_then(|url| parse_query_float(url, "value"))
+        .ok_or(bad("no value"))?;
     tracing::debug!(rate, "HLS rate");
     if let Ok(mut state) = conn.hls_state.lock()
         && let Some(session) = state.session.as_mut()
     {
         session.set_rate(rate);
     }
-    None
+    Ok(None)
 }
 
 /// `POST /stop` — stop HLS playback.
@@ -171,7 +179,7 @@ pub(crate) fn handle_stop(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     tracing::info!("HLS stop");
     if let Ok(mut state) = conn.hls_state.lock() {
         if let Some(session) = state.session.as_mut() {
@@ -180,7 +188,16 @@ pub(crate) fn handle_stop(
         state.session = None;
         state.session_id = None;
     }
-    None
+    Ok(None)
+}
+
+/// An XML plist answer.
+fn xml_reply(response: &mut HttpResponse, dict: plist::Dictionary) -> Handled {
+    let mut buf = Vec::new();
+    plist::to_writer_xml(&mut buf, &plist::Value::Dictionary(dict))
+        .map_err(|_| RtspError::internal("the answer's plist"))?;
+    response.add_header("Content-Type", "text/x-apple-plist+xml");
+    Ok(Some(buf))
 }
 
 /// Parse `?key=value` from a URL query string.

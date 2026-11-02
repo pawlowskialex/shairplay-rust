@@ -430,7 +430,11 @@ async fn ap1_l16_rejects_iv_without_encryption_key() {
         sdp.len()
     );
     let response = send_rtsp(&mut stream, &announce).await;
-    assert!(response.contains("RTSP/1.0 200 OK"), "got: {response}");
+    assert!(
+        response.contains("RTSP/1.0 400 Bad Request"),
+        "got: {response}"
+    );
+    assert!(response.contains("Connection: close"), "got: {response}");
 
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
@@ -609,6 +613,50 @@ async fn teardown_closes_connection() {
     server.stop().await;
 }
 
+/// A request that fails is answered with its status, not a 200 without a body: a volume that isn't a number and an
+/// fp-setup of no known size (400), a SETUP before its ANNOUNCE (455, and the connection closes).
+#[tokio::test]
+#[serial]
+async fn failures_are_answered_with_their_status() {
+    let (mut server, port, _) = start_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let body = "volume: nan\r\n";
+    let resp = send_rtsp(
+        &mut stream,
+        &format!(
+            "SET_PARAMETER rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(resp.starts_with("RTSP/1.0 400 Bad Request"), "got: {resp}");
+    let resp = send_rtsp(
+        &mut stream,
+        "POST /fp-setup RTSP/1.0\r\nCSeq: 2\r\nContent-Length: 3\r\n\r\nabc",
+    )
+    .await;
+    assert!(resp.starts_with("RTSP/1.0 400 Bad Request"), "got: {resp}");
+    let resp = send_rtsp(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 3\r\nTransport: RTP/AVP/UDP;unicast;mode=record\r\n\r\n",
+    )
+    .await;
+    assert!(
+        resp.starts_with("RTSP/1.0 455 Method Not Valid in This State"),
+        "got: {resp}"
+    );
+    assert!(resp.contains("Connection: close"), "got: {resp}");
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("still open")
+        .unwrap();
+    assert_eq!(n, 0);
+    server.stop().await;
+}
+
 // --- AirPlay 2 integration tests ---
 
 #[cfg(feature = "ap2-core")]
@@ -691,6 +739,57 @@ mod ap2_tests {
         m3.add(TlvType::PublicKey as u8, &[2]);
         m3.add(TlvType::Proof as u8, &[0; 64]);
         m3
+    }
+
+    /// A plist SETUP on `stream`: the response's status line.
+    async fn setup_status(stream: &mut TcpStream, body: &[u8]) -> String {
+        let req = format!(
+            "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+        resp.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// AirPlay 2 failures with their status: a SETUP that isn't a plist (400), a realtime stream of a shape the
+    /// decoder doesn't take (415); a pair-verify M3 without its M1 gets HAP's error in the TLV.
+    #[tokio::test]
+    #[serial]
+    async fn ap2_failures_are_answered_with_their_status() {
+        let (mut server, port, _) = start_server().await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            setup_status(&mut stream, b"bplist00 not really").await,
+            "RTSP/1.0 400 Bad Request"
+        );
+        let stream0 = plist::Dictionary::from_iter([
+            ("type".to_string(), plist::Value::Integer(96.into())),
+            ("spf".to_string(), plist::Value::Integer(1_000_000.into())),
+            ("shk".to_string(), plist::Value::Data(vec![7; 32])),
+        ]);
+        let setup = plist::Dictionary::from_iter([(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream0)]),
+        )]);
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &setup).unwrap();
+        assert_eq!(
+            setup_status(&mut stream, &body).await,
+            "RTSP/1.0 415 Unsupported Media Type"
+        );
+        let mut m3 = TlvValues::new();
+        m3.add(TlvType::State as u8, &[3]);
+        m3.add(TlvType::EncryptedData as u8, &[0; 32]);
+        let m4 = post_tlv(&mut stream, "/pair-verify", 2, &m3).await;
+        assert_eq!(m4.get_type(TlvType::State), Some(&[4u8][..]));
+        assert_eq!(m4.get_type(TlvType::Error), Some(&[2u8][..]));
+        server.stop().await;
     }
 
     /// One proof per M1, and a limit on failed proofs: each is an online guess at the PIN.

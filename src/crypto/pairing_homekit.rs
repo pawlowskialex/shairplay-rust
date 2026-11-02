@@ -724,6 +724,9 @@ pub(crate) fn pairing_error_response(state: u8) -> Vec<u8> {
 /// kTLVError_MaxTries: the accessory refuses pair-setup after too many failed attempts (HAP).
 pub(crate) const TLV_ERROR_MAX_TRIES: u8 = 5;
 
+/// kTLVError_MaxPeers: the accessory has no room for another controller (HAP).
+pub(crate) const TLV_ERROR_MAX_PEERS: u8 = 4;
+
 /// A pairing response with `error` at `state`.
 pub(crate) fn pairing_error(state: u8, error: u8) -> Vec<u8> {
     let mut tlv = TlvValues::new();

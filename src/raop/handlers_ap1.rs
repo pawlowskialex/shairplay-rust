@@ -8,6 +8,7 @@ use crate::error::{CodecError, ShairplayError};
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::proto::sdp::Sdp;
 use crate::raop::rtp::{RaopRtp, RtpEncryption};
+use crate::raop::rtsp::{Handled, RtspError, bad};
 
 #[cfg(feature = "ap2-core")]
 use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
@@ -101,14 +102,14 @@ pub(crate) fn handle_pair_setup(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
+) -> Handled {
+    let data = request.data().ok_or(bad("no body"))?;
     if data.len() != 32 {
-        return None;
+        return Err(bad("an AP1 pair-setup body is a 32-byte key"));
     }
     let public_key = conn.shared.pairing.public_key();
     response.add_header("Content-Type", "application/octet-stream");
-    Some(public_key.to_vec())
+    Ok(Some(public_key.to_vec()))
 }
 
 /// AP1 pair-verify: Ed25519/Curve25519 handshake (M1/M2).
@@ -116,41 +117,37 @@ pub(crate) fn handle_pair_verify(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    if data.len() < 4 {
-        return None;
-    }
-
-    match data[0] {
-        1 => {
-            if data.len() != 4 + 32 + 32 {
-                return None;
-            }
-            let ecdh_key: &[u8; 32] = data[4..36].try_into().ok()?;
-            let ed_key: &[u8; 32] = data[36..68].try_into().ok()?;
-            let _ = conn.pairing.handshake(ecdh_key, ed_key);
-            let public_key = conn.pairing.get_public_key().ok()?;
-            let signature = conn.pairing.get_signature().ok()?;
+) -> Handled {
+    let data = request.data().ok_or(bad("no body"))?;
+    match data.first() {
+        Some(1) if data.len() == 4 + 32 + 32 => {
+            let ecdh_key: &[u8; 32] = data[4..36].try_into().map_err(|_| bad("key"))?;
+            let ed_key: &[u8; 32] = data[36..68].try_into().map_err(|_| bad("key"))?;
+            let verified = conn.pairing.handshake(ecdh_key, ed_key).and_then(|()| {
+                Ok((
+                    conn.pairing.get_public_key()?,
+                    conn.pairing.get_signature()?,
+                ))
+            });
+            let (public_key, signature) = verified.map_err(|e| {
+                RtspError::unauthorized("AP1 pair-verify M1").report(ShairplayError::Crypto(e))
+            })?;
             response.add_header("Content-Type", "application/octet-stream");
             let mut resp = Vec::with_capacity(96);
             resp.extend_from_slice(&public_key);
             resp.extend_from_slice(&signature);
-            Some(resp)
+            Ok(Some(resp))
         }
-        0 => {
-            if data.len() != 4 + 64 {
-                return None;
-            }
-            let sig: &[u8; 64] = data[4..68].try_into().ok()?;
-            if let Err(e) = conn.pairing.finish(sig) {
-                tracing::warn!("AP1 pair-verify finish failed: {e}");
-                conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                response.set_disconnect(true);
-            }
-            None
+        Some(0) if data.len() == 4 + 64 => {
+            let sig: &[u8; 64] = data[4..68].try_into().map_err(|_| bad("signature"))?;
+            conn.pairing.finish(sig).map_err(|e| {
+                RtspError::unauthorized("AP1 pair-verify finish")
+                    .closing()
+                    .report(ShairplayError::Crypto(e))
+            })?;
+            Ok(None)
         }
-        _ => None,
+        _ => Err(bad("not an AP1 pair-verify message")),
     }
 }
 
@@ -159,35 +156,20 @@ pub(crate) fn handle_fp_setup(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
+) -> Handled {
+    let data = request.data().ok_or(bad("no body"))?;
     tracing::debug!(data_len = data.len(), "fp-setup");
+    let failed = |e| RtspError::bad_request("fp-setup").report(ShairplayError::Crypto(e));
     match data.len() {
         16 => {
-            let req: &[u8; 16] = data.try_into().ok()?;
-            let res = match conn.fairplay.setup(req) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("fp-setup M1 failed: {e}");
-                    conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    return None;
-                }
-            };
-            Some(res.to_vec())
+            let req: &[u8; 16] = data.try_into().map_err(|_| bad("fp-setup M1"))?;
+            Ok(Some(conn.fairplay.setup(req).map_err(failed)?.to_vec()))
         }
         164 => {
-            let req: &[u8; 164] = data.try_into().ok()?;
-            let res = match conn.fairplay.handshake(req) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("fp-setup M2 failed: {e}");
-                    conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    return None;
-                }
-            };
-            Some(res.to_vec())
+            let req: &[u8; 164] = data.try_into().map_err(|_| bad("fp-setup M2"))?;
+            Ok(Some(conn.fairplay.handshake(req).map_err(failed)?.to_vec()))
         }
-        _ => None,
+        _ => Err(bad("an fp-setup body is 16 or 164 bytes")),
     }
 }
 
@@ -196,7 +178,7 @@ pub(crate) fn handle_options(
     _conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     #[cfg(feature = "ap2-core")]
     response.add_header(
         "Public",
@@ -207,17 +189,19 @@ pub(crate) fn handle_options(
         "Public",
         "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER",
     );
-    None
+    Ok(None)
 }
 
-/// RTSP ANNOUNCE: parse SDP, extract AES keys, create RTP session.
+/// RTSP ANNOUNCE: parse SDP, extract AES keys, create RTP session. Every failure closes the connection: the
+/// sender's stream can't play here.
 pub(crate) fn handle_announce(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let sdp_str = std::str::from_utf8(data).ok()?;
+    _response: &mut HttpResponse,
+) -> Handled {
+    let refuse = |detail: &'static str| RtspError::bad_request(detail).closing();
+    let data = request.data().ok_or(refuse("ANNOUNCE without SDP"))?;
+    let sdp_str = std::str::from_utf8(data).map_err(|_| refuse("the SDP isn't text"))?;
     if !conn.session {
         conn.session = true;
         conn.shared
@@ -226,8 +210,8 @@ pub(crate) fn handle_announce(
     }
     let sdp = Sdp::parse(sdp_str);
 
-    let remote = sdp.connection()?;
-    let rtpmap = sdp.rtpmap()?;
+    let remote = sdp.connection().ok_or(refuse("the SDP has no c= line"))?;
+    let rtpmap = sdp.rtpmap().ok_or(refuse("the SDP has no rtpmap"))?;
     let fmtp = sdp.fmtp();
     // aesiv/rsaaeskey are absent when the sender negotiated no encryption
     // (e.g. PipeWire's et=0 mode).
@@ -236,88 +220,60 @@ pub(crate) fn handle_announce(
     let aesiv_str = sdp.aesiv();
 
     if rsa_key.is_some() && fairplay_key.is_some() {
-        tracing::warn!("ANNOUNCE: multiple audio encryption keys supplied");
-        response.set_disconnect(true);
-        return None;
+        return Err(refuse("ANNOUNCE: two audio encryption keys"));
     }
 
     let encryption_expected = rsa_key.is_some() || fairplay_key.is_some();
     if !encryption_expected && aesiv_str.is_some() {
-        tracing::warn!("ANNOUNCE: aesiv supplied without an audio encryption key");
-        response.set_disconnect(true);
-        return None;
+        return Err(refuse("ANNOUNCE: aesiv without an audio encryption key"));
     }
 
-    let mut aeskey = [0u8; 16];
-    let mut aesiv = [0u8; 16];
-
+    let crypto = |detail: &'static str, e| refuse(detail).report(ShairplayError::Crypto(e));
     // Decrypt AES key from RSA or FairPlay
     let key_bytes = if let Some(rsa_key_str) = rsa_key {
-        match conn.shared.rsakey.decrypt(rsa_key_str) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                tracing::warn!("ANNOUNCE rsaaeskey decrypt failed: {e}");
-                conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                None
-            }
-        }
+        Some(
+            conn.shared
+                .rsakey
+                .decrypt(rsa_key_str)
+                .map_err(|e| crypto("ANNOUNCE: rsaaeskey doesn't decrypt", e))?,
+        )
     } else if let Some(fp_key_str) = fairplay_key {
-        match conn.shared.rsakey.decode(fp_key_str) {
-            Ok(fp_data) if fp_data.len() == 72 => {
-                let input: &[u8; 72] = fp_data.as_slice().try_into().ok()?;
-                match conn.fairplay.decrypt(input) {
-                    Ok(key) => Some(key.to_vec()),
-                    Err(e) => {
-                        tracing::warn!("ANNOUNCE fpaeskey decrypt failed: {e}");
-                        conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                        None
-                    }
-                }
-            }
-            Ok(fp_data) => {
-                tracing::warn!(len = fp_data.len(), "ANNOUNCE fpaeskey has invalid length");
-                None
-            }
-            Err(e) => {
-                tracing::warn!("ANNOUNCE fpaeskey decode failed: {e}");
-                conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                None
-            }
-        }
+        let fp_data = conn
+            .shared
+            .rsakey
+            .decode(fp_key_str)
+            .map_err(|e| crypto("ANNOUNCE: fpaeskey doesn't decode", e))?;
+        let input: &[u8; 72] = fp_data
+            .as_slice()
+            .try_into()
+            .map_err(|_| refuse("ANNOUNCE: fpaeskey isn't 72 bytes"))?;
+        Some(
+            conn.fairplay
+                .decrypt(input)
+                .map_err(|e| crypto("ANNOUNCE: fpaeskey doesn't decrypt", e))?
+                .to_vec(),
+        )
     } else {
         None
     };
 
-    // Did the sender negotiate encryption? If it advertised a key
-    // (`a=rsaaeskey`/`a=fpaeskey`) but we can't recover a usable key+iv, we must
-    // fail the connection rather than silently fall back to the unencrypted
-    // passthrough — feeding still-encrypted bytes to the decoder as PCM plays
-    // loud static. Only a sender that advertised no key at all is unencrypted.
-    if encryption_expected {
-        let Some(key_bytes) = key_bytes.filter(|k| k.len() >= 16) else {
-            tracing::warn!(
-                "ANNOUNCE: encryption negotiated but AES key unavailable/short; aborting"
-            );
-            response.set_disconnect(true);
-            return None;
-        };
-        aeskey.copy_from_slice(&key_bytes[..16]);
-
-        // An encrypted stream carries `a=aesiv`; require it to decode cleanly.
-        let iv_ok = aesiv_str
-            .and_then(|iv_str| conn.shared.rsakey.decode(iv_str).ok())
-            .filter(|iv| iv.len() >= 16);
-        let Some(iv_bytes) = iv_ok else {
-            tracing::warn!("ANNOUNCE: encryption negotiated but aesiv missing/malformed; aborting");
-            response.set_disconnect(true);
-            return None;
-        };
-        aesiv.copy_from_slice(&iv_bytes[..16]);
-    }
-    let encryption = encryption_expected.then_some(RtpEncryption {
-        key: aeskey,
-        iv: aesiv,
-    });
+    // A sender that advertised a key (`a=rsaaeskey`/`a=fpaeskey`) without a usable key and iv is refused, not played
+    // unencrypted: still-encrypted bytes fed to the decoder as PCM play loud static. Only a sender that advertised
+    // no key at all is unencrypted.
+    let encryption = match key_bytes {
+        Some(key_bytes) => {
+            let key = key_bytes
+                .get(..16)
+                .and_then(|k| <[u8; 16]>::try_from(k).ok())
+                .ok_or(refuse("ANNOUNCE: the AES key is short"))?;
+            let iv = aesiv_str
+                .and_then(|iv_str| conn.shared.rsakey.decode(iv_str).ok())
+                .and_then(|iv| iv.get(..16).and_then(|v| <[u8; 16]>::try_from(v).ok()))
+                .ok_or(refuse("ANNOUNCE: aesiv missing or malformed"))?;
+            Some(RtpEncryption { key, iv })
+        }
+        None => None,
+    };
 
     // Destroy existing RTP session if any
     conn.raop_rtp = None;
@@ -339,19 +295,15 @@ pub(crate) fn handle_announce(
 
     if conn.raop_rtp.is_none() {
         let fmtp = fmtp.unwrap_or("<missing>");
-        tracing::warn!(
-            rtpmap,
-            fmtp,
-            "ANNOUNCE: unsupported or malformed audio format"
+        return Err(
+            RtspError::unsupported(format!("ANNOUNCE: rtpmap {rtpmap} fmtp {fmtp}"))
+                .closing()
+                .report(CodecError::UnsupportedFormat(format!(
+                    "ANNOUNCE rtpmap={rtpmap} fmtp={fmtp}"
+                ))),
         );
-        conn.shared
-            .handler
-            .on_error(&ShairplayError::Codec(CodecError::UnsupportedFormat(
-                format!("ANNOUNCE rtpmap={rtpmap} fmtp={fmtp}"),
-            )));
-        response.set_disconnect(true);
     }
-    None
+    Ok(None)
 }
 
 /// AP1 RTSP SETUP: bind RTP ports and start audio receiver.
@@ -359,8 +311,10 @@ pub(crate) fn handle_setup(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let transport = request.header("Transport")?;
+) -> Handled {
+    let transport = request
+        .header("Transport")
+        .ok_or(bad("SETUP without Transport"))?;
     tracing::debug!(transport, "AP1 SETUP");
 
     // Check for DACP remote control headers
@@ -389,31 +343,25 @@ pub(crate) fn handle_setup(
         }
     }
 
-    if let Some(rtp) = &mut conn.raop_rtp {
-        conn.shared
-            .claim_stream(conn.id, &conn.sender_id, &conn.close);
-        let (cport, tport, dport) = match rtp.start(use_udp, remote_cport, remote_tport) {
-            Ok(ports) => ports,
-            Err(e) => {
-                tracing::warn!("AP1 SETUP rtp.start failed: {e}");
-                conn.shared.handler.on_error(&e);
-                return None;
-            }
-        };
+    let Some(rtp) = &mut conn.raop_rtp else {
+        return Err(RtspError::not_now("AP1 SETUP before ANNOUNCE").closing());
+    };
+    conn.shared
+        .claim_stream(conn.id, &conn.sender_id, &conn.close);
+    let (cport, tport, dport) = rtp
+        .start(use_udp, remote_cport, remote_tport)
+        .map_err(|e| RtspError::internal("AP1 SETUP: the RTP ports").report(e))?;
 
-        let transport_resp = if use_udp {
-            format!(
-                "RTP/AVP/UDP;unicast;mode=record;timing_port={tport};events;control_port={cport};server_port={dport}"
-            )
-        } else {
-            format!("RTP/AVP/TCP;unicast;interleaved=0-1;mode=record;server_port={dport}")
-        };
-        response.add_header("Transport", &transport_resp);
-        response.add_header("Session", "DEADBEEF");
+    let transport_resp = if use_udp {
+        format!(
+            "RTP/AVP/UDP;unicast;mode=record;timing_port={tport};events;control_port={cport};server_port={dport}"
+        )
     } else {
-        response.set_disconnect(true);
-    }
-    None
+        format!("RTP/AVP/TCP;unicast;interleaved=0-1;mode=record;server_port={dport}")
+    };
+    response.add_header("Transport", &transport_resp);
+    response.add_header("Session", "DEADBEEF");
+    Ok(None)
 }
 
 /// AP1 RTSP RECORD: acknowledge the start of RTP streaming.
@@ -421,43 +369,43 @@ pub(crate) fn handle_record(
     _conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     // Mirror the AP2 RECORD response: classic RAOP clients expect an
     // Audio-Latency header. The value is a placeholder — actual playback
     // timing is handled by the RTP layer, not advertised here.
     response.add_header("Audio-Latency", "0");
-    None
+    Ok(None)
 }
 
-/// RTSP GET_PARAMETER: return volume or other parameters.
+/// RTSP GET_PARAMETER: return volume or other parameters. Without a body (a keepalive) or a parameter it knows:
+/// an empty answer.
 pub(crate) fn handle_get_parameter(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let content_type = request.header("Content-Type")?;
-    if content_type != "text/parameters" {
-        return None;
+) -> Handled {
+    if request.header("Content-Type") != Some("text/parameters") {
+        return Ok(None);
     }
-
-    let data = request.data()?;
-    let text = std::str::from_utf8(data).ok()?;
+    let text = std::str::from_utf8(request.data().unwrap_or_default())
+        .map_err(|_| bad("the parameters aren't text"))?;
     if text.contains("volume") {
         response.add_header("Content-Type", "text/parameters");
         let volume = conn.shared.handler.volume().unwrap_or(0.0);
-        return Some(format!("volume: {volume:.6}\r\n").into_bytes());
+        return Ok(Some(format!("volume: {volume:.6}\r\n").into_bytes()));
     }
-    None
+    Ok(None)
 }
 
-/// RTSP SET_PARAMETER: handle volume, metadata, artwork, progress.
+/// RTSP SET_PARAMETER: handle volume, metadata, artwork, progress. What it doesn't know is ignored.
 pub(crate) fn handle_set_parameter(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let content_type = request.header("Content-Type")?;
-    let data = request.data()?;
+) -> Handled {
+    let (Some(content_type), Some(data)) = (request.header("Content-Type"), request.data()) else {
+        return Ok(None);
+    };
     tracing::debug!(content_type, len = data.len(), "SET_PARAMETER");
 
     // Volume, progress, cover art, and DMAP metadata are delivered straight to the
@@ -466,14 +414,16 @@ pub(crate) fn handle_set_parameter(
     // arrive on their own RTSP methods, not here.
     match content_type {
         "text/parameters" => {
-            let text = std::str::from_utf8(data).ok()?;
+            let text = std::str::from_utf8(data).map_err(|_| bad("the parameters aren't text"))?;
             if let Some(rest) = text.strip_prefix("volume: ") {
                 // dB, -144 (mute) to 0; "nan" and "inf" parse as f32 too
-                if let Ok(vol) = rest.trim().parse::<f32>()
-                    && vol.is_finite()
-                {
-                    conn.shared.handler.on_volume(vol.clamp(-144.0, 0.0));
-                }
+                let vol = rest
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or(bad("volume isn't a number"))?;
+                conn.shared.handler.on_volume(vol.clamp(-144.0, 0.0));
             } else if let Some(rest) = text.strip_prefix("progress: ") {
                 let parts: Vec<&str> = rest.trim().split('/').collect();
                 if parts.len() == 3 {
@@ -492,7 +442,7 @@ pub(crate) fn handle_set_parameter(
         }
         _ => {}
     }
-    None
+    Ok(None)
 }
 
 // --- AirPlay 2 handlers ---
@@ -585,11 +535,14 @@ mod tests {
 
         // 16-byte M1 with byte[4] = 0x00 (!= 0x03) → FairPlay::setup returns Err.
         let req = fp_setup_request(&[0u8; 16]);
-        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
 
-        let out = handle_fp_setup(&mut conn, &req, &mut resp);
+        let resp = crate::raop::rtsp::dispatch(&mut conn, &req);
 
-        assert!(out.is_none(), "malformed fp-setup should decline");
+        assert_eq!(
+            resp.status_code(),
+            400,
+            "malformed fp-setup should be refused"
+        );
         let errors = handler.errors.lock().unwrap();
         assert_eq!(
             errors.len(),
@@ -617,7 +570,10 @@ mod tests {
 
         let out = handle_fp_setup(&mut conn, &req, &mut resp);
 
-        assert!(out.is_some(), "valid fp-setup M1 should produce a reply");
+        assert!(
+            out.unwrap().is_some(),
+            "valid fp-setup M1 should produce a reply"
+        );
         assert!(
             handler.errors.lock().unwrap().is_empty(),
             "no error expected on success"
