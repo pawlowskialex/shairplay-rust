@@ -1,11 +1,12 @@
-//! Packet offload: hand realtime audio packets (AirPlay 1 RTP, AirPlay 2 realtime) to a coprocessor that decrypts
-//! and decodes them, instead of doing it on the receiving thread.
+//! Offload: hand a stream's audio to the application's coprocessor (or its own decoder) instead of decrypting and
+//! decoding it on the receiving thread. One trait for every kind of stream: realtime RTP packets (AirPlay 1, AirPlay
+//! 2 realtime), and AirPlay 2 buffered ALAC frames or AAC access units.
 //!
-//! The receiver submits each packet as it arrives and collects finished ones in submission order, so a job's
-//! latency overlaps the wait for the next packet and the receiving thread never blocks on the coprocessor. An
-//! offload that can't take a packet (full, unsupported, failed) returns `false` from [`PacketOffload::submit`] and
-//! the packet is processed in software as before. Install one with
-//! [`RaopServerBuilder::packet_offload`](crate::RaopServerBuilder::packet_offload).
+//! The receiver submits work as it arrives (buffered audio: shortly before it is due) and collects finished work in
+//! submission order, so a job's latency overlaps the wait for the next and the receiving thread never blocks on the
+//! coprocessor. An offload that can't take a unit (full, unsupported, failed) returns `false` from
+//! [`Offload::submit`] and the unit is processed in software as before. Install one with
+//! [`RaopServerBuilder::offload`](crate::RaopServerBuilder::offload).
 
 use std::sync::Arc;
 
@@ -47,88 +48,60 @@ pub struct OffloadAlac {
     pub channels: u8,
 }
 
-/// What an offload is asked to do for every packet of a stream.
-#[derive(Clone)]
-pub struct OffloadStream {
-    /// How the packets are encrypted.
-    pub cipher: OffloadCipher,
-    /// Decode ALAC too (else the offload returns the plaintext payload for the software decoder).
-    pub alac: Option<OffloadAlac>,
+/// The work a stream asks of an offload, when it starts.
+pub enum OffloadJob<'a> {
+    /// Whole RTP packets, header included (AirPlay 1, AirPlay 2 realtime): decrypt, and decode ALAC too if `alac`
+    /// (else hand back the plaintext payload for the software decoder).
+    Packets {
+        /// How the packets are encrypted.
+        cipher: &'a OffloadCipher,
+        /// The stream's ALAC parameters, to decode.
+        alac: Option<&'a OffloadAlac>,
+    },
+    /// AirPlay 2 buffered ALAC frames, in the clear.
+    AlacFrames {
+        /// The stream's ALAC parameters.
+        alac: &'a OffloadAlac,
+        /// Its sample rate.
+        sample_rate: u32,
+    },
+    /// AirPlay 2 buffered AAC-LC access units (no ADTS).
+    AacFrames {
+        /// The stream's sample rate.
+        sample_rate: u32,
+        /// Its channels.
+        channels: u8,
+    },
 }
 
-/// A finished packet.
-pub enum OffloadOutput<'a> {
-    /// Decoded interleaved 16-bit samples.
-    Pcm(&'a [i16]),
-    /// The decrypted payload, for the software decoder.
+/// A finished unit.
+pub enum Decoded<'a> {
+    /// Interleaved 16-bit samples.
+    S16(&'a [i16]),
+    /// Interleaved 24-bit samples, sign-extended to 32 bits.
+    S24(&'a [i32]),
+    /// The decrypted payload, for the software decoder ([`OffloadJob::Packets`] without `alac`).
     Plain(&'a [u8]),
     /// Dropped: authentication failed, the frame didn't decode, or the coprocessor failed.
     Failed,
 }
 
-/// A coprocessor's per-stream queue. Packets are whole RTP packets, header included.
-pub trait PacketOffload: Send {
-    /// Queue a packet under `tag`; `false` if it can't be taken (then the caller processes it itself).
-    fn submit(&mut self, tag: u32, packet: &[u8]) -> bool;
-    /// Hand over finished packets in submission order, stopping at the first that isn't finished.
-    fn collect(&mut self, done: &mut dyn FnMut(u32, OffloadOutput<'_>));
-    /// Packets submitted and not yet collected.
-    fn in_flight(&self) -> usize;
-}
-
-/// Makes a stream's offload, or `None` to process the stream in software.
-pub type OffloadFactory =
-    Arc<dyn Fn(&OffloadStream) -> Option<Box<dyn PacketOffload>> + Send + Sync>;
-
-/// An AAC-LC decoder supplied by the application, for AirPlay 2 buffered audio: raw access units in (no ADTS),
-/// interleaved 16-bit PCM out. Install with
-/// [`RaopServerBuilder::aac_decoder`](crate::RaopServerBuilder::aac_decoder).
-pub trait AacDecoder: Send {
-    /// Decode one access unit; `None` drops it.
-    fn decode(&mut self, access_unit: &[u8]) -> Option<Vec<i16>>;
-
-    /// A decoder that works asynchronously (on a coprocessor) queues an access unit under `tag` and returns
-    /// `true`; the playout then submits frames shortly before they are due and collects them in order. The
-    /// default, `false`, means every frame goes through [`decode`](Self::decode) when it is due.
-    fn submit(&mut self, _tag: u32, _access_unit: &[u8]) -> bool {
-        false
-    }
-
-    /// Hand over finished units in submission order, stopping at the first unfinished one (`None`: dropped).
-    fn collect(&mut self, _done: &mut dyn FnMut(u32, Option<&[i16]>)) {}
-
+/// A coprocessor's (or the application's decoder's) per-stream queue.
+pub trait Offload: Send {
+    /// Queue a unit under `tag`; `false` if it can't be taken now (then it is processed in software, or by
+    /// [`decode`](Offload::decode) for AAC).
+    fn submit(&mut self, tag: u32, unit: &[u8]) -> bool;
+    /// Hand over finished units in submission order, stopping at the first that isn't finished.
+    fn collect(&mut self, done: &mut dyn FnMut(u32, Decoded<'_>));
     /// Units submitted and not yet collected.
-    fn in_flight(&self) -> usize {
-        0
+    fn in_flight(&self) -> usize;
+    /// For [`OffloadJob::AacFrames`]: decode an access unit now, one [`submit`](Offload::submit) declined (an
+    /// application's AAC decoder replaces the library's: a synchronous one declines every submit and decodes
+    /// here). `None` drops the unit. Not called for the other jobs.
+    fn decode(&mut self, _unit: &[u8]) -> Option<Vec<i16>> {
+        None
     }
 }
 
-/// Samples an application's frame decoder hands back.
-pub enum FramePcm<'a> {
-    /// Interleaved 16-bit samples.
-    S16(&'a [i16]),
-    /// Interleaved 24-bit samples, sign-extended to 32 bits.
-    S24(&'a [i32]),
-}
-
-/// AirPlay 2 buffered ALAC frames decoded by the application (a coprocessor), ahead of playout like
-/// [`AacDecoder`]'s asynchronous interface: the playout submits frames shortly before they are due and collects
-/// them in order. A frame it doesn't take is decoded by the library's own ALAC decoder (and, if nothing was in
-/// flight, the rest of the stream too). Install with
-/// [`RaopServerBuilder::alac_offload`](crate::RaopServerBuilder::alac_offload).
-pub trait AlacOffload: Send {
-    /// Queue a frame under `tag`; `false` if it can't be taken now.
-    fn submit(&mut self, tag: u32, frame: &[u8]) -> bool;
-    /// Hand over finished frames in submission order, stopping at the first unfinished one (`None`: dropped).
-    fn collect(&mut self, done: &mut dyn FnMut(u32, Option<FramePcm<'_>>));
-    /// Frames submitted and not yet collected.
-    fn in_flight(&self) -> usize;
-}
-
-/// Makes a buffered ALAC stream's offload from its parameters and sample rate, or `None` to decode it in software.
-pub type AlacOffloadFactory =
-    Arc<dyn Fn(&OffloadAlac, u32) -> Option<Box<dyn AlacOffload>> + Send + Sync>;
-
-/// Makes a stream's AAC decoder from its sample rate and channel count, or `None` to use the library's own
-/// (`aac-symphonia`).
-pub type AacDecoderFactory = Arc<dyn Fn(u32, u8) -> Option<Box<dyn AacDecoder>> + Send + Sync>;
+/// Makes a stream's offload for its job, or `None` to process the stream in software.
+pub type OffloadFactory = Arc<dyn Fn(&OffloadJob<'_>) -> Option<Box<dyn Offload>> + Send + Sync>;

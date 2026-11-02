@@ -1046,7 +1046,7 @@ fn setup_stream_realtime(
             sample_rate: conn.shared.output_sample_rate,
             max_channels: conn.shared.output_max_channels,
             format: conn.shared.output_format,
-            offload: conn.shared.packet_offload.clone(),
+            offload: conn.shared.offload.clone(),
             latency_min: stream0
                 .get("latencyMin")
                 .and_then(|v| v.as_unsigned_integer())
@@ -1171,8 +1171,7 @@ fn setup_stream_buffered(
         sample_rate: conn.shared.output_sample_rate,
         max_channels: conn.shared.output_max_channels,
         format: conn.shared.output_format,
-        aac_decoder: conn.shared.aac_decoder.clone(),
-        alac_offload: conn.shared.alac_offload.clone(),
+        offload: conn.shared.offload.clone(),
         offset_ns: conn.shared.buffered_offset_ns,
     };
 

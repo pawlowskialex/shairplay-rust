@@ -35,10 +35,8 @@ pub(crate) struct OutputConfig {
     pub(crate) max_channels: Option<u8>,
     /// Sample format of the PCM handed to the session.
     pub(crate) format: crate::raop::SampleFormat,
-    /// The application's AAC decoder, tried first.
-    pub(crate) aac_decoder: Option<crate::raop::offload::AacDecoderFactory>,
-    /// The application's ALAC offload, tried first.
-    pub(crate) alac_offload: Option<crate::raop::offload::AlacOffloadFactory>,
+    /// The application's offload (its AAC decoder, its ALAC offload), tried first.
+    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
     /// Added to every frame's network time (may be negative; the builder's buffered_offset_ms)
     pub(crate) offset_ns: i64,
 }
@@ -49,8 +47,7 @@ impl std::fmt::Debug for OutputConfig {
             .field("sample_rate", &self.sample_rate)
             .field("max_channels", &self.max_channels)
             .field("format", &self.format)
-            .field("aac_decoder", &self.aac_decoder.is_some())
-            .field("alac_offload", &self.alac_offload.is_some())
+            .field("offload", &self.offload.is_some())
             .finish()
     }
 }
@@ -481,9 +478,10 @@ async fn receive_loop(
 /// The decoder and output shaping for the current stream format.
 struct Stream {
     ssrc: AudioSsrc,
+    /// The library's decoder: ALAC's always (for frames the offload doesn't take), AAC's without the application's
     decoder: Option<Box<dyn AacBackend>>,
-    /// The application's ALAC offload: frames it takes are decoded there, the rest by `decoder`.
-    alac_offload: Option<Box<dyn crate::raop::offload::AlacOffload>>,
+    /// The application's offload: frames it takes are decoded there; an AAC one also decodes the rest itself.
+    offload: Option<Box<dyn crate::raop::offload::Offload>>,
     #[cfg(feature = "resample")]
     resampler: Option<crate::codec::resample::StreamResampler>,
     src_channels: u8,
@@ -513,29 +511,35 @@ impl Stream {
     ) -> (Self, AudioFormat) {
         let src_sr = ssrc.sample_rate();
         let src_ch = ssrc.channels();
-        let mut alac_offload = None;
-        let decoder = if ssrc.is_alac() {
+        use crate::raop::offload::OffloadJob;
+        let factory = output_config.offload.as_ref();
+        let (offload, decoder) = if ssrc.is_alac() {
             let bit_depth = ssrc.bit_depth().unwrap_or(16);
             let params = crate::codec::alac::buffered_params(bit_depth, src_ch);
-            alac_offload = output_config
-                .alac_offload
-                .as_ref()
-                .and_then(|f| f(&params, src_sr));
-            Ok(Box::new(crate::codec::alac::buffered_decoder(
-                src_sr, bit_depth, src_ch,
-            )) as Box<dyn AacBackend>)
+            let offload = factory.and_then(|f| {
+                f(&OffloadJob::AlacFrames {
+                    alac: &params,
+                    sample_rate: src_sr,
+                })
+            });
+            let alac = crate::codec::alac::buffered_decoder(src_sr, bit_depth, src_ch);
+            (offload, Ok(Some(Box::new(alac) as Box<dyn AacBackend>)))
         } else {
-            let external = output_config
-                .aac_decoder
-                .as_ref()
-                .and_then(|f| f(src_sr, src_ch));
-            match external {
-                Some(d) => Ok(Box::new(crate::codec::aac::External(d)) as Box<dyn AacBackend>),
-                None => crate::codec::aac::new_decoder(src_sr, src_ch),
-            }
+            let offload = factory.and_then(|f| {
+                f(&OffloadJob::AacFrames {
+                    sample_rate: src_sr,
+                    channels: src_ch,
+                })
+            });
+            // the application's decoder replaces the library's
+            let decoder = match offload {
+                Some(_) => Ok(None),
+                None => crate::codec::aac::new_decoder(src_sr, src_ch).map(Some),
+            };
+            (offload, decoder)
         };
         let decoder = match decoder {
-            Ok(d) => Some(d),
+            Ok(d) => d,
             Err(e) => {
                 warn!("Failed to create AAC decoder for {:?}: {e}", ssrc);
                 handler.on_error(&ShairplayError::Codec(CodecError::UnsupportedFormat(format!(
@@ -572,7 +576,7 @@ impl Stream {
         let stream = Self {
             ssrc,
             decoder,
-            alac_offload,
+            offload,
             #[cfg(feature = "resample")]
             resampler,
             src_channels: src_ch,
@@ -583,8 +587,12 @@ impl Stream {
         (stream, format)
     }
 
-    fn decode(&mut self, aac: &[u8]) -> Option<crate::codec::Pcm> {
-        let pcm = self.decoder.as_mut()?.decode(aac)?;
+    fn decode(&mut self, frame: &[u8]) -> Option<crate::codec::Pcm> {
+        let pcm = match (self.offload.as_mut(), self.ssrc.is_alac()) {
+            // the application's AAC decoder decodes what it didn't take ahead
+            (Some(o), false) => crate::codec::Pcm::S16(o.decode(frame)?),
+            _ => self.decoder.as_mut()?.decode(frame)?,
+        };
         Some(self.shape(pcm))
     }
 
@@ -600,32 +608,23 @@ impl Stream {
 
     /// Queue a frame with an asynchronous decoder; `false` if it has none or it can't take the frame now.
     fn submit(&mut self, tag: u32, frame: &[u8]) -> bool {
-        if let Some(o) = self.alac_offload.as_mut() {
-            return o.submit(tag, frame);
-        }
-        self.decoder
-            .as_mut()
-            .and_then(|d| d.external())
-            .is_some_and(|d| d.submit(tag, frame))
+        self.offload.as_mut().is_some_and(|o| o.submit(tag, frame))
     }
 
     /// Finished frames into their `ahead` entries.
     fn collect(&mut self, ahead: &mut VecDeque<Ahead>) {
         use crate::codec::Pcm;
-        use crate::raop::offload::FramePcm;
+        use crate::raop::offload::Decoded;
         let mut done: Vec<(u32, Option<Pcm>)> = Vec::new();
-        if let Some(o) = self.alac_offload.as_mut() {
-            o.collect(&mut |tag, pcm| {
-                done.push((
-                    tag,
-                    pcm.map(|p| match p {
-                        FramePcm::S16(v) => Pcm::S16(v.to_vec()),
-                        FramePcm::S24(v) => Pcm::S24(v.to_vec()),
-                    }),
-                ))
+        if let Some(o) = self.offload.as_mut() {
+            o.collect(&mut |tag, out| {
+                let pcm = match out {
+                    Decoded::S16(v) => Some(Pcm::S16(v.to_vec())),
+                    Decoded::S24(v) => Some(Pcm::S24(v.to_vec())),
+                    Decoded::Plain(_) | Decoded::Failed => None,
+                };
+                done.push((tag, pcm));
             });
-        } else if let Some(d) = self.decoder.as_mut().and_then(|d| d.external()) {
-            d.collect(&mut |tag, pcm| done.push((tag, pcm.map(|v| Pcm::S16(v.to_vec())))));
         }
         for (tag, pcm) in done {
             let pcm = pcm.map(|p| self.shape(p));
@@ -943,7 +942,7 @@ mod decode_ahead_tests {
         queue: VecDeque<(u32, i16, Instant)>,
     }
 
-    impl crate::raop::offload::AacDecoder for Mock {
+    impl crate::raop::offload::Offload for Mock {
         fn decode(&mut self, au: &[u8]) -> Option<Vec<i16>> {
             Some(vec![au[0] as i16; 2048])
         }
@@ -954,13 +953,13 @@ mod decode_ahead_tests {
             }
             self.asynchronous
         }
-        fn collect(&mut self, done: &mut dyn FnMut(u32, Option<&[i16]>)) {
+        fn collect(&mut self, done: &mut dyn FnMut(u32, crate::raop::offload::Decoded<'_>)) {
             while let Some(&(tag, v, at)) = self.queue.front() {
                 if Instant::now() < at {
                     return;
                 }
                 self.queue.pop_front();
-                done(tag, Some(&vec![v; 2048]));
+                done(tag, crate::raop::offload::Decoded::S16(&vec![v; 2048]));
             }
         }
         fn in_flight(&self) -> usize {
@@ -1008,19 +1007,18 @@ mod decode_ahead_tests {
         let state = Arc::new((Mutex::new(st), Condvar::new()));
         let out = Arc::new(StdMutex::new(Vec::new()));
         let handler: Arc<dyn AudioHandler> = Arc::new(Handler(out.clone()));
-        let factory: crate::raop::offload::AacDecoderFactory = Arc::new(move |_, _| {
+        let factory: crate::raop::offload::OffloadFactory = Arc::new(move |_| {
             Some(Box::new(Mock {
                 asynchronous,
                 delay: Duration::from_millis(12),
                 queue: VecDeque::new(),
-            }) as Box<dyn crate::raop::offload::AacDecoder>)
+            }) as Box<dyn crate::raop::offload::Offload>)
         });
         let config = OutputConfig {
             sample_rate: None,
             max_channels: None,
             format: crate::raop::SampleFormat::S16,
-            aac_decoder: Some(factory),
-            alac_offload: None,
+            offload: Some(factory),
             offset_ns: 0,
         };
         let st = state.clone();
@@ -1068,7 +1066,7 @@ mod decode_ahead_tests {
         queue: VecDeque<(u32, i32, Instant)>,
     }
 
-    impl crate::raop::offload::AlacOffload for AlacMock {
+    impl crate::raop::offload::Offload for AlacMock {
         fn submit(&mut self, tag: u32, frame: &[u8]) -> bool {
             if self.decline.contains(&frame[0]) {
                 return false;
@@ -1077,19 +1075,13 @@ mod decode_ahead_tests {
             self.queue.push_back((tag, i32::from(frame[0]) << 4, at));
             true
         }
-        fn collect(
-            &mut self,
-            done: &mut dyn FnMut(u32, Option<crate::raop::offload::FramePcm<'_>>),
-        ) {
+        fn collect(&mut self, done: &mut dyn FnMut(u32, crate::raop::offload::Decoded<'_>)) {
             while let Some(&(tag, v, at)) = self.queue.front() {
                 if Instant::now() < at {
                     return;
                 }
                 self.queue.pop_front();
-                done(
-                    tag,
-                    Some(crate::raop::offload::FramePcm::S24(&vec![v; 704])),
-                );
+                done(tag, crate::raop::offload::Decoded::S24(&vec![v; 704]));
             }
         }
         fn in_flight(&self) -> usize {
@@ -1137,22 +1129,28 @@ mod decode_ahead_tests {
         let state = Arc::new((Mutex::new(st), Condvar::new()));
         let out = Arc::new(StdMutex::new((Vec::new(), Vec::new())));
         let handler: Arc<dyn AudioHandler> = Arc::new(Handler32(out.clone()));
-        let factory: crate::raop::offload::AlacOffloadFactory = Arc::new(move |p, rate| {
+        let factory: crate::raop::offload::OffloadFactory = Arc::new(move |job| {
+            let crate::raop::offload::OffloadJob::AlacFrames {
+                alac: p,
+                sample_rate: rate,
+            } = job
+            else {
+                panic!("an ALAC stream asked for another job");
+            };
             assert_eq!(
-                (p.frame_length, p.bit_depth, p.channels, rate),
+                (p.frame_length, p.bit_depth, p.channels, *rate),
                 (352, 24, 2, 48000)
             );
             Some(Box::new(AlacMock {
                 decline: decline.clone(),
                 queue: VecDeque::new(),
-            }) as Box<dyn crate::raop::offload::AlacOffload>)
+            }) as Box<dyn crate::raop::offload::Offload>)
         });
         let config = OutputConfig {
             sample_rate: None,
             max_channels: None,
             format: crate::raop::SampleFormat::Integer,
-            aac_decoder: None,
-            alac_offload: Some(factory),
+            offload: Some(factory),
             offset_ns: 0,
         };
         let st = state.clone();
@@ -1190,7 +1188,14 @@ mod decode_ahead_tests {
 
     /// An AAC decoder (synchronous) that counts the live ones.
     struct Live(Arc<std::sync::atomic::AtomicUsize>);
-    impl crate::raop::offload::AacDecoder for Live {
+    impl crate::raop::offload::Offload for Live {
+        fn submit(&mut self, _: u32, _: &[u8]) -> bool {
+            false
+        }
+        fn collect(&mut self, _: &mut dyn FnMut(u32, crate::raop::offload::Decoded<'_>)) {}
+        fn in_flight(&self) -> usize {
+            0
+        }
         fn decode(&mut self, au: &[u8]) -> Option<Vec<i16>> {
             Some(vec![au[0] as i16; 2048])
         }
@@ -1229,23 +1234,22 @@ mod decode_ahead_tests {
         let live = Arc::new(AtomicUsize::new(0));
         let alive_at_alac = Arc::new(AtomicUsize::new(usize::MAX));
         let (l1, l2, a2) = (live.clone(), live.clone(), alive_at_alac.clone());
-        let aac: crate::raop::offload::AacDecoderFactory = Arc::new(move |_, _| {
-            l1.fetch_add(1, SeqCst);
-            Some(Box::new(Live(l1.clone())) as Box<dyn crate::raop::offload::AacDecoder>)
-        });
-        let alac: crate::raop::offload::AlacOffloadFactory = Arc::new(move |_, _| {
+        let factory: crate::raop::offload::OffloadFactory = Arc::new(move |job| {
+            if let crate::raop::offload::OffloadJob::AacFrames { .. } = job {
+                l1.fetch_add(1, SeqCst);
+                return Some(Box::new(Live(l1.clone())) as Box<dyn crate::raop::offload::Offload>);
+            }
             a2.store(l2.load(SeqCst), SeqCst);
             Some(Box::new(AlacMock {
                 decline: 0..0,
                 queue: VecDeque::new(),
-            }) as Box<dyn crate::raop::offload::AlacOffload>)
+            }) as Box<dyn crate::raop::offload::Offload>)
         });
         let config = OutputConfig {
             sample_rate: None,
             max_channels: None,
             format: crate::raop::SampleFormat::S16,
-            aac_decoder: Some(aac),
-            alac_offload: Some(alac),
+            offload: Some(factory),
             offset_ns: 0,
         };
         let st = state.clone();

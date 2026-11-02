@@ -87,17 +87,19 @@ pub(crate) async fn run(
     let mut src_ch: u8 = 2;
     let mut out_ch: u8 = 2;
 
+    let offload_cipher = crate::raop::offload::OffloadCipher::ChaCha20Poly1305 { key: shk };
+    let alac = crate::raop::offload::OffloadAlac {
+        frame_length: output_config.samples_per_frame,
+        bit_depth: output_config.bit_depth,
+        pb: 40,
+        mb: 10,
+        kb: 14,
+        channels: output_config.channels,
+    };
     let mut offload = output_config.offload.as_ref().and_then(|f| {
-        f(&crate::raop::offload::OffloadStream {
-            cipher: crate::raop::offload::OffloadCipher::ChaCha20Poly1305 { key: shk },
-            alac: Some(crate::raop::offload::OffloadAlac {
-                frame_length: output_config.samples_per_frame,
-                bit_depth: output_config.bit_depth,
-                pb: 40,
-                mb: 10,
-                kb: 14,
-                channels: output_config.channels,
-            }),
+        f(&crate::raop::offload::OffloadJob::Packets {
+            cipher: &offload_cipher,
+            alac: Some(&alac),
         })
     });
 
@@ -164,10 +166,9 @@ pub(crate) async fn run(
                     // each packet out takes its timestamp, whatever became of it
                     let ts = offload_ts.pop_front();
                     let pcm = match out {
-                        crate::raop::offload::OffloadOutput::Pcm(s) => {
-                            crate::codec::Pcm::S16(s.to_vec())
-                        }
-                        crate::raop::offload::OffloadOutput::Plain(p) => {
+                        crate::raop::offload::Decoded::S16(s) => crate::codec::Pcm::S16(s.to_vec()),
+                        crate::raop::offload::Decoded::S24(s) => crate::codec::Pcm::S24(s.to_vec()),
+                        crate::raop::offload::Decoded::Plain(p) => {
                             match decoder.as_mut().and_then(|d| d.decode_frame_pcm(p)) {
                                 Some(pcm) => pcm,
                                 None => {
@@ -176,7 +177,7 @@ pub(crate) async fn run(
                                 }
                             }
                         }
-                        crate::raop::offload::OffloadOutput::Failed => {
+                        crate::raop::offload::Decoded::Failed => {
                             silence!(1);
                             return;
                         }

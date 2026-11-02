@@ -71,10 +71,7 @@ pub use net::mdns_scope::{MdnsScope, MdnsScopeApplied};
 pub use net::server::BindConfig;
 #[cfg(feature = "hls")]
 pub use raop::hls::{HlsHandler, HlsSession};
-pub use raop::offload::{
-    AacDecoder, AacDecoderFactory, AlacOffload, AlacOffloadFactory, FramePcm, OffloadAlac,
-    OffloadCipher, OffloadFactory, OffloadOutput, OffloadStream, PacketOffload,
-};
+pub use raop::offload::{Decoded, Offload, OffloadAlac, OffloadCipher, OffloadFactory, OffloadJob};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 #[cfg(feature = "ap2-core")]
