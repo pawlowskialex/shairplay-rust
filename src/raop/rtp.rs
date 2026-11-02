@@ -549,13 +549,15 @@ mod tests {
         assert!(Ap1Format::parse("96 mpeg4-generic/44100/2", "").is_none());
     }
 
-    /// What a session got: the first sample of each delivery (0 for silence).
+    /// What a session got: the last sample of each delivery (0 for silence; the first after a silence is faded
+    /// in), and every delivery's first.
     #[derive(Clone, Default)]
-    struct Got(Arc<Mutex<Vec<i16>>>);
+    struct Got(Arc<Mutex<Vec<i16>>>, Arc<Mutex<Vec<i16>>>);
     impl AudioSession for Got {
         fn audio(&mut self, samples: Samples<'_>, _: Option<u64>) {
             if let Samples::S16(s) = samples {
-                self.0.lock().unwrap().push(s[0]);
+                self.0.lock().unwrap().push(s[s.len() - 1]);
+                self.1.lock().unwrap().push(s[0]);
             }
         }
     }
@@ -660,8 +662,9 @@ mod tests {
         assert!(got.0.lock().unwrap().is_empty(), "nothing back yet");
         finish(&q);
         p.drain();
-        // 65534 as -2, 65535 as -1, 0, silence for 1, 2
+        // 65534 as -2, 65535 as -1, 0, silence for 1, 2 (fading in: its first sample is 2 * 1/2 of the way, 1)
         assert_eq!(*got.0.lock().unwrap(), [-2, -1, 0, 0, 2]);
+        assert_eq!(got.1.lock().unwrap()[4], 1);
     }
 
     /// A sender that opens with placeholders under the first sequence numbers, then sends the frames under the

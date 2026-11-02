@@ -315,9 +315,14 @@ pub(crate) struct Output {
     session: Option<Box<dyn AudioSession>>,
     format: AudioFormat,
     src_channels: u8,
+    /// Silence took the place of missing audio: what comes next fades in
+    fade_in: bool,
     #[cfg(feature = "resample")]
     resampler: Option<crate::codec::resample::StreamResampler>,
 }
+
+/// Frames audio fades in over after silence that took the place of missing audio (5.8 ms at 44.1 kHz).
+const FADE_IN: usize = 256;
 
 impl Output {
     /// The handler's session for a stream from `source`.
@@ -357,13 +362,17 @@ impl Output {
             session: Some(handler.audio_init(format)),
             format,
             src_channels: source.channels,
+            fade_in: false,
             #[cfg(feature = "resample")]
             resampler,
         }
     }
 
     /// Samples to the session, to play at `play_at_ns` if the stream is on a timeline.
-    pub(crate) fn play(&mut self, pcm: Pcm, play_at_ns: Option<u64>) {
+    pub(crate) fn play(&mut self, mut pcm: Pcm, play_at_ns: Option<u64>) {
+        if std::mem::take(&mut self.fade_in) {
+            pcm.fade_in(usize::from(self.src_channels), FADE_IN);
+        }
         let pcm = crate::codec::shape(
             pcm,
             self.src_channels,
@@ -376,11 +385,13 @@ impl Output {
         }
     }
 
-    /// `frames` frames of silence (lost audio, played so the output's queue keeps its length).
+    /// `frames` frames of silence (lost audio, played so the output's queue keeps its length); what plays next
+    /// fades in. On a timeline lost audio needs none: the next play time leaves the hole.
     pub(crate) fn silence(&mut self, frames: usize, play_at_ns: Option<u64>) {
         if frames > 0 {
             let n = frames * usize::from(self.src_channels);
             self.play(Pcm::S16(vec![0; n]), play_at_ns);
+            self.fade_in = true;
         }
     }
 
