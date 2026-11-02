@@ -24,6 +24,12 @@ pub struct CipherContext {
     counter: u64,
 }
 
+impl Drop for CipherContext {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+    }
+}
+
 impl CipherContext {
     /// Create a new encryption context from a 256-bit key.
     pub(crate) fn new(key: [u8; 32]) -> Self {

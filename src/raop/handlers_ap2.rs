@@ -13,8 +13,9 @@ use crate::raop::rtp::RaopRtp;
 #[cfg(feature = "ap2-core")]
 use std::sync::atomic::Ordering;
 
-use super::handlers_ap1::{RaopConnection, bind_addr_for, local_ip_from};
+use super::handlers_ap1::{PairingStep, Peer, RaopConnection, bind_addr_for, local_ip_from};
 use super::rtsp::{Handled, RtspError, bad, plist_body};
+use super::sessions::Stream;
 
 #[cfg(feature = "ap2-core")]
 fn bind_tcp(addr: std::net::SocketAddr) -> Result<(tokio::net::TcpListener, u16), RtspError> {
@@ -40,15 +41,18 @@ fn bind_udp(addr: std::net::SocketAddr) -> Result<(tokio::net::UdpSocket, u16), 
 
 #[cfg(feature = "ap2-core")]
 impl RaopConnection {
-    /// Decouple network event stream listener spawning from high-level RTSP handlers.
+    /// The event channel: the sender connects to `event_listener`, then what goes into `rx` goes to it. It ends with
+    /// the connection (`sender`, the channel's own end, kept until then: what the application holds may go first).
     pub(crate) fn spawn_event_channel(
         &mut self,
         event_listener: tokio::net::TcpListener,
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
         rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        sender: crate::raop::event_channel::EventSender,
     ) {
         let peer = self.remote_socket.ip();
-        tokio::spawn(async move {
+        self.tasks.push(crate::util::OwnedTask::spawn(async move {
+            let _sender = sender;
             if let Some((stream, addr)) = crate::net::accept_from(&event_listener, peer).await {
                 tracing::info!(%addr, "Event channel client connected");
                 crate::net::keepalive(&stream);
@@ -59,7 +63,18 @@ impl RaopConnection {
                 )
                 .await;
             }
-        });
+        }));
+    }
+
+    /// The pair-setup state M3 or M5 continues from (taken: one proof per M1).
+    fn take_setup(&mut self) -> Option<Box<crate::crypto::pairing_homekit::SrpServer>> {
+        match std::mem::replace(&mut self.pairing_step, PairingStep::None) {
+            PairingStep::Setup(srp) => Some(srp),
+            other => {
+                self.pairing_step = other;
+                None
+            }
+        }
     }
 }
 
@@ -109,12 +124,12 @@ pub(crate) fn handle_pair_setup(
                 return Ok(Some(pairing_homekit::pairing_error_response(2)));
             }
             let m2 = srp.build_m2();
-            conn.srp_server = Some(srp);
+            conn.pairing_step = PairingStep::Setup(Box::new(srp));
             Ok(Some(m2))
         }
         3 => {
             // one proof per M1: the SRP state (b, B) goes with it, so a wrong PIN can't be tried again against it
-            let Some(mut srp) = conn.srp_server.take() else {
+            let Some(mut srp) = conn.take_setup() else {
                 return Ok(Some(pairing_homekit::pairing_error_response(4)));
             };
             if !srp.process_m3(data).unwrap_or(false) {
@@ -124,17 +139,19 @@ pub(crate) fn handle_pair_setup(
             }
             let m4 = srp.build_m4().map_err(failed("pair-setup M4"))?;
             if srp.is_transient() {
-                conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
-                conn.is_ap2 = true;
+                conn.secret = srp
+                    .shared_secret()
+                    .map(|s| zeroize::Zeroizing::new(s.to_vec()));
+                conn.peer = Peer::Transient;
                 tracing::info!("AP2 transient pair-setup complete");
             } else {
                 // M5 follows
-                conn.srp_server = Some(srp);
+                conn.pairing_step = PairingStep::Setup(srp);
             }
             Ok(Some(m4))
         }
         5 => {
-            let Some(mut srp) = conn.srp_server.take() else {
+            let Some(mut srp) = conn.take_setup() else {
                 return Ok(Some(pairing_homekit::pairing_error_response(6)));
             };
             match srp.process_m5(data) {
@@ -215,8 +232,11 @@ pub(crate) fn handle_pair_verify(
                 Ok(m2) => {
                     tracing::debug!(m2_len = m2.len(), "pair-verify M2 built");
                     // Store ECDH shared secret immediately (needed for video even if M3 never arrives)
-                    conn.pair_verify_secret = Some(*pv.ecdh_shared_secret());
-                    conn.pair_verify = Some(pv);
+                    #[cfg(feature = "video")]
+                    {
+                        conn.ecdh = Some(zeroize::Zeroizing::new(*pv.ecdh_shared_secret()));
+                    }
+                    conn.pairing_step = PairingStep::Verify(Box::new(pv));
                     Ok(Some(m2))
                 }
                 Err(e) => {
@@ -227,20 +247,30 @@ pub(crate) fn handle_pair_verify(
             }
         }
         3 => {
-            let Some(pv) = conn.pair_verify.as_mut() else {
+            // its state goes with this message, whatever comes of it
+            let PairingStep::Verify(mut pv) =
+                std::mem::replace(&mut conn.pairing_step, PairingStep::None)
+            else {
                 tracing::warn!("pair-verify M3 without M1");
                 return Ok(Some(pairing_homekit::pairing_error_response(4)));
             };
             let store = conn.shared.pairing_store.clone();
             match pv.process_m3_build_m4(data, Some(&|id| store.get(id))) {
                 Ok(m4) => {
-                    conn.pair_verify_secret = pv.shared_secret().copied();
-                    conn.ap2_shared_secret = pv.shared_secret().map(|s| s.to_vec());
-                    conn.is_ap2 = true;
-                    if let Some(c) = pv.controller() {
-                        conn.controller = Some(c.to_string());
-                        conn.shared.verified_as(conn.id, c, &conn.close);
+                    #[cfg(feature = "video")]
+                    {
+                        conn.ecdh = pv.shared_secret().map(|s| zeroize::Zeroizing::new(*s));
                     }
+                    conn.secret = pv
+                        .shared_secret()
+                        .map(|s| zeroize::Zeroizing::new(s.to_vec()));
+                    conn.peer = match pv.controller() {
+                        Some(c) => {
+                            conn.shared.sessions.verified(conn.id, c);
+                            Peer::Controller(c.to_string())
+                        }
+                        None => Peer::Transient,
+                    };
                     tracing::info!("AP2 pair-verify complete, encrypted RTSP active");
                     Ok(Some(m4))
                 }
@@ -266,11 +296,11 @@ pub(crate) fn handle_pairings(
     response.add_header("Content-Type", "application/pairing+tlv8");
     let (body, removed) = pairings(
         conn.shared.pairing_store.as_ref(),
-        conn.controller.as_deref(),
+        conn.controller(),
         request.data().unwrap_or(&[]),
     );
     for id in removed {
-        conn.shared.close_controller(&id);
+        conn.shared.sessions.close_controller(&id);
     }
     Ok(Some(body))
 }
@@ -802,7 +832,7 @@ fn setup_initial(
                     // Stage 2: hash with ECDH only if AP2 pairing was used.
                     // With UxPlay-style features (bit 27 off), no pairing occurs
                     // and the raw FairPlay key is used directly.
-                    let derived = if let Some(ref secret) = conn.ap2_shared_secret {
+                    let derived = if let Some(secret) = conn.secret.as_deref() {
                         use sha2::{Digest, Sha512};
                         let mut hasher = Sha512::new();
                         hasher.update(fp_key);
@@ -839,7 +869,7 @@ fn setup_initial(
     }
 
     if let Some(id) = dict.get("deviceID").and_then(|v| v.as_string()) {
-        conn.sender_id = id.to_string();
+        conn.shared.sessions.set_sender(conn.id, id);
     }
 
     let is_rc_only = dict
@@ -856,13 +886,13 @@ fn setup_initial(
     if is_rc_only {
         tracing::info!("Remote Control Only connection - establishing event channel");
 
-        let event_port_resp = if let Some(shared_secret) = conn.ap2_shared_secret.as_ref() {
+        let event_port_resp = if let Some(shared_secret) = conn.secret.clone() {
             let (event_listener, event_port) = bind_tcp(bind_addr_for(conn))?;
 
             if let Ok(event_channel_cipher) =
-                crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
+                crate::crypto::chacha_transport::EncryptedChannel::events(&shared_secret)
             {
-                let event_sender = {
+                {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
                     if let Some(msg) = build_update_info_message(
@@ -875,10 +905,8 @@ fn setup_initial(
                     }
 
                     let sender = crate::raop::event_channel::EventSender::from_tx(tx);
-                    conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
-                    sender
-                };
-                conn.event_sender = Some(event_sender);
+                    conn.spawn_event_channel(event_listener, event_channel_cipher, rx, sender);
+                }
             }
             event_port as u64
         } else {
@@ -909,12 +937,12 @@ fn setup_initial(
 
     // Derive event channel encryption keys from shared secret (AP2 only).
     // In legacy mode there's no shared secret — skip the encrypted event channel.
-    if let Some(shared_secret) = conn.ap2_shared_secret.as_ref()
+    if let Some(shared_secret) = conn.secret.clone()
         && let Ok(event_channel_cipher) =
-            crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
+            crate::crypto::chacha_transport::EncryptedChannel::events(&shared_secret)
     {
         // Spawn bidirectional event channel
-        let event_sender = {
+        {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Queue updateInfo so it's sent immediately when client connects
@@ -942,14 +970,12 @@ fn setup_initial(
                     conn.mr_supported.clone(),
                 ),
             ));
-            conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
-            sender
-        };
-        conn.event_sender = Some(event_sender);
+            conn.spawn_event_channel(event_listener, event_channel_cipher, rx, sender);
+        }
     }
 
     // In legacy mode, event channel is not encrypted — return port 0 like UxPlay.
-    let event_port_resp = if conn.ap2_shared_secret.is_some() {
+    let event_port_resp = if conn.secret.is_some() {
         event_port as u64
     } else {
         0
@@ -963,7 +989,7 @@ fn setup_initial(
     // The iPhone needs NTP sync before it sends the stream SETUP.
     // RaopRtp is created later in the stream SETUP with real ALAC parameters.
     #[cfg(feature = "video")]
-    let timing_port = if !conn.is_ap2 && conn.ekey.is_some() {
+    let timing_port = if !conn.paired() && conn.ekey.is_some() {
         let timing_rport = dict
             .get("timingPort")
             .and_then(|v| v.as_unsigned_integer())
@@ -972,7 +998,8 @@ fn setup_initial(
         let (tsock, tport) = bind_udp(bind_addr_for(conn))?;
         let mut remote_timing = conn.remote_socket;
         remote_timing.set_port(timing_rport);
-        crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing, None);
+        conn.tasks
+            .push(crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing, None).into());
         tracing::debug!(tport, timing_rport, "Legacy video: NTP timing socket bound");
         tport
     } else {
@@ -1061,8 +1088,6 @@ fn setup_stream_realtime(
                 sender: std::net::SocketAddr::new(conn.remote_socket.ip(), p as u16),
             });
 
-        conn.shared
-            .claim_stream(conn.id, &conn.sender_id, &conn.close);
         let handler = conn.shared.handler.clone();
         let output_config = crate::raop::realtime_audio::OutputConfig {
             source_sample_rate: alac_format.sample_rate,
@@ -1081,18 +1106,14 @@ fn setup_stream_realtime(
             latency_ns: conn.shared.realtime_latency_ns,
         };
 
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        conn.realtime_cmd = Some(cmd_tx);
-        let handle = tokio::spawn(crate::raop::realtime_audio::run(
+        let stream = crate::raop::realtime_audio::RealtimeStream::start(
             socket,
             retransmit,
             shk_arr,
             handler,
             output_config,
-            cmd_rx,
-        ));
-        conn.shared
-            .set_active_audio(conn.id, Box::new(move || handle.abort()));
+        );
+        conn.shared.sessions.play(conn.id, Stream::Realtime(stream));
 
         stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     } else {
@@ -1108,7 +1129,7 @@ fn setup_stream_realtime(
             let aes_key = conn.ekey.unwrap_or([0u8; 16]);
             let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
             let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
-            conn.raop_rtp = RaopRtp::new(
+            let rtp = RaopRtp::new(
                 conn.shared.handler.clone(),
                 crate::raop::rtp::RtpConfig {
                     remote: conn.remote_socket.ip().to_string(),
@@ -1125,7 +1146,7 @@ fn setup_stream_realtime(
                     offload: None,
                 },
             );
-            if let Some(rtp) = &mut conn.raop_rtp {
+            if let Some(mut rtp) = rtp {
                 let control_port = stream0
                     .get("controlPort")
                     .and_then(|v| v.as_unsigned_integer())
@@ -1136,6 +1157,7 @@ fn setup_stream_realtime(
                     .map_err(|e| RtspError::internal("legacy ALAC: the RTP ports").report(e))?;
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
                 stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
+                conn.shared.sessions.play(conn.id, Stream::Ap1(rtp));
             }
         }
         #[cfg(not(feature = "video"))]
@@ -1185,8 +1207,6 @@ fn setup_stream_buffered(
 
     let (listener, audio_port) = bind_tcp(bind_addr_for(conn))?;
     tracing::info!(audio_port, "Buffered audio TCP port opened");
-    conn.shared
-        .claim_stream(conn.id, &conn.sender_id, &conn.close);
 
     let handler = conn.shared.handler.clone();
     let output_config = crate::raop::buffered_audio::OutputConfig {
@@ -1201,14 +1221,8 @@ fn setup_stream_buffered(
         listener,
         peer: conn.remote_socket.ip(),
     };
-    let cmd_tx = proc.start(shk_arr, output_config, handler);
-    conn.playout_cmd = Some(cmd_tx.clone());
-    conn.shared.set_active_audio(
-        conn.id,
-        Box::new(move || {
-            let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
-        }),
-    );
+    let stream = proc.start(shk_arr, output_config, handler);
+    conn.shared.sessions.play(conn.id, Stream::Buffered(stream));
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     stream_resp.insert(
@@ -1234,11 +1248,11 @@ fn setup_stream_rc(
         tracing::debug!(data_port, "RC data channel opened");
 
         let peer = conn.remote_socket.ip();
-        tokio::spawn(async move {
+        conn.tasks.push(crate::util::OwnedTask::spawn(async move {
             if let Some((_, addr)) = crate::net::accept_from(&data_listener, peer).await {
                 tracing::info!(%addr, "RC data channel client connected");
             }
-        });
+        }));
 
         stream_resp.insert("streamID".into(), plist::Value::Integer(1_i64.into()));
         stream_resp.insert("dataPort".into(), plist::Value::Integer(data_port.into()));
@@ -1274,7 +1288,7 @@ fn setup_stream_video(
     {
         tracing::debug!("Video key: Stage 3 derivation from aeskey_audio");
         crate::crypto::video_key::derive_stream_key_iv(&aeskey_audio, stream_connection_id)
-    } else if let Some(ecdh) = conn.pair_verify_secret.as_ref() {
+    } else if let Some(ecdh) = conn.ecdh.as_deref() {
         let fp_key = conn.shared.video_ekey.read().ok().and_then(|k| *k);
         if let Some(fp_key) = fp_key {
             let eaes_key = crate::crypto::video_key::derive_eaes_key(&fp_key, ecdh);
@@ -1308,7 +1322,9 @@ fn setup_stream_video(
 
     if let Some(vh) = &conn.shared.video_handler {
         let session = vh.video_init();
-        tokio::spawn(crate::raop::video_stream::run(listener, cipher, session));
+        conn.tasks.push(crate::util::OwnedTask::spawn(
+            crate::raop::video_stream::run(listener, cipher, session),
+        ));
     }
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
@@ -1325,6 +1341,16 @@ pub(crate) fn handle_record(
     tracing::debug!("RECORD");
     response.add_header("Audio-Latency", "0");
     Ok(None)
+}
+
+/// `command` to the buffered stream connection `conn` plays, if it plays one.
+#[cfg(feature = "ap2-core")]
+fn buffered(conn: &RaopConnection, command: crate::raop::buffered_audio::PlayoutCommand) {
+    conn.shared.sessions.with(conn.id, |s| {
+        if let Stream::Buffered(b) = s {
+            b.command(command);
+        }
+    });
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1368,14 +1394,15 @@ pub(crate) fn handle_set_rate_anchor_time(
         tracing::info!("AP2 play pause");
     }
 
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
+    buffered(
+        conn,
+        crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
             timeline,
             rate,
-        });
-    }
+        },
+    );
 
     Ok(None)
 }
@@ -1418,12 +1445,13 @@ pub(crate) fn handle_flush_buffered(
         plist = plist_brief(&plist::Value::Dictionary(dict.clone())),
         "FLUSHBUFFERED"
     );
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush {
+    buffered(
+        conn,
+        crate::raop::buffered_audio::PlayoutCommand::Flush {
             from_seq,
             until_seq,
-        });
-    }
+        },
+    );
     Ok(None)
 }
 
@@ -1438,7 +1466,12 @@ pub(crate) fn handle_feedback(
 ) -> Handled {
     // Only return stream info when audio is actually playing (matches shairport-sync)
     #[cfg(feature = "ap2-core")]
-    if conn.playout_cmd.is_some() {
+    if conn
+        .shared
+        .sessions
+        .with(conn.id, |s| matches!(s, Stream::Buffered(_)))
+        .unwrap_or(false)
+    {
         let mut stream_dict = plist::Dictionary::new();
         stream_dict.insert("type".into(), plist::Value::Integer(103_i64.into()));
         stream_dict.insert("sr".into(), plist::Value::Real(44100.0));

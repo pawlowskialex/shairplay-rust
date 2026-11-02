@@ -1,4 +1,5 @@
-//! Async TCP server for the RTSP connections: reading, request bodies within their limits, plain or encrypted framing, answers off the runtime thread.
+//! Async TCP server for the RTSP connections: reading, request bodies within their limits, plain or encrypted
+//! framing, answers off the runtime thread.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -276,7 +277,7 @@ pub(crate) trait ConnectionHandler: Send + 'static {
         false
     }
 
-    /// A signal that closes the connection (another sender took over).
+    /// A signal that closes the connection (another sender took over, its pairing was removed, the server stops).
     fn close_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
         None
     }
@@ -567,7 +568,7 @@ where
                 }
             } => r,
             _ = closed => {
-                tracing::info!(%remote, "Closing: another sender took over");
+                tracing::info!(%remote, "Closing: another sender took over, its pairing went, or the server stops");
                 None
             }
             () = slot.evict.notified() => {

@@ -66,8 +66,40 @@ pub(crate) enum RealtimeCommand {
     Flush { before: Option<u32> },
 }
 
+/// A running realtime stream: its receiver ends when this goes (TEARDOWN, another stream, the connection's end).
+pub(crate) struct RealtimeStream {
+    commands: tokio::sync::mpsc::UnboundedSender<RealtimeCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RealtimeStream {
+    /// Receive on `socket` (and `ctrl`: resends, sync packets) into the handler's sessions.
+    pub(crate) fn start(
+        socket: UdpSocket,
+        ctrl: Option<Retransmit>,
+        shk: [u8; 32],
+        handler: Arc<dyn AudioHandler>,
+        output_config: OutputConfig,
+    ) -> Self {
+        let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run(socket, ctrl, shk, handler, output_config, rx));
+        RealtimeStream { commands, task }
+    }
+
+    /// FLUSH: see [`RealtimeCommand::Flush`].
+    pub(crate) fn flush(&self, before: Option<u32>) {
+        let _ = self.commands.send(RealtimeCommand::Flush { before });
+    }
+}
+
+impl Drop for RealtimeStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Run the realtime audio receiver loop.
-pub(crate) async fn run(
+async fn run(
     socket: UdpSocket,
     ctrl: Option<Retransmit>,
     shk: [u8; 32],

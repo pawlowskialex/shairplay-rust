@@ -478,12 +478,9 @@ impl RaopServerBuilder {
             device_id,
             #[cfg(feature = "ap2-core")]
             airplay_name,
-            #[cfg(feature = "ap2-core")]
-            active_audio: std::sync::Mutex::new(None),
-            stream_owner: std::sync::Mutex::new(None),
-            verified: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
+            sessions: Default::default(),
         });
 
         let mut httpd = HttpServer::new(shared.clone(), self.max_clients);
@@ -580,13 +577,15 @@ impl RaopServer {
         self.httpd.is_running()
     }
 
-    /// Stop the server: unregister mDNS services and close all listeners.
+    /// Stop the server: unregister mDNS services, close all listeners, stop every stream and close every
+    /// connection.
     pub async fn stop(&mut self) {
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();
         }
         self.httpd.stop().await;
+        self.shared.sessions.close_all();
     }
 
     /// Get the mDNS service info for this server.
@@ -658,39 +657,5 @@ mod primitive_tests {
             derive_pi_from_hwaddr(&[1, 2, 3, 4, 5, 7]),
             derive_pi_from_hwaddr(&[1, 2, 3, 4, 5, 6])
         );
-    }
-}
-
-#[cfg(all(test, feature = "ap2-core"))]
-mod session_tests {
-    use super::RaopServer;
-    use crate::raop::{AudioFormat, AudioHandler, AudioSession};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct Silent;
-    impl AudioSession for Silent {
-        fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
-    }
-    struct NoAudio;
-    impl AudioHandler for NoAudio {
-        fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
-            Box::new(Silent)
-        }
-    }
-
-    /// A streams-only TEARDOWN stops its own connection's stream, not whoever plays.
-    #[test]
-    fn only_the_connection_that_started_a_stream_stops_it() {
-        let server = RaopServer::builder().build(Arc::new(NoAudio)).unwrap();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let s = stopped.clone();
-        server
-            .shared
-            .set_active_audio(1, Box::new(move || s.store(true, Ordering::SeqCst)));
-        server.shared.stop_audio_of(2);
-        assert!(!stopped.load(Ordering::SeqCst));
-        server.shared.stop_audio_of(1);
-        assert!(stopped.load(Ordering::SeqCst));
     }
 }
