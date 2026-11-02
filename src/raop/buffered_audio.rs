@@ -23,7 +23,7 @@ use crate::error::{CodecError, ShairplayError};
 use crate::raop::audio_pipeline::{
     NONCE_TRAIL_LEN, POLY1305_TAG_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha,
 };
-use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
+use crate::raop::{AudioFormat, AudioHandler};
 use crate::util::now_ns;
 
 #[derive(Clone)]
@@ -565,8 +565,7 @@ impl Stream {
         };
         let sample_format = output_config.format.resolve(ssrc.bit_depth().unwrap_or(16));
         let format = AudioFormat {
-            codec: AudioCodec::Pcm,
-            bits: sample_format.bits(),
+            format: sample_format,
             channels: target_ch,
             sample_rate: target_sr,
         };
@@ -808,7 +807,7 @@ fn delivery_loop(
                     Timing::Network { .. } => play_time(timing, ts, sr),
                     Timing::Local { .. } => None,
                 };
-                pcm.deliver_timed(sess.as_mut(), format, at);
+                pcm.deliver(sess.as_mut(), format, at);
             };
 
         let mut progress = !to_submit.is_empty() || !ready.is_empty();
@@ -971,9 +970,10 @@ mod decode_ahead_tests {
 
     struct Sink(Arc<StdMutex<Vec<i16>>>);
     impl crate::raop::AudioSession for Sink {
-        fn audio_process(&mut self, _: &[f32]) {}
-        fn audio_process_s16(&mut self, s: &[i16]) {
-            self.0.lock().unwrap().push(s[0]);
+        fn audio(&mut self, samples: crate::raop::Samples<'_>, _: Option<u64>) {
+            if let crate::raop::Samples::S16(s) = samples {
+                self.0.lock().unwrap().push(s[0]);
+            }
         }
     }
     struct Handler(Arc<StdMutex<Vec<i16>>>);
@@ -1097,27 +1097,29 @@ mod decode_ahead_tests {
         }
     }
 
-    struct Sink32(Arc<StdMutex<(Vec<u8>, Vec<i32>)>>);
+    struct Sink32(Arc<StdMutex<(Vec<crate::raop::SampleFormat>, Vec<i32>)>>);
     impl crate::raop::AudioSession for Sink32 {
-        fn audio_process(&mut self, _: &[f32]) {}
-        fn audio_process_s16(&mut self, _: &[i16]) {
-            panic!("16-bit delivery of a 24-bit stream");
-        }
-        fn audio_process_s32(&mut self, s: &[i32]) {
-            self.0.lock().unwrap().1.push(s[0]);
+        fn audio(&mut self, samples: crate::raop::Samples<'_>, _: Option<u64>) {
+            match samples {
+                crate::raop::Samples::S32(s) => self.0.lock().unwrap().1.push(s[0]),
+                _ => panic!("not 32-bit delivery of a 24-bit stream"),
+            }
         }
     }
-    struct Handler32(Arc<StdMutex<(Vec<u8>, Vec<i32>)>>);
+    struct Handler32(Arc<StdMutex<(Vec<crate::raop::SampleFormat>, Vec<i32>)>>);
     impl AudioHandler for Handler32 {
         fn audio_init(&self, f: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
-            self.0.lock().unwrap().0.push(f.bits);
+            self.0.lock().unwrap().0.push(f.format);
             Box::new(Sink32(self.0.clone()))
         }
     }
 
     /// ALAC/48000/S24 frames 0..n through the offload (declining `decline`) to an `Integer` session: the formats
     /// the session was set up with and the first sample of each delivery.
-    fn play_alac24(n: u8, decline: std::ops::Range<u8>) -> (Vec<u8>, Vec<i32>) {
+    fn play_alac24(
+        n: u8,
+        decline: std::ops::Range<u8>,
+    ) -> (Vec<crate::raop::SampleFormat>, Vec<i32>) {
         let mut st = PlayoutState::new();
         for k in 0..n {
             st.arrive(Frame {
@@ -1171,7 +1173,7 @@ mod decode_ahead_tests {
     fn alac_offload_24_bit_frames_come_out_in_order_as_s32() {
         // ALAC frames stand alone: no pre-roll
         let (formats, got) = play_alac24(24, 0..0);
-        assert_eq!(formats, [32]);
+        assert_eq!(formats, [crate::raop::SampleFormat::S32]);
         assert_eq!(got, (0..24).map(|k| k << 12).collect::<Vec<i32>>());
     }
 

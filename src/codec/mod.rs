@@ -7,7 +7,7 @@ pub(crate) mod resample;
 #[cfg(feature = "ap2-core")]
 pub(crate) mod aac;
 
-use crate::raop::{AudioSession, SampleFormat};
+use crate::raop::{AudioSession, SampleFormat, Samples};
 
 #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
 /// Decoded interleaved PCM in whichever format the decoder produced. The pipelines carry it as is
@@ -70,35 +70,24 @@ impl Pcm {
         )
     }
 
-    /// Hand the samples to the session with the time they should play (16-bit sessions; others untimed).
-    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
-    pub(crate) fn deliver_timed(
+    /// Hand the samples to the session in its format (`Integer` unresolved: as `S16`), with the time they
+    /// should play if the stream is on a timeline.
+    pub(crate) fn deliver(
         self,
         session: &mut dyn AudioSession,
         format: SampleFormat,
         play_at_ns: Option<u64>,
     ) {
-        match (play_at_ns, format) {
-            (Some(t), SampleFormat::S16 | SampleFormat::Integer) => {
-                session.audio_process_timed_s16(&self.into_s16(), t)
-            }
-            (Some(t), SampleFormat::S32) => session.audio_process_timed_s32(&self.into_s32(), t),
-            _ => self.deliver(session, format),
-        }
-    }
-
-    /// Hand the samples to the session in its format (`Integer` unresolved: as `S16`).
-    pub(crate) fn deliver(self, session: &mut dyn AudioSession, format: SampleFormat) {
         match (self, format) {
+            (Pcm::F32(v), SampleFormat::F32) => session.audio(Samples::F32(&v), play_at_ns),
+            (p, SampleFormat::F32) => session.audio(Samples::F32(&p.into_f32()), play_at_ns),
             (Pcm::S16(v), SampleFormat::S16 | SampleFormat::Integer) => {
-                session.audio_process_s16(&v)
+                session.audio(Samples::S16(&v), play_at_ns);
             }
-            (Pcm::F32(v), SampleFormat::F32) => session.audio_process(&v),
             (p, SampleFormat::S16 | SampleFormat::Integer) => {
-                session.audio_process_s16(&p.into_s16())
+                session.audio(Samples::S16(&p.into_s16()), play_at_ns);
             }
-            (p, SampleFormat::S32) => session.audio_process_s32(&p.into_s32()),
-            (p, SampleFormat::F32) => session.audio_process(&p.into_f32()),
+            (p, SampleFormat::S32) => session.audio(Samples::S32(&p.into_s32()), play_at_ns),
         }
     }
 }
@@ -209,18 +198,13 @@ mod tests {
         timed: Option<u64>,
     }
     impl AudioSession for Got {
-        fn audio_process(&mut self, _: &[f32]) {
-            panic!("float delivery");
-        }
-        fn audio_process_s16(&mut self, s: &[i16]) {
-            self.s16.extend_from_slice(s);
-        }
-        fn audio_process_s32(&mut self, s: &[i32]) {
-            self.s32.extend_from_slice(s);
-        }
-        fn audio_process_timed_s32(&mut self, s: &[i32], at: u64) {
-            self.timed = Some(at);
-            self.audio_process_s32(s);
+        fn audio(&mut self, samples: Samples<'_>, at: Option<u64>) {
+            self.timed = at.or(self.timed);
+            match samples {
+                Samples::F32(_) => panic!("float delivery"),
+                Samples::S16(s) => self.s16.extend_from_slice(s),
+                Samples::S32(s) => self.s32.extend_from_slice(s),
+            }
         }
     }
 
@@ -235,14 +219,10 @@ mod tests {
     #[test]
     fn s32_keeps_24_bits() {
         let mut got = Got::default();
-        Pcm::S24(vec![0x7F_FFFF, -0x80_0000, 1, -1]).deliver_timed(
-            &mut got,
-            SampleFormat::S32,
-            Some(7),
-        );
+        Pcm::S24(vec![0x7F_FFFF, -0x80_0000, 1, -1]).deliver(&mut got, SampleFormat::S32, Some(7));
         assert_eq!(got.s32, [0x7FFF_FF00, i32::MIN, 0x100, -0x100]);
         assert_eq!(got.timed, Some(7));
-        Pcm::S16(vec![-32768, 1]).deliver(&mut got, SampleFormat::S32);
+        Pcm::S16(vec![-32768, 1]).deliver(&mut got, SampleFormat::S32, None);
         assert_eq!(&got.s32[4..], [i32::MIN, 0x1_0000]);
         assert!(got.s16.is_empty());
     }
@@ -250,7 +230,7 @@ mod tests {
     #[test]
     fn integer_unresolved_is_s16() {
         let mut got = Got::default();
-        Pcm::S24(vec![0x12_3480]).deliver(&mut got, SampleFormat::Integer);
+        Pcm::S24(vec![0x12_3480]).deliver(&mut got, SampleFormat::Integer, None);
         assert_eq!(got.s16, [0x1235]);
         assert!(got.s32.is_empty());
     }

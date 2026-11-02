@@ -23,7 +23,7 @@ use tracing::info;
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::buffer::{RAOP_PACKET_LEN, RaopBuffer, StreamFormat};
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
-use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
+use crate::raop::{AudioFormat, AudioHandler};
 
 /// Sentinel value for [`RtpState::flush`] indicating no flush is pending.
 const NO_FLUSH: i32 = -42;
@@ -174,22 +174,24 @@ fn deliver_next(
         let Some(samples) = buf.dequeue(no_resend) else {
             return false;
         };
-        crate::codec::Pcm::F32(rs.process(samples)).deliver(session, format);
+        crate::codec::Pcm::F32(rs.process(samples)).deliver(session, format, None);
         return true;
     }
     match format {
         crate::raop::SampleFormat::S16 | crate::raop::SampleFormat::Integer => {
             match buf.dequeue_s16(no_resend) {
-                Some(samples) => session.audio_process_s16(samples),
+                Some(samples) => session.audio(crate::raop::Samples::S16(samples), None),
                 None => return false,
             }
         }
         crate::raop::SampleFormat::S32 => match buf.dequeue_s16(no_resend) {
-            Some(samples) => crate::codec::Pcm::S16(samples.to_vec()).deliver(session, format),
+            Some(samples) => {
+                crate::codec::Pcm::S16(samples.to_vec()).deliver(session, format, None)
+            }
             None => return false,
         },
         crate::raop::SampleFormat::F32 => match buf.dequeue(no_resend) {
-            Some(samples) => session.audio_process(samples),
+            Some(samples) => session.audio(crate::raop::Samples::F32(samples), None),
             None => return false,
         },
     }
@@ -269,8 +271,7 @@ impl RaopRtp {
             let format = self.format;
             let output_format = self.output_format;
             let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: output_format.bits(),
+                format: output_format.resolve(16),
                 channels: format.num_channels,
                 // When resampling is enabled the audio delivered downstream is at
                 // the output rate, so announce that (matching the non-UDP path);
@@ -390,8 +391,7 @@ impl RaopRtp {
             let format = self.format;
             let output_format = self.output_format;
             let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: output_format.bits(),
+                format: output_format.resolve(16),
                 channels: format.num_channels,
                 sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
             });

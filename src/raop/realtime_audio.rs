@@ -13,7 +13,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::reorder::{Reorder, Retransmit, resent_packet};
-use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
+use crate::raop::{AudioFormat, AudioHandler};
 
 #[cfg(feature = "resample")]
 use crate::codec::resample::StreamResampler;
@@ -149,7 +149,7 @@ pub(crate) async fn run(
                         #[cfg(feature = "resample")]
                         &mut resampler,
                     );
-                    pcm.deliver(sess.as_mut(), output_config.format);
+                    pcm.deliver(sess.as_mut(), output_config.format, None);
                 }
             }
         };
@@ -197,7 +197,7 @@ pub(crate) async fn run(
                         last_played = ts;
                     }
                     if let Some(ref mut sess) = *session {
-                        pcm.deliver_timed(sess.as_mut(), output_config.format, at);
+                        pcm.deliver(sess.as_mut(), output_config.format, at);
                     }
                 });
             }
@@ -254,7 +254,7 @@ pub(crate) async fn run(
                 let at = anchor.and_then(|a| a.play_at(ts, src_sr, offset_ns));
                 last_played = Some(ts);
                 if let Some(ref mut sess) = *session {
-                    pcm.deliver_timed(sess.as_mut(), output_config.format, at);
+                    pcm.deliver(sess.as_mut(), output_config.format, at);
                 }
             }
         };
@@ -377,8 +377,7 @@ pub(crate) async fn run(
                     };
 
                     let format = AudioFormat {
-                        codec: AudioCodec::Pcm,
-                        bits: output_config.format.bits(),
+                        format: output_config.format.resolve(output_config.bit_depth),
                         channels: out_ch,
                         sample_rate: target_sr,
                     };
@@ -550,7 +549,7 @@ mod tests {
 
     struct Silent;
     impl crate::raop::AudioSession for Silent {
-        fn audio_process(&mut self, _: &[f32]) {}
+        fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
     }
     struct NoAudio;
     impl AudioHandler for NoAudio {

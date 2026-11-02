@@ -46,7 +46,7 @@ security boundaries, unknowns, and required regression coverage.
   clock from its Sync / Follow_Up pairs (`Follower`: the fastest sample of each
   window, a drift fit, the path delay from a Delay_Req a second). Buffered audio plays
   at the network time of its SETRATEANCHORTIME anchor and realtime audio at its sync
-  packets' (`AudioSession::audio_process_timed_*`), so receivers play in step. The
+  packets' (`AudioSession::audio`'s play time), so receivers play in step. The
   builder's `ptp(false)` turns the sink off; `ptp_log` writes the clock samples as CSV.
   Binding 319/320 may need root or `CAP_NET_BIND_SERVICE`; a failed bind logs one line.
 

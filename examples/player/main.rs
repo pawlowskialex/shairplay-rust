@@ -299,8 +299,8 @@ struct Handler {
 impl AudioHandler for Handler {
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
         eprintln!(
-            "🎵 New stream: {}ch {}bit {}Hz",
-            format.channels, format.bits, format.sample_rate
+            "🎵 New stream: {}ch {:?} {}Hz",
+            format.channels, format.format, format.sample_rate
         );
 
         let resampler = if self.use_resample && format.sample_rate != self.device_rate {
@@ -342,7 +342,11 @@ struct Session {
 }
 
 impl AudioSession for Session {
-    fn audio_process(&mut self, samples: &[f32]) {
+    fn audio(&mut self, samples: shairplay::Samples<'_>, _play_at_ns: Option<u64>) {
+        // the server is built for f32 (the default sample format)
+        let shairplay::Samples::F32(samples) = samples else {
+            return;
+        };
         let mut samples = samples.to_vec();
 
         // Resample if needed
