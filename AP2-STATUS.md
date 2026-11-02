@@ -39,37 +39,21 @@ authentication. See the dedicated
 [`/auth-setup` protocol status](docs/protocol/auth-setup.md) for evidence levels,
 security boundaries, unknowns, and required regression coverage.
 
-## Open / Unwired — scaffolding present, not connected
+## Timing and events
 
-Implemented building blocks that are **not** wired into the runtime path. Kept
-deliberately (behind `#[allow(dead_code)]`) as the foundation for these features —
-do **not** delete them as "dead code"; they are unfinished AP2 capabilities.
+- **PTP timing and the network timeline** — `src/net/ptp.rs` runs a sink on ports
+  319/320 (IPv6-unspecified, IPv4 where there is no IPv6) and follows each master's
+  clock from its Sync / Follow_Up pairs (`Follower`: the fastest sample of each
+  window, a drift fit, the path delay from a Delay_Req a second). Buffered audio plays
+  at the network time of its SETRATEANCHORTIME anchor and realtime audio at its sync
+  packets' (`AudioSession::audio_process_timed_*`), so receivers play in step. The
+  builder's `ptp(false)` turns the sink off; `ptp_log` writes the clock samples as CSV.
+  Binding 319/320 may need root or `CAP_NET_BIND_SERVICE`; a failed bind logs one line.
 
-- **PTP timing → real clock sync / multi-room** — `src/net/ptp.rs` is a complete
-  IEEE-1588 / Apple-aPTP client (Sync/Follow_Up/Announce parsing, `OffsetSmoother`,
-  `PtpAnchor`). As of the fast-connect work a **PTP sink now runs**: `spawn_ptp_sink()`
-  binds and drains ports 319/320 (IPv6-unspecified) so the sender no longer stalls on
-  ICMP port-unreachable — this is purely the connect-latency fix and can be disabled
-  with `SHAIRPLAY_NO_PTP`. What is still **not connected to playout** is the timing
-  itself: the parsed Follow_Up/Announce timestamps are only logged (`debug`) — no
-  offset is computed and `PtpClock`/`OffsetSmoother` stay unused — so the receiver
-  plays out on best-effort local timing and there is **no true clock sync and no
-  multi-room sync**. To finish wiring: compute offsets from the drained Sync/Follow_Up
-  stream, feed them into `PtpClock`, and schedule buffered/realtime playout via
-  `PtpAnchor::delay_until_playout` instead of immediate delivery. (Binding 319/320 may
-  need root / `CAP_NET_BIND_SERVICE`, esp. on Linux; the bind is best-effort and
-  degrades gracefully — a failed bind just logs one line and leaves the slow-connect
-  behaviour. The sink is IPv6-only today.)
-
-- **Outbound event reporting** — the encrypted event channel is established and the
-  initial `updateInfo` is pushed at SETUP, but the receiver never sends events
-  afterward. `EventSender::send` (held in `RaopConnection::event_sender`,
-  `src/raop/event_channel.rs`) is the API for this; wire calls to it on receiver-side
-  state changes (volume / now-playing / progress) for fuller AP2 event reporting.
-
-> Related already-wired gap closed in 0.6.0: `AudioHandler::on_error` was defined but
-> never called — now wired. The two items above are the remaining "built but unwired"
-> AP2 capabilities.
+- **Outbound events** — the encrypted event channel carries the initial `updateInfo`
+  and the receiver's remote control (`sendMediaRemoteCommand`: play, pause, skips, the
+  volume as `dvlc`), handed to `AudioHandler::on_remote_control` at SETUP. Volume and
+  now-playing reports beyond that aren't sent.
 
 ## Video — Working (iOS 18)
 

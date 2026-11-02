@@ -1052,6 +1052,7 @@ fn setup_stream_realtime(
                 .and_then(|v| v.as_unsigned_integer())
                 .and_then(|v| u32::try_from(v).ok()),
             peer: Some(conn.remote_socket.ip()),
+            latency_ns: conn.shared.realtime_latency_ns,
         };
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1172,6 +1173,7 @@ fn setup_stream_buffered(
         format: conn.shared.output_format,
         aac_decoder: conn.shared.aac_decoder.clone(),
         alac_offload: conn.shared.alac_offload.clone(),
+        offset_ns: conn.shared.buffered_offset_ns,
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor {

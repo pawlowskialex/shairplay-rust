@@ -66,6 +66,7 @@ async fn start_server() -> (RaopServer, u16, TestState) {
         coverart: coverart.clone(),
     });
     let mut server = RaopServer::builder()
+        .mdns(false)
         .name("IntegrationTest")
         .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         .port(0)
@@ -110,6 +111,7 @@ fn empty_handler() -> Arc<TestHandler> {
 #[cfg(feature = "ap2-core")]
 fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
     RaopServer::builder()
+        .mdns(false)
         .name(name)
         .port(0)
         .mode(shairplay::AirPlayMode::AirPlay1)
@@ -117,7 +119,7 @@ fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
 
 #[cfg(not(feature = "ap2-core"))]
 fn ap1_builder(name: &str) -> shairplay::RaopServerBuilder {
-    RaopServer::builder().name(name).port(0)
+    RaopServer::builder().mdns(false).name(name).port(0)
 }
 
 fn raop_txt<'a>(info: &'a shairplay::AirPlayServiceInfo, key: &str) -> &'a str {
@@ -146,6 +148,7 @@ fn assert_invalid_configuration(
 #[test]
 fn default_hwaddr_is_locally_administered_unicast() {
     let server = RaopServer::builder()
+        .mdns(false)
         .name("RandomHwaddrTest")
         .port(0)
         .build(empty_handler())
@@ -226,6 +229,7 @@ fn ap2_rejects_ap1_advertisement_options_and_keeps_its_fixed_profile() {
 
     assert_invalid_configuration(
         RaopServer::builder()
+            .mdns(false)
             .name("WrongMode")
             .port(0)
             .advertise_codecs([Ap1Codec::Pcm])
@@ -234,6 +238,7 @@ fn ap2_rejects_ap1_advertisement_options_and_keeps_its_fixed_profile() {
     );
 
     let server = RaopServer::builder()
+        .mdns(false)
         .name("Ap2Advertisement")
         .port(0)
         .build(empty_handler())
@@ -245,6 +250,7 @@ fn ap2_rejects_ap1_advertisement_options_and_keeps_its_fixed_profile() {
 #[test]
 fn builder_rejects_invalid_hwaddr_length() {
     let result = RaopServer::builder()
+        .mdns(false)
         .name("InvalidHwaddrTest")
         .hwaddr(vec![0xAA; 5])
         .build(empty_handler());
@@ -544,6 +550,7 @@ async fn fp_setup_returns_142_bytes() {
 #[serial]
 async fn unauthorized_without_password_header() {
     let mut server = RaopServer::builder()
+        .mdns(false)
         .name("AuthTest")
         .hwaddr([0xAA; 6])
         .port(0)
@@ -732,6 +739,7 @@ mod ap2_tests {
     #[serial]
     async fn ap2_with_a_pin_only_paired_controllers_get_past_pairing() {
         let mut server = RaopServer::builder()
+            .mdns(false)
             .name("PinGateTest")
             .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
             .port(0)
@@ -777,6 +785,7 @@ mod ap2_tests {
     #[test]
     fn ap2_pin_pairing_service_info_advertises_persistent_pairing() {
         let server = RaopServer::builder()
+            .mdns(false)
             .name("PersistentPairingTest")
             .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
             .port(0)
@@ -813,6 +822,7 @@ mod ap2_tests {
     async fn ap2_pair_pin_start_is_acknowledged() {
         let handler = empty_handler();
         let mut server = RaopServer::builder()
+            .mdns(false)
             .name("PinStartTest")
             .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
             .port(0)
@@ -1431,7 +1441,10 @@ async fn mdns_scope_with_a_wildcard_refuses_to_start() {
 
 #[tokio::test]
 async fn mdns_scope_on_loopback_starts() {
+    // `CI` runners have no Bonjour/Avahi: only a registered service reports a scope
+    let announce = std::env::var("CI").is_err();
     let mut server = ap1_builder("ScopeLoopback")
+        .mdns(announce)
         .mdns_scope(shairplay::MdnsScope::Addrs(vec![
             "127.0.0.1".parse().unwrap(),
         ]))
@@ -1439,8 +1452,7 @@ async fn mdns_scope_on_loopback_starts() {
         .unwrap();
     server.start().await.expect("loopback is on every host");
     assert!(server.is_running());
-    // `CI` skips the mDNS registration, so only a registered service reports a scope.
-    if std::env::var("CI").is_err() {
+    if announce {
         assert!(
             matches!(
                 server.mdns_scope_applied(),
@@ -1460,6 +1472,7 @@ async fn mdns_scope_on_loopback_starts() {
 async fn buffered_setup_advertises_the_audio_buffer_size() {
     for (size, expected) in [(None, 0x10_0000_u64), (Some(256 * 1024), 256 * 1024)] {
         let mut builder = RaopServer::builder()
+            .mdns(false)
             .name("IntegrationTest")
             .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
             .port(0);

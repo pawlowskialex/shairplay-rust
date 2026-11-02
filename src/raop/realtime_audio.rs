@@ -41,6 +41,8 @@ pub(crate) struct OutputConfig {
     /// The sender: datagrams from other hosts are dropped (sync packets aren't authenticated, and audio packets
     /// would go through the reorder stage before their tag is checked). None: any (tests).
     pub(crate) peer: Option<std::net::IpAddr>,
+    /// The latency instead of the sender's (the builder's realtime_latency_ms)
+    pub(crate) latency_ns: Option<i64>,
 }
 
 fn alac_decoder_info(config: &OutputConfig) -> [u8; 48] {
@@ -99,7 +101,9 @@ pub(crate) async fn run(
         })
     });
 
-    let offset_ns = realtime_offset_ns(output_config.latency_min, output_config.source_sample_rate);
+    let offset_ns = output_config.latency_ns.unwrap_or_else(|| {
+        realtime_offset_ns(output_config.latency_min, output_config.source_sample_rate)
+    });
     info!(
         offload = offload.is_some(),
         retransmit = ctrl.is_some(),
@@ -467,14 +471,8 @@ impl Anchor {
 }
 
 /// Added to every realtime packet's network time: the receiver latency the sender asked for (SETUP `latencyMin`, when
-/// it is sane), else 11025 frames; SHAIRPLAY_REALTIME_LATENCY_MS overrides (ms, may be negative).
+/// it is sane), else 11025 frames.
 fn realtime_offset_ns(latency_min: Option<u32>, rate: u32) -> i64 {
-    if let Some(ms) = std::env::var("SHAIRPLAY_REALTIME_LATENCY_MS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-    {
-        return (ms * 1e6) as i64;
-    }
     let frames = latency_min
         .filter(|&f| f > 0 && f <= MAX_LATENCY_FRAMES)
         .unwrap_or(DEFAULT_LATENCY_FRAMES);
@@ -537,6 +535,7 @@ mod tests {
             offload: None,
             latency_min: None,
             peer: None,
+            latency_ns: None,
         });
 
         assert_eq!(u32::from_be_bytes(info[24..28].try_into().unwrap()), 352);
@@ -577,6 +576,7 @@ mod tests {
             offload: None,
             latency_min: None,
             peer: None,
+            latency_ns: None,
         };
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(run(socket, None, [0; 32], Arc::new(NoAudio), config, rx));
