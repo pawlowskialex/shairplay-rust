@@ -8,7 +8,7 @@
 
 use crate::codec::alac::{AlacConfig, AlacDecoder};
 use crate::raop::offload::{
-    OffloadAlac, OffloadCipher, OffloadFactory, OffloadOutput, OffloadStream, PacketOffload,
+    Decoded, Offload, OffloadAlac, OffloadCipher, OffloadFactory, OffloadJob,
 };
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use std::borrow::Cow;
@@ -223,7 +223,7 @@ pub struct RaopBuffer {
     /// What [`dequeue`](Self::dequeue) returns: the dequeued frame as f32.
     f32_scratch: Vec<f32>,
     /// A coprocessor decrypting and decoding packets ([`set_offload`](Self::set_offload)).
-    offload: Option<Box<dyn PacketOffload>>,
+    offload: Option<Box<dyn Offload>>,
     /// Counts flushes: offload tags are `generation << 16 | seqnum`, so a result for a packet from before a flush
     /// never fills a slot reused after it.
     generation: u16,
@@ -324,24 +324,25 @@ impl RaopBuffer {
         let (Some(factory), Codec::Alac { config, .. }) = (factory, &self.codec) else {
             return;
         };
-        let stream = OffloadStream {
-            cipher: match self.aes {
-                Some(a) => OffloadCipher::Aes128Cbc {
-                    key: a.key,
-                    iv: a.iv,
-                },
-                None => OffloadCipher::None,
+        let cipher = match self.aes {
+            Some(a) => OffloadCipher::Aes128Cbc {
+                key: a.key,
+                iv: a.iv,
             },
-            alac: Some(OffloadAlac {
-                frame_length: config.frame_length,
-                bit_depth: config.bit_depth,
-                pb: config.pb,
-                mb: config.mb,
-                kb: config.kb,
-                channels: config.num_channels,
-            }),
+            None => OffloadCipher::None,
         };
-        self.offload = factory(&stream);
+        let alac = OffloadAlac {
+            frame_length: config.frame_length,
+            bit_depth: config.bit_depth,
+            pb: config.pb,
+            mb: config.mb,
+            kb: config.kb,
+            channels: config.num_channels,
+        };
+        self.offload = factory(&OffloadJob::Packets {
+            cipher: &cipher,
+            alac: Some(&alac),
+        });
     }
 
     /// Packets with the offload.
@@ -361,14 +362,23 @@ impl RaopBuffer {
             }
             self.entries[idx].pending = false;
             let n = match out {
-                OffloadOutput::Pcm(pcm) => {
+                Decoded::S16(pcm) => {
                     let e = &mut self.entries[idx];
                     let n = pcm.len().min(e.audio_buffer.len());
                     e.audio_buffer[..n].copy_from_slice(&pcm[..n]);
                     n
                 }
-                OffloadOutput::Plain(payload) => self.decode_into(idx, payload).max(0) as usize,
-                OffloadOutput::Failed => 0,
+                // the slots are 16-bit: a 24-bit sample's top 16 bits
+                Decoded::S24(pcm) => {
+                    let e = &mut self.entries[idx];
+                    let n = pcm.len().min(e.audio_buffer.len());
+                    for (o, &v) in e.audio_buffer[..n].iter_mut().zip(pcm) {
+                        *o = (v >> 8) as i16;
+                    }
+                    n
+                }
+                Decoded::Plain(payload) => self.decode_into(idx, payload).max(0) as usize,
+                Decoded::Failed => 0,
             };
             self.entries[idx].audio_buffer_len = n;
             self.entries[idx].available = n > 0;
@@ -648,16 +658,16 @@ mod offload_tests {
         queue: Arc<Mutex<Vec<(u32, bool)>>>, // (tag, finished)
     }
 
-    impl PacketOffload for Mock {
+    impl Offload for Mock {
         fn submit(&mut self, tag: u32, _packet: &[u8]) -> bool {
             self.queue.lock().unwrap().push((tag, false));
             true
         }
-        fn collect(&mut self, done: &mut dyn FnMut(u32, OffloadOutput<'_>)) {
+        fn collect(&mut self, done: &mut dyn FnMut(u32, Decoded<'_>)) {
             let mut q = self.queue.lock().unwrap();
             while let Some(&(tag, true)) = q.first() {
                 let pcm = vec![(tag & 0xFFFF) as i16; 4];
-                done(tag, OffloadOutput::Pcm(&pcm));
+                done(tag, Decoded::S16(&pcm));
                 q.remove(0);
             }
         }
@@ -681,10 +691,13 @@ mod offload_tests {
                 .unwrap();
         let queue = Arc::new(Mutex::new(Vec::new()));
         let q2 = queue.clone();
-        let factory: OffloadFactory = Arc::new(move |s: &OffloadStream| {
-            assert!(matches!(s.cipher, OffloadCipher::None));
-            assert_eq!(s.alac.unwrap().frame_length, 352);
-            Some(Box::new(Mock { queue: q2.clone() }) as Box<dyn PacketOffload>)
+        let factory: OffloadFactory = Arc::new(move |job: &OffloadJob<'_>| {
+            let OffloadJob::Packets { cipher, alac } = job else {
+                panic!("an AP1 stream asked for another job");
+            };
+            assert!(matches!(cipher, OffloadCipher::None));
+            assert_eq!(alac.unwrap().frame_length, 352);
+            Some(Box::new(Mock { queue: q2.clone() }) as Box<dyn Offload>)
         });
         b.set_offload(Some(&factory));
         (b, queue)
