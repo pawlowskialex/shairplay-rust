@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use shairplay::{AudioCodec, AudioFormat, AudioHandler, AudioSession};
+use shairplay::{AudioFormat, AudioHandler, AudioSession, SampleFormat, Samples};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -23,7 +23,10 @@ impl AudioHandler for Capture {
 }
 
 impl AudioSession for Capture {
-    fn audio_process(&mut self, samples: &[f32]) {
+    fn audio(&mut self, samples: Samples<'_>, _: Option<u64>) {
+        let Samples::F32(samples) = samples else {
+            panic!("the test server delivers f32");
+        };
         self.0.send(Event::Samples(samples.to_vec())).unwrap();
     }
 }
@@ -150,13 +153,8 @@ async fn play_session(port: u16, tcp: bool, events: &mut UnboundedReceiver<Event
         panic!("expected audio init")
     };
     assert_eq!(
-        (
-            format.codec,
-            format.sample_rate,
-            format.channels,
-            format.bits
-        ),
-        (AudioCodec::Pcm, 44100, 2, 32)
+        (format.format, format.sample_rate, format.channels),
+        (SampleFormat::F32, 44100, 2)
     );
     let samples = [i16::MIN, -16384, 0, 16384, i16::MAX, -1];
     for sequence in [10, 11] {

@@ -272,11 +272,10 @@ impl RaopServerBuilder {
         self
     }
 
-    /// Set the sample format sessions receive: [`SampleFormat::F32`](crate::SampleFormat::F32) through
-    /// `audio_process` (default), [`SampleFormat::S16`](crate::SampleFormat::S16) through `audio_process_s16`
-    /// or [`SampleFormat::S32`](crate::SampleFormat::S32) through `audio_process_s32`, which keep integer
-    /// decoders' output integer end to end, or [`SampleFormat::Integer`](crate::SampleFormat::Integer): `S16` or
-    /// `S32` by the source's depth.
+    /// Set the sample format sessions receive ([`AudioSession::audio`](crate::AudioSession::audio)):
+    /// [`SampleFormat::F32`](crate::SampleFormat::F32) (default), [`SampleFormat::S16`](crate::SampleFormat::S16)
+    /// or [`SampleFormat::S32`](crate::SampleFormat::S32), which keep integer decoders' output integer end to
+    /// end, or [`SampleFormat::Integer`](crate::SampleFormat::Integer): `S16` or `S32` by the source's depth.
     pub fn sample_format(mut self, format: crate::raop::SampleFormat) -> Self {
         self.output_format = format;
         self
@@ -612,7 +611,7 @@ mod session_tests {
 
     struct Silent;
     impl AudioSession for Silent {
-        fn audio_process(&mut self, _: &[f32]) {}
+        fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
     }
     struct NoAudio;
     impl AudioHandler for NoAudio {

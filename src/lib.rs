@@ -8,7 +8,7 @@ from Apple devices on the local network.
 
 ```rust,no_run
 use std::sync::Arc;
-use shairplay::{RaopServer, AudioHandler, AudioSession, AudioFormat};
+use shairplay::{RaopServer, AudioHandler, AudioSession, AudioFormat, Samples};
 
 struct MyHandler;
 impl AudioHandler for MyHandler {
@@ -19,8 +19,8 @@ impl AudioHandler for MyHandler {
 
 struct MySession;
 impl AudioSession for MySession {
-    fn audio_process(&mut self, samples: &[f32]) {
-        // F32 interleaved PCM — same format for AP1 and AP2
+    fn audio(&mut self, samples: Samples<'_>, play_at_ns: Option<u64>) {
+        // interleaved PCM in the server's sample format (F32 by default), same for AP1 and AP2
     }
 }
 
@@ -79,6 +79,8 @@ pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 #[cfg(feature = "ap2-core")]
 pub use raop::{AirPlayMode, MemoryPairingStore, PairingStore};
 pub use raop::{
-    Ap1Codec, Ap1Encryption, AudioCodec, AudioFormat, AudioHandler, AudioSession, DeviceIdentity,
-    RaopServer, RaopServerBuilder, RemoteCommand, RemoteControl, SampleFormat, TrackMetadata,
+    Ap1Codec, Ap1Encryption, AudioFormat, AudioHandler, AudioSession, DeviceIdentity, RaopServer,
+    RaopServerBuilder, RemoteCommand, RemoteControl, SampleFormat, Samples, TrackMetadata,
 };
+#[cfg(feature = "ap2-core")]
+pub use util::now_ns;

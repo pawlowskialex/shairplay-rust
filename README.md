@@ -59,20 +59,21 @@ cargo add shairplay --features video
 
 ```rust
 use std::sync::Arc;
-use shairplay::{RaopServer, AudioHandler, AudioSession, AudioFormat};
+use shairplay::{RaopServer, AudioHandler, AudioSession, AudioFormat, Samples};
 
 struct MyHandler;
 impl AudioHandler for MyHandler {
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
-        println!("Stream: {}ch {}bit {}Hz", format.channels, format.bits, format.sample_rate);
+        println!("Stream: {}ch {:?} {}Hz", format.channels, format.format, format.sample_rate);
         Box::new(MySession)
     }
 }
 
 struct MySession;
 impl AudioSession for MySession {
-    fn audio_process(&mut self, samples: &[f32]) {
-        // F32 interleaved PCM — same format for AP1 and AP2
+    fn audio(&mut self, samples: Samples<'_>, play_at_ns: Option<u64>) {
+        // interleaved PCM in the server's sample format (F32 by default), same for AP1 and AP2;
+        // play_at_ns: when it should be heard, if the stream is on a timeline
     }
 }
 

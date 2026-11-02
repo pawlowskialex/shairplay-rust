@@ -671,7 +671,7 @@ mod ap2_tests {
             fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
                 struct DummySession;
                 impl AudioSession for DummySession {
-                    fn audio_process(&mut self, _samples: &[f32]) {}
+                    fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
                 }
                 Box::new(DummySession)
             }
@@ -835,7 +835,7 @@ fn server_build_generates_and_persists_random_identity() {
     }
     struct NoopSession;
     impl AudioSession for NoopSession {
-        fn audio_process(&mut self, _: &[f32]) {}
+        fn audio(&mut self, _: crate::raop::Samples<'_>, _: Option<u64>) {}
     }
 
     // Returns no persisted identity, captures whatever build() saves.

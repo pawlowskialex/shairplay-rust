@@ -18,13 +18,6 @@ pub enum AirPlayMode {
     AirPlay2,
 }
 
-/// Audio codec type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioCodec {
-    /// Decoded PCM (f32 interleaved). Always delivered regardless of AP1/AP2.
-    Pcm,
-}
-
 /// AirPlay 1 wire codec advertised in the `_raop._tcp` `cn` TXT record.
 ///
 /// The receiver auto-detects the actual codec per connection from the SDP
@@ -81,31 +74,22 @@ impl Ap1Encryption {
 /// ([`RaopServerBuilder::sample_format`](crate::RaopServerBuilder::sample_format)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SampleFormat {
-    /// 32-bit float, through [`AudioSession::audio_process`]. The default.
+    /// 32-bit float ([`Samples::F32`]). The default.
     #[default]
     F32,
-    /// Signed 16-bit, through [`AudioSession::audio_process_s16`]. On CPUs without an FPU this
-    /// keeps the whole path integer: ALAC and raw L16 produce 16-bit samples, and
-    /// float conversion happens only where mixdown or resampling needs it.
+    /// Signed 16-bit ([`Samples::S16`]). On CPUs without an FPU this keeps the whole path integer: ALAC and
+    /// raw L16 produce 16-bit samples, and float conversion happens only where mixdown or resampling needs it.
     S16,
-    /// Signed 32-bit with the sample in the top bits (a 16-bit sample in bits 31:16, a 24-bit one in 31:8),
-    /// through [`AudioSession::audio_process_s32`]. Integer end to end like [`S16`](Self::S16).
+    /// Signed 32-bit with the sample in the top bits (a 16-bit sample in bits 31:16, a 24-bit one in 31:8)
+    /// ([`Samples::S32`]). Integer end to end like [`S16`](Self::S16).
     S32,
     /// Integers at the source's depth: [`S16`](Self::S16) for 16-bit sources, [`S32`](Self::S32) for deeper
-    /// ones (24-bit ALAC), chosen per stream; the session's [`AudioFormat::bits`] says which. A 24-bit source
+    /// ones (24-bit ALAC), chosen per stream; the session's [`AudioFormat::format`] says which. A 24-bit source
     /// keeps its depth, a 16-bit one costs no more than with `S16`.
     Integer,
 }
 
 impl SampleFormat {
-    /// Bits per sample (`Integer`: 16, what it gives a 16-bit source).
-    pub const fn bits(self) -> u8 {
-        match self {
-            SampleFormat::F32 | SampleFormat::S32 => 32,
-            SampleFormat::S16 | SampleFormat::Integer => 16,
-        }
-    }
-
     /// The format a stream from a source of `source_bits` gets: `Integer` resolved, the others as they are.
     pub const fn resolve(self, source_bits: u8) -> SampleFormat {
         match self {
@@ -119,11 +103,8 @@ impl SampleFormat {
 /// Audio format descriptor passed to [`AudioHandler::audio_init`].
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFormat {
-    /// Audio codec (always PCM for decoded output).
-    pub codec: AudioCodec,
-    /// Bits per sample: 32 for [`SampleFormat::F32`] (`&[f32]`) and [`SampleFormat::S32`] (`&[i32]`), 16 for
-    /// [`SampleFormat::S16`] (`&[i16]`); [`SampleFormat::Integer`]: 16 or 32, as the stream is delivered.
-    pub bits: u8,
+    /// What [`AudioSession::audio`] gets: F32, S16 or S32 (never `Integer`, which is resolved per stream).
+    pub format: SampleFormat,
     /// Number of channels.
     pub channels: u8,
     /// Sample rate in Hz.
@@ -296,46 +277,28 @@ impl PairingStore for MemoryPairingStore {
     }
 }
 
-/// Per-connection audio session — hot path only.
+/// Decoded interleaved PCM, in the format the session was set up with ([`AudioFormat::format`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Samples<'a> {
+    /// 32-bit float, -1.0..1.0.
+    F32(&'a [f32]),
+    /// Signed 16-bit.
+    S16(&'a [i16]),
+    /// Signed 32-bit, the sample in the top bits.
+    S32(&'a [i32]),
+}
+
+/// Per-stream audio session — hot path only.
 ///
-/// Created by [`AudioHandler::audio_init`]. Dropped when the client disconnects.
-/// Only receives decoded PCM samples and flush events. All metadata, volume,
-/// and artwork events go to [`AudioHandler`] instead.
-pub trait AudioSession: Send + Sync {
-    /// Receive decoded f32 interleaved PCM audio samples.
-    fn audio_process(&mut self, samples: &[f32]);
-    /// Receive decoded signed 16-bit interleaved PCM. Called instead of
-    /// [`audio_process`](Self::audio_process) when the server was built with [`SampleFormat::S16`]; the
-    /// default converts to f32 and calls `audio_process`.
-    fn audio_process_s16(&mut self, samples: &[i16]) {
-        let f: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        self.audio_process(&f);
-    }
-    /// 16-bit PCM like [`audio_process_s16`](Self::audio_process_s16), with the time its first frame should
-    /// leave the speaker: local wall-clock nanoseconds since the epoch (`SystemTime`), from the stream's network
-    /// timeline (AirPlay 2 buffered audio with a PTP clock followed). Sessions that can schedule their output play it
-    /// then (multi-room sync); the default ignores the time.
-    fn audio_process_timed_s16(&mut self, samples: &[i16], play_at_ns: u64) {
-        let _ = play_at_ns;
-        self.audio_process_s16(samples);
-    }
-    /// Receive signed 32-bit interleaved PCM, the sample in the top bits. Called when the stream's format is
-    /// [`SampleFormat::S32`] (or [`SampleFormat::Integer`] with a deeper source); the default converts to f32
-    /// and calls `audio_process`.
-    fn audio_process_s32(&mut self, samples: &[i32]) {
-        let f: Vec<f32> = samples
-            .iter()
-            .map(|&s| s as f32 / 2_147_483_648.0)
-            .collect();
-        self.audio_process(&f);
-    }
-    /// 32-bit PCM like [`audio_process_s32`](Self::audio_process_s32), with the time its first frame should
-    /// leave the speaker, as [`audio_process_timed_s16`](Self::audio_process_timed_s16); the default ignores the
-    /// time.
-    fn audio_process_timed_s32(&mut self, samples: &[i32], play_at_ns: u64) {
-        let _ = play_at_ns;
-        self.audio_process_s32(samples);
-    }
+/// Created by [`AudioHandler::audio_init`]. Dropped when the stream ends. Only receives decoded PCM samples and
+/// flush events. All metadata, volume, and artwork events go to [`AudioHandler`] instead.
+pub trait AudioSession: Send {
+    /// Decoded audio, and the time its first frame should leave the speaker when the stream is on a timeline
+    /// (AirPlay 2 with a PTP clock followed): nanoseconds on the receiver's monotonic clock ([`now_ns`]). Sessions
+    /// that can schedule their output play it then (multi-room sync); `None`: as it comes.
+    ///
+    /// [`now_ns`]: crate::now_ns
+    fn audio(&mut self, samples: Samples<'_>, play_at_ns: Option<u64>);
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
 }

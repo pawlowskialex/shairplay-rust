@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use shairplay::{AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer, TrackMetadata};
+use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer, SampleFormat, TrackMetadata};
 
 #[path = "integration/auth_setup.rs"]
 mod auth_setup;
@@ -42,7 +42,7 @@ impl AudioHandler for TestHandler {
 }
 
 impl AudioSession for TestSession {
-    fn audio_process(&mut self, _samples: &[f32]) {}
+    fn audio(&mut self, _: shairplay::Samples<'_>, _: Option<u64>) {}
 }
 
 struct TestState {
@@ -399,8 +399,7 @@ async fn ap1_unencrypted_l16_without_fmtp_initializes_audio() {
     {
         let inits = state.inits.lock().unwrap();
         assert_eq!(inits.len(), 1, "expected one initialized audio session");
-        assert_eq!(inits[0].codec, AudioCodec::Pcm);
-        assert_eq!(inits[0].bits, 32);
+        assert_eq!(inits[0].format, SampleFormat::F32);
         assert_eq!(inits[0].channels, 2);
         assert_eq!(inits[0].sample_rate, 44_100);
     }
