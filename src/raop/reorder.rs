@@ -58,11 +58,12 @@ struct ReorderStats {
     late: u32,       // arrived after their place was played (or twice)
 }
 
-/// Realtime packets (or what was made of them: `T`) in sequence order. A packet behind a gap is held while the gap is asked for again (`ASK_AGAIN`
-/// later once more, then every `ASK_LATER`); after `GIVE_UP` (or the stream's longer [`wait`](Self::wait)), or with
-/// `max_held` packets waiting, the gap is played as silence (the output queue has to cover the wait). A jump of more
-/// than `MAX_GAP`, or than what may be held, is a new start (a flush), not a loss. Without retransmits (`hold` false)
-/// gaps are given up at once.
+/// Realtime packets (or what was made of them: `T`) in sequence order. A packet behind a gap is held while the gap
+/// is asked for again (`ASK_AGAIN` later once more, then every `ASK_LATER`, `MAX_ASKS` times in all, a run of missing
+/// ones in one request); after `GIVE_UP` (or the stream's longer [`wait`](Self::wait)), or with `max_held` packets
+/// waiting, the gap is played as silence (the output queue has to cover the wait). A jump of more than `MAX_GAP`, or
+/// than what may be held, is a new start (a flush), not a loss. Without retransmits (`hold` false) gaps are given up
+/// at once.
 pub(crate) struct Reorder<T = Vec<u8>> {
     hold: bool,
     max_held: usize,
@@ -77,6 +78,8 @@ pub(crate) struct Reorder<T = Vec<u8>> {
 
 const ASK_AGAIN: std::time::Duration = std::time::Duration::from_millis(50);
 const ASK_LATER: std::time::Duration = std::time::Duration::from_millis(250);
+/// A missing packet is asked for at most this often (at once, after `ASK_AGAIN`, then every `ASK_LATER`).
+const MAX_ASKS: u8 = 4;
 const GIVE_UP: std::time::Duration = std::time::Duration::from_millis(120);
 const MAX_GAP: u64 = 64;
 
@@ -192,20 +195,33 @@ impl<T> Reorder<T> {
         out: &mut Vec<(u32, T)>,
         due: impl Fn(&T, u64) -> bool,
     ) {
+        // asked again in runs of consecutive numbers, one request each (a stall leaves hundreds missing)
         let again: Vec<u64> = self
             .asked
             .iter()
             .filter(|(_, (_, last, n))| {
-                now.duration_since(*last) >= if *n < 2 { ASK_AGAIN } else { ASK_LATER }
+                *n < MAX_ASKS
+                    && now.duration_since(*last) >= if *n < 2 { ASK_AGAIN } else { ASK_LATER }
             })
             .map(|(&m, _)| m)
             .collect();
+        let mut run: Option<(u64, u64)> = None;
         for m in again {
             if let Some(e) = self.asked.get_mut(&m) {
                 e.1 = now;
-                e.2 = e.2.saturating_add(1);
+                e.2 += 1;
             }
-            self.ask(m, m + 1);
+            run = match run {
+                Some((a, b)) if b == m => Some((a, m + 1)),
+                Some((a, b)) => {
+                    self.ask(a, b);
+                    Some((m, m + 1))
+                }
+                None => Some((m, m + 1)),
+            };
+        }
+        if let Some((a, b)) = run {
+            self.ask(a, b);
         }
         while let Some(next) = self.next {
             let Some((&first, held)) = self.held.iter().next() else {
@@ -492,6 +508,21 @@ mod tests {
             due(t + Duration::from_millis(30)),
         );
         assert_eq!(seqs(&out), vec![(0, 0), (2, 3)]);
+    }
+
+    /// A run of missing packets is asked for again in one request, and no more than `MAX_ASKS` times.
+    #[test]
+    fn a_run_is_asked_for_again_in_one_request_a_few_times() {
+        let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
+        r.wait(Duration::from_secs(2), 125);
+        r.push(10, vec![10], t, &mut out);
+        r.push(20, vec![20], t, &mut out); // 11..20 missing
+        let mut requests = r.take_requests();
+        for ms in (10..=1500).step_by(10) {
+            r.tick(t + Duration::from_millis(ms), &mut out);
+            requests.extend(r.take_requests());
+        }
+        assert_eq!(requests, vec![(11, 9); MAX_ASKS as usize]);
     }
 
     #[test]
