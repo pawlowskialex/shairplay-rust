@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::handlers_ap1::RaopConnection;
+use super::rtsp::{Handled, RtspError};
 use crate::error::ProtocolError;
 use crate::net::server::RequestBodyPolicy;
 use crate::proto::http::{HttpRequest, HttpResponse};
@@ -37,18 +38,15 @@ pub(super) fn handle(
     _conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     let valid_type = request.header("Content-Type").is_some_and(|value| {
         value
             .trim_matches([' ', '\t'])
             .eq_ignore_ascii_case(CONTENT_TYPE)
     });
     if !valid_type || request.data() != Some(PIPEWIRE_PROBE.as_slice()) {
-        *response =
-            super::rtsp::new_response(400, "Bad Request", request.header("CSeq").unwrap_or("0"));
-        response.add_header("Connection", "close");
-        response.set_disconnect(true);
+        return Err(RtspError::bad_request("not PipeWire's auth-setup probe").closing());
     }
     response.add_header("Content-Length", "0");
-    None
+    Ok(None)
 }

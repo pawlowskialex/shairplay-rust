@@ -14,19 +14,28 @@ use crate::raop::rtp::RaopRtp;
 use std::sync::atomic::Ordering;
 
 use super::handlers_ap1::{RaopConnection, bind_addr_for, local_ip_from};
+use super::rtsp::{Handled, RtspError, bad, plist_body};
 
 #[cfg(feature = "ap2-core")]
-fn bind_tcp(addr: std::net::SocketAddr) -> Option<tokio::net::TcpListener> {
-    let listener = std::net::TcpListener::bind(addr).ok()?;
-    listener.set_nonblocking(true).ok()?;
-    tokio::net::TcpListener::from_std(listener).ok()
+fn bind_tcp(addr: std::net::SocketAddr) -> Result<(tokio::net::TcpListener, u16), RtspError> {
+    let bound = std::net::TcpListener::bind(addr).and_then(|l| {
+        l.set_nonblocking(true)?;
+        let l = tokio::net::TcpListener::from_std(l)?;
+        let port = l.local_addr()?.port();
+        Ok((l, port))
+    });
+    bound.map_err(|e| RtspError::internal(format!("a TCP port on {addr}: {e}")))
 }
 
 #[cfg(feature = "ap2-core")]
-fn bind_udp(addr: std::net::SocketAddr) -> Option<tokio::net::UdpSocket> {
-    let socket = std::net::UdpSocket::bind(addr).ok()?;
-    socket.set_nonblocking(true).ok()?;
-    tokio::net::UdpSocket::from_std(socket).ok()
+fn bind_udp(addr: std::net::SocketAddr) -> Result<(tokio::net::UdpSocket, u16), RtspError> {
+    let bound = std::net::UdpSocket::bind(addr).and_then(|s| {
+        s.set_nonblocking(true)?;
+        let s = tokio::net::UdpSocket::from_std(s)?;
+        let port = s.local_addr()?.port();
+        Ok((s, port))
+    });
+    bound.map_err(|e| RtspError::internal(format!("a UDP port on {addr}: {e}")))
 }
 
 #[cfg(feature = "ap2-core")]
@@ -60,8 +69,8 @@ pub(crate) fn handle_pair_setup(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
+) -> Handled {
+    let data = request.data().ok_or(bad("no body"))?;
     response.add_header("Content-Type", "application/octet-stream");
 
     // Try AP2 TLV-based pairing first; fall back to AP1 if not valid TLV
@@ -69,46 +78,51 @@ pub(crate) fn handle_pair_setup(
         Ok(t) if t.get(6).is_some() => t, // Must have State field
         _ => return super::handlers_ap1::handle_pair_setup(conn, request, response),
     };
-    let state = *tlv.get(6)?.first()?;
+    let state = *tlv
+        .get(6)
+        .and_then(|s| s.first())
+        .ok_or(bad("an empty State"))?;
+    let failed = |what: &'static str| {
+        move |e: crate::error::CryptoError| {
+            RtspError::internal(what).report(ShairplayError::Crypto(e))
+        }
+    };
 
     match state {
         1 => {
             tracing::info!("AP2 pair-setup M1 received");
             if conn.shared.pair_failures.load(Ordering::Relaxed) >= MAX_PAIR_FAILURES {
                 tracing::warn!("pair-setup refused: too many failed attempts since the start");
-                return Some(pairing_homekit::pairing_error(
+                return Ok(Some(pairing_homekit::pairing_error(
                     2,
                     pairing_homekit::TLV_ERROR_MAX_TRIES,
-                ));
+                )));
             }
-            let mut srp = match conn.shared.srp_spare.take() {
-                Ok(srp) => srp,
-                Err(e) => {
-                    tracing::warn!("pair-setup M1 init failed: {e}");
-                    conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    return Some(pairing_homekit::pairing_error_response(2));
-                }
-            };
+            let mut srp = conn
+                .shared
+                .srp_spare
+                .take()
+                .map_err(failed("pair-setup M1: the SRP state"))?;
             if let Err(e) = srp.process_m1(data) {
                 tracing::warn!("pair-setup M1 failed: {e}");
                 conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                return Some(pairing_homekit::pairing_error_response(2));
+                return Ok(Some(pairing_homekit::pairing_error_response(2)));
             }
             let m2 = srp.build_m2();
             conn.srp_server = Some(srp);
-            Some(m2)
+            Ok(Some(m2))
         }
         3 => {
             // one proof per M1: the SRP state (b, B) goes with it, so a wrong PIN can't be tried again against it
             let Some(mut srp) = conn.srp_server.take() else {
-                return Some(pairing_homekit::pairing_error_response(4));
+                return Ok(Some(pairing_homekit::pairing_error_response(4)));
             };
             if !srp.process_m3(data).unwrap_or(false) {
                 conn.shared.pair_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("pair-setup M3: the proof didn't check");
-                return Some(pairing_homekit::pairing_error_response(4));
+                return Ok(Some(pairing_homekit::pairing_error_response(4)));
             }
-            let m4 = srp.build_m4().ok()?;
+            let m4 = srp.build_m4().map_err(failed("pair-setup M4"))?;
             if srp.is_transient() {
                 conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
                 conn.is_ap2 = true;
@@ -117,11 +131,11 @@ pub(crate) fn handle_pair_setup(
                 // M5 follows
                 conn.srp_server = Some(srp);
             }
-            Some(m4)
+            Ok(Some(m4))
         }
         5 => {
             let Some(mut srp) = conn.srp_server.take() else {
-                return Some(pairing_homekit::pairing_error_response(6));
+                return Ok(Some(pairing_homekit::pairing_error_response(6)));
             };
             match srp.process_m5(data) {
                 // a pairing doesn't replace another controller's key under the same identifier (HAP: as AddPairing);
@@ -137,32 +151,33 @@ pub(crate) fn handle_pair_setup(
                         client_id,
                         "pair-setup M5: identifier already paired with another key"
                     );
-                    Some(pairing_homekit::pairing_error_response(6))
+                    Ok(Some(pairing_homekit::pairing_error_response(6)))
                 }
                 Ok((client_id, client_pk)) => {
                     let m6 = srp
                         .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
-                        .ok()?;
+                        .map_err(failed("pair-setup M6"))?;
                     if !conn.shared.pairing_store.put(&client_id, client_pk, true) {
-                        tracing::warn!(client_id, "pairing store full: controller not stored");
+                        tracing::warn!(client_id, "pair-setup M5: the pairing store is full");
+                        return Ok(Some(pairing_homekit::pairing_error(
+                            6,
+                            pairing_homekit::TLV_ERROR_MAX_PEERS,
+                        )));
                     }
                     tracing::info!(
                         client_id,
                         "AP2 normal pair-setup complete, client key stored"
                     );
-                    Some(m6)
+                    Ok(Some(m6))
                 }
                 Err(e) => {
                     tracing::warn!("pair-setup M5 failed: {e}");
                     conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    let mut tlv = crate::crypto::tlv::TlvValues::new();
-                    tlv.add(6, &[6]); // State=6
-                    tlv.add(7, &[2]); // Error=Authentication
-                    Some(tlv.encode())
+                    Ok(Some(pairing_homekit::pairing_error_response(6)))
                 }
             }
         }
-        _ => None,
+        _ => Err(bad("pair-setup: not M1, M3 or M5")),
     }
 }
 
@@ -172,8 +187,8 @@ pub(crate) fn handle_pair_verify(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
+) -> Handled {
+    let data = request.data().ok_or(bad("no body"))?;
     response.add_header("Content-Type", "application/octet-stream");
 
     let tlv = match crate::crypto::tlv::TlvValues::decode(data) {
@@ -186,7 +201,10 @@ pub(crate) fn handle_pair_verify(
             return super::handlers_ap1::handle_pair_verify(conn, request, response);
         }
     };
-    let state = *tlv.get(6)?.first()?;
+    let state = *tlv
+        .get(6)
+        .and_then(|s| s.first())
+        .ok_or(bad("an empty State"))?;
     tracing::debug!(state, data_len = data.len(), "pair-verify TLV state");
 
     match state {
@@ -199,17 +217,20 @@ pub(crate) fn handle_pair_verify(
                     // Store ECDH shared secret immediately (needed for video even if M3 never arrives)
                     conn.pair_verify_secret = Some(*pv.ecdh_shared_secret());
                     conn.pair_verify = Some(pv);
-                    Some(m2)
+                    Ok(Some(m2))
                 }
                 Err(e) => {
                     tracing::warn!("pair-verify M1 failed: {e}");
                     conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    None
+                    Ok(Some(pairing_homekit::pairing_error_response(2)))
                 }
             }
         }
         3 => {
-            let pv = conn.pair_verify.as_mut()?;
+            let Some(pv) = conn.pair_verify.as_mut() else {
+                tracing::warn!("pair-verify M3 without M1");
+                return Ok(Some(pairing_homekit::pairing_error_response(4)));
+            };
             let store = conn.shared.pairing_store.clone();
             match pv.process_m3_build_m4(data, Some(&|id| store.get(id))) {
                 Ok(m4) => {
@@ -221,16 +242,16 @@ pub(crate) fn handle_pair_verify(
                         conn.shared.verified_as(conn.id, c, &conn.close);
                     }
                     tracing::info!("AP2 pair-verify complete, encrypted RTSP active");
-                    Some(m4)
+                    Ok(Some(m4))
                 }
                 Err(e) => {
                     tracing::warn!("pair-verify M3 failed: {e}");
                     conn.shared.handler.on_error(&ShairplayError::Crypto(e));
-                    None
+                    Ok(Some(pairing_homekit::pairing_error_response(4)))
                 }
             }
         }
-        _ => None,
+        _ => Err(bad("pair-verify: not M1 or M3")),
     }
 }
 
@@ -241,7 +262,7 @@ pub(crate) fn handle_pairings(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     response.add_header("Content-Type", "application/pairing+tlv8");
     let (body, removed) = pairings(
         conn.shared.pairing_store.as_ref(),
@@ -251,7 +272,7 @@ pub(crate) fn handle_pairings(
     for id in removed {
         conn.shared.close_controller(&id);
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 #[cfg(feature = "ap2-core")]
@@ -450,7 +471,7 @@ pub(crate) fn handle_info(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     use crate::raop::config;
 
     let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&conn.shared.identity_seed);
@@ -553,7 +574,16 @@ pub(crate) fn handle_info(
         );
     }
 
-    response.set_plist_body(&dict)
+    plist_reply(response, &dict)
+}
+
+/// A binary plist answer.
+#[cfg(feature = "ap2-core")]
+fn plist_reply(response: &mut HttpResponse, dict: &plist::Dictionary) -> Handled {
+    response
+        .set_plist_body(dict)
+        .map(Some)
+        .ok_or_else(|| RtspError::internal("the answer's plist"))
 }
 
 #[cfg(feature = "ap2-core")]
@@ -565,9 +595,9 @@ pub(crate) fn handle_pair_pin_start(
     _conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     response.add_header("Content-Type", "application/octet-stream");
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -616,10 +646,8 @@ pub(crate) fn handle_setup(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
-    let dict = plist_val.as_dictionary()?;
+) -> Handled {
+    let dict = &plist_body(request)?;
     let keys: Vec<_> = dict.keys().collect();
     let has_streams = dict.get("streams").is_some();
     let is_mirror = dict
@@ -639,20 +667,24 @@ pub(crate) fn handle_setup(
         timing,
         "SETUP plist"
     );
-    tracing::debug!(plist = plist_brief(&plist_val), "SETUP");
+    tracing::debug!(
+        plist = plist_brief(&plist::Value::Dictionary(dict.clone())),
+        "SETUP"
+    );
     tracing::debug!(
         dacp_id = request.header("DACP-ID"),
         active_remote = request.header("Active-Remote").is_some(),
         "SETUP remote-control headers"
     );
 
-    let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
+    let resp_dict = if let Some(streams) = dict.get("streams") {
+        let streams = streams.as_array().ok_or(bad("streams isn't an array"))?;
         setup_streams(conn, streams)?
     } else {
         setup_initial(conn, dict)?
     };
 
-    response.set_plist_body(&resp_dict)
+    plist_reply(response, &resp_dict)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -692,10 +724,19 @@ pub(crate) fn plist_brief(v: &plist::Value) -> String {
 
 #[cfg(feature = "ap2-core")]
 /// Stream SETUP (`streams` present): dispatch by stream type, then add the shared control port.
-fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<plist::Dictionary> {
+fn setup_streams(
+    conn: &mut RaopConnection,
+    streams: &[plist::Value],
+) -> Result<plist::Dictionary, RtspError> {
     // Stream SETUP — type 96 (realtime) or type 103 (buffered) or type 110 (video)
-    let stream0 = streams.first()?.as_dictionary()?;
-    let stream_type = stream0.get("type")?.as_unsigned_integer()?;
+    let stream0 = streams
+        .first()
+        .and_then(|s| s.as_dictionary())
+        .ok_or(bad("no stream"))?;
+    let stream_type = stream0
+        .get("type")
+        .and_then(|t| t.as_unsigned_integer())
+        .ok_or(bad("a stream without its type"))?;
     let stream_keys: Vec<_> = stream0.keys().collect();
     tracing::info!(stream_type, ?stream_keys, "Stream SETUP");
 
@@ -717,8 +758,7 @@ fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<
     // Control port: streams that use one (realtime: retransmits) put their own; the others get a port nobody listens
     // on, as the sender expects the key
     if !stream_resp.contains_key("controlPort") {
-        let ctrl_sock = std::net::UdpSocket::bind(bind_addr_for(conn)).ok()?;
-        let ctrl_port = ctrl_sock.local_addr().ok()?.port();
+        let (ctrl_sock, ctrl_port) = bind_udp(bind_addr_for(conn))?;
         drop(ctrl_sock);
         stream_resp.insert(
             "controlPort".into(),
@@ -731,13 +771,16 @@ fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<
         "streams".into(),
         plist::Value::Array(vec![plist::Value::Dictionary(stream_resp)]),
     );
-    Some(resp_dict)
+    Ok(resp_dict)
 }
 
 #[cfg(feature = "ap2-core")]
 /// Initial SETUP (no `streams`): capture FairPlay keys (video), establish the event
 /// channel and timing, and return the response dictionary.
-fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<plist::Dictionary> {
+fn setup_initial(
+    conn: &mut RaopConnection,
+    dict: &plist::Dictionary,
+) -> Result<plist::Dictionary, RtspError> {
     let mut resp_dict = plist::Dictionary::new();
     let timing = dict
         .get("timingProtocol")
@@ -814,8 +857,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         tracing::info!("Remote Control Only connection - establishing event channel");
 
         let event_port_resp = if let Some(shared_secret) = conn.ap2_shared_secret.as_ref() {
-            let event_listener = bind_tcp(bind_addr_for(conn))?;
-            let event_port = event_listener.local_addr().ok()?.port();
+            let (event_listener, event_port) = bind_tcp(bind_addr_for(conn))?;
 
             if let Ok(event_channel_cipher) =
                 crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
@@ -848,7 +890,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             plist::Value::Integer(event_port_resp.into()),
         );
 
-        return Some(resp_dict);
+        return Ok(resp_dict);
     }
 
     if timing == "PTP" {
@@ -862,8 +904,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
     }
 
     // Bind event port on same address family as the client connection
-    let event_listener = bind_tcp(bind_addr_for(conn))?;
-    let event_port = event_listener.local_addr().ok()?.port();
+    let (event_listener, event_port) = bind_tcp(bind_addr_for(conn))?;
     tracing::info!(event_port, "Event channel opened");
 
     // Derive event channel encryption keys from shared secret (AP2 only).
@@ -928,15 +969,10 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             .and_then(|v| v.as_unsigned_integer())
             .and_then(|p| u16::try_from(p).ok())
             .unwrap_or(0);
-        let tport = bind_udp(bind_addr_for(conn))
-            .and_then(|tsock| {
-                let local_port = tsock.local_addr().ok()?.port();
-                let mut remote_timing = conn.remote_socket;
-                remote_timing.set_port(timing_rport);
-                crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing, None);
-                Some(local_port)
-            })
-            .unwrap_or(0);
+        let (tsock, tport) = bind_udp(bind_addr_for(conn))?;
+        let mut remote_timing = conn.remote_socket;
+        remote_timing.set_port(timing_rport);
+        crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing, None);
         tracing::debug!(tport, timing_rport, "Legacy video: NTP timing socket bound");
         tport
     } else {
@@ -950,7 +986,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         plist::Value::Integer(u64::from(timing_port).into()),
     );
 
-    Some(resp_dict)
+    Ok(resp_dict)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -959,7 +995,7 @@ fn setup_stream_realtime(
     conn: &mut RaopConnection,
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
-) -> Option<()> {
+) -> Result<(), RtspError> {
     let sr = stream0
         .get("sr")
         .and_then(|v| v.as_unsigned_integer())
@@ -980,18 +1016,13 @@ fn setup_stream_realtime(
     });
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
     // the decoder's buffers are sized from these: a stream the decoder can't take is refused here
-    let Ok(spf) = u32::try_from(spf) else {
-        return None;
-    };
+    let spf = u32::try_from(spf).map_err(|_| bad("spf"))?;
     if !crate::codec::alac::supported(spf, alac_format.bit_depth, alac_format.channels)
         || !crate::codec::alac::supported_rate(alac_format.sample_rate)
     {
-        tracing::warn!(
-            spf,
-            ?alac_format,
-            "AP2 realtime stream refused: not a shape the decoder takes"
-        );
-        return None;
+        return Err(RtspError::unsupported(format!(
+            "AP2 realtime stream refused, not a shape the decoder takes: spf {spf}, {alac_format:?}"
+        )));
     }
 
     if shk.len() == 32 {
@@ -1014,13 +1045,12 @@ fn setup_stream_realtime(
         let mut shk_arr = [0u8; 32];
         shk_arr.copy_from_slice(shk);
 
-        let socket = bind_udp(bind_addr_for(conn))?;
-        let audio_port = socket.local_addr().ok()?.port();
+        let (socket, audio_port) = bind_udp(bind_addr_for(conn))?;
         // Our control port, kept open: the sender answers retransmit requests there. Its own is where they go.
-        let ctrl = bind_udp(bind_addr_for(conn))?;
+        let (ctrl, ctrl_port) = bind_udp(bind_addr_for(conn))?;
         stream_resp.insert(
             "controlPort".into(),
-            plist::Value::Integer(ctrl.local_addr().ok()?.port().into()),
+            plist::Value::Integer(ctrl_port.into()),
         );
         let retransmit = stream0
             .get("controlPort")
@@ -1101,23 +1131,26 @@ fn setup_stream_realtime(
                     .and_then(|v| v.as_unsigned_integer())
                     .and_then(|p| u16::try_from(p).ok())
                     .unwrap_or(0);
-                let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
+                let (cport, _tport, dport) = rtp
+                    .start(true, control_port, 0)
+                    .map_err(|e| RtspError::internal("legacy ALAC: the RTP ports").report(e))?;
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
                 stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
             }
         }
         #[cfg(not(feature = "video"))]
         {
-            tracing::warn!("Type 96 without shk — requires video feature");
-            conn.shared
-                .handler
-                .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
-                    "realtime (type 96) SETUP requires a shared key or the video feature".into(),
-                )));
-            return None;
+            return Err(
+                RtspError::bad_request("a realtime stream without shk").report(
+                    ProtocolError::InvalidRtsp(
+                        "realtime (type 96) SETUP requires a shared key or the video feature"
+                            .into(),
+                    ),
+                ),
+            );
         }
     }
-    Some(())
+    Ok(())
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1126,7 +1159,7 @@ fn setup_stream_buffered(
     conn: &mut RaopConnection,
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
-) -> Option<()> {
+) -> Result<(), RtspError> {
     let audio_format = stream0
         .get("audioFormat")
         .and_then(|v| v.as_unsigned_integer())
@@ -1141,23 +1174,16 @@ fn setup_stream_buffered(
     );
 
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
-    if shk.len() != 32 {
-        tracing::warn!(len = shk.len(), "Invalid shk length");
-        conn.shared
-            .handler
-            .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
-                format!(
-                    "buffered (type 103) SETUP: invalid shk length {}",
-                    shk.len()
-                ),
-            )));
-        return None;
-    }
-    let mut shk_arr = [0u8; 32];
-    shk_arr.copy_from_slice(shk);
+    let shk_arr = <[u8; 32]>::try_from(shk).map_err(|_| {
+        RtspError::bad_request("a buffered stream without a 32-byte shk").report(
+            ProtocolError::InvalidRtsp(format!(
+                "buffered (type 103) SETUP: invalid shk length {}",
+                shk.len()
+            )),
+        )
+    })?;
 
-    let listener = bind_tcp(bind_addr_for(conn))?;
-    let audio_port = listener.local_addr().ok()?.port();
+    let (listener, audio_port) = bind_tcp(bind_addr_for(conn))?;
     tracing::info!(audio_port, "Buffered audio TCP port opened");
     conn.shared
         .claim_stream(conn.id, &conn.sender_id, &conn.close);
@@ -1189,7 +1215,7 @@ fn setup_stream_buffered(
         "audioBufferSize".into(),
         plist::Value::Integer(i64::from(conn.shared.audio_buffer_size).into()),
     );
-    Some(())
+    Ok(())
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1198,14 +1224,13 @@ fn setup_stream_rc(
     conn: &mut RaopConnection,
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
-) -> Option<()> {
+) -> Result<(), RtspError> {
     tracing::info!("Remote Control stream setup (type 130)");
 
     // On PTP connections, type 130 is just acknowledged.
     // On RC connections, it sets up an encrypted data channel.
     if let Some(_seed) = stream0.get("seed").and_then(|v| v.as_unsigned_integer()) {
-        let data_listener = bind_tcp(bind_addr_for(conn))?;
-        let data_port = data_listener.local_addr().ok()?.port();
+        let (data_listener, data_port) = bind_tcp(bind_addr_for(conn))?;
         tracing::debug!(data_port, "RC data channel opened");
 
         let peer = conn.remote_socket.ip();
@@ -1220,7 +1245,7 @@ fn setup_stream_rc(
     } else {
         stream_resp.insert("streamID".into(), plist::Value::Integer(1_i64.into()));
     }
-    Some(())
+    Ok(())
 }
 
 #[cfg(feature = "video")]
@@ -1230,7 +1255,7 @@ fn setup_stream_video(
     conn: &mut RaopConnection,
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
-) -> Option<()> {
+) -> Result<(), RtspError> {
     let stream_connection_id = stream0
         .get("streamConnectionID")
         .and_then(plist_u64)
@@ -1261,30 +1286,24 @@ fn setup_stream_video(
             // iOS 18+ with HomeKit pairing does not send ekey; derivation is unsolved
             // (see AP2-STATUS.md). Decline the stream rather than installing a zeroed key
             // and feeding the app undecryptable "garbage" NAL units.
-            tracing::warn!(
-                "Video: no ekey available — iOS 18 HomeKit video decryption unsupported; declining stream"
-            );
-            conn.shared
-                .handler
-                .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
-                    "video stream key derivation: no ekey (iOS 18 HomeKit unsupported)".into(),
-                )));
-            return None;
+            return Err(RtspError::unsupported(
+                "video: no ekey (iOS 18 with HomeKit pairing): the key can't be derived",
+            )
+            .report(CryptoError::FairPlay(
+                "video stream key derivation: no ekey (iOS 18 HomeKit unsupported)".into(),
+            )));
         }
     } else {
-        tracing::warn!("Video stream: no encryption keys available");
-        conn.shared
-            .handler
-            .on_error(&ShairplayError::Crypto(CryptoError::FairPlay(
+        return Err(RtspError::bad_request("video: no encryption keys").report(
+            CryptoError::FairPlay(
                 "video stream key derivation: no encryption keys available".into(),
-            )));
-        return None;
+            ),
+        ));
     };
 
     let cipher = crate::crypto::video_cipher::VideoCipher::new(&ekey, &eiv);
 
-    let listener = bind_tcp(bind_addr_for(conn))?;
-    let video_port = listener.local_addr().ok()?.port();
+    let (listener, video_port) = bind_tcp(bind_addr_for(conn))?;
     tracing::info!(video_port, "Video stream TCP port opened");
 
     if let Some(vh) = &conn.shared.video_handler {
@@ -1293,7 +1312,7 @@ fn setup_stream_video(
     }
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
-    Some(())
+    Ok(())
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1302,10 +1321,10 @@ pub(crate) fn handle_record(
     _conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     tracing::debug!("RECORD");
     response.add_header("Audio-Latency", "0");
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1314,11 +1333,12 @@ pub(crate) fn handle_set_rate_anchor_time(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
-    let dict = plist_val.as_dictionary()?;
-    tracing::debug!(plist = plist_brief(&plist_val), "SETRATEANCHORTIME");
+) -> Handled {
+    let dict = &plist_body(request)?;
+    tracing::debug!(
+        plist = plist_brief(&plist::Value::Dictionary(dict.clone())),
+        "SETRATEANCHORTIME"
+    );
 
     let rate = dict.get("rate").and_then(plist_u64).unwrap_or(0) as u32;
     let rtp_time = dict.get("rtpTime").and_then(plist_u64).unwrap_or(0) as u32;
@@ -1357,7 +1377,7 @@ pub(crate) fn handle_set_rate_anchor_time(
         });
     }
 
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1366,7 +1386,7 @@ pub(crate) fn handle_set_peers(
     _conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     if let Some(data) = request.data()
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
         && let Some(arr) = plist_val.as_array()
@@ -1378,7 +1398,7 @@ pub(crate) fn handle_set_peers(
     {
         tracing::debug!(plist = plist_brief(&v), "SETPEERSX");
     }
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1387,25 +1407,24 @@ pub(crate) fn handle_flush_buffered(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
-    if let Some(data) = request.data()
-        && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
-    {
-        let dict = plist_val.as_dictionary();
-        let get = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist_u64);
-        // flushFromSeq absent: an immediate flush
-        let from_seq = get("flushFromSeq").map(|v| v as u32);
-        // without flushUntilSeq: everything queued
-        let until_seq = get("flushUntilSeq").map(|v| v as u32);
-        tracing::debug!(plist = plist_brief(&plist_val), "FLUSHBUFFERED");
-        if let Some(cmd) = &conn.playout_cmd {
-            let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush {
-                from_seq,
-                until_seq,
-            });
-        }
+) -> Handled {
+    let dict = plist_body(request)?;
+    let get = |k: &str| dict.get(k).and_then(plist_u64);
+    // flushFromSeq absent: an immediate flush
+    let from_seq = get("flushFromSeq").map(|v| v as u32);
+    // without flushUntilSeq: everything queued
+    let until_seq = get("flushUntilSeq").map(|v| v as u32);
+    tracing::debug!(
+        plist = plist_brief(&plist::Value::Dictionary(dict.clone())),
+        "FLUSHBUFFERED"
+    );
+    if let Some(cmd) = &conn.playout_cmd {
+        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush {
+            from_seq,
+            until_seq,
+        });
     }
-    None
+    Ok(None)
 }
 
 // --- AP2 POST sub-handlers ---
@@ -1416,7 +1435,7 @@ pub(crate) fn handle_feedback(
     conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     // Only return stream info when audio is actually playing (matches shairport-sync)
     #[cfg(feature = "ap2-core")]
     if conn.playout_cmd.is_some() {
@@ -1428,13 +1447,10 @@ pub(crate) fn handle_feedback(
             "streams".into(),
             plist::Value::Array(vec![plist::Value::Dictionary(stream_dict)]),
         );
-        let mut buf = Vec::new();
-        plist::to_writer_binary(&mut buf, &resp_dict).ok()?;
-        response.add_header("Content-Type", "application/x-apple-binary-plist");
-        return Some(buf);
+        return plist_reply(response, &resp_dict);
     }
     let _ = conn;
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1443,7 +1459,7 @@ pub(crate) fn handle_command(
     conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     if let Some(data) = request.data()
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
         && let Some(dict) = plist_val.as_dictionary()
@@ -1457,7 +1473,7 @@ pub(crate) fn handle_command(
             conn.mr_supported.update(dict);
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "ap2-core")]
@@ -1466,7 +1482,7 @@ pub(crate) fn handle_audio_mode(
     _conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
-) -> Option<Vec<u8>> {
+) -> Handled {
     if let Some(data) = request.data()
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
         && let Some(dict) = plist_val.as_dictionary()
@@ -1477,5 +1493,5 @@ pub(crate) fn handle_audio_mode(
             .unwrap_or("unknown");
         tracing::debug!(mode, "POST /audioMode");
     }
-    None
+    Ok(None)
 }

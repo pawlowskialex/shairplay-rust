@@ -12,6 +12,7 @@ pub enum TlvType {
     Salt = 2,
     PublicKey = 3,
     Proof = 4,
+    EncryptedData = 5,
     Error = 7,
     State = 6,
     Flags = 19,
