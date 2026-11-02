@@ -29,8 +29,6 @@ pub(crate) struct RaopShared {
     #[cfg(feature = "ap2-core")]
     pub(crate) identity_seed: [u8; 32],
     pub(crate) output_sample_rate: Option<u32>,
-    /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
-    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
     /// Buffered audio plays this much after its network time (builder's buffered_offset_ms)
     #[cfg(feature = "ap2-core")]
@@ -71,6 +69,17 @@ pub(crate) struct RaopShared {
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
     /// Every connection and the stream it plays
     pub(crate) sessions: crate::raop::sessions::Sessions,
+}
+
+impl RaopShared {
+    /// What streams' samples go out as (the builder's output options).
+    pub(crate) fn output(&self) -> crate::raop::pipeline::OutputConfig {
+        crate::raop::pipeline::OutputConfig {
+            sample_rate: self.output_sample_rate,
+            max_channels: self.output_max_channels,
+            format: self.output_format,
+        }
+    }
 }
 
 /// Failed pair-setup attempts after which the server refuses pair-setup until it restarts: each costs an online

@@ -60,6 +60,9 @@ plist = "1.9"
 
 # AirPlay 2 (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
+# an AirPlay 2 packet's tag checked without decrypting it (the cipher and MAC chacha20poly1305 is made of)
+chacha20 = { version = "0.9", optional = true }
+poly1305 = { version = "0.8", optional = true }
 hkdf = { version = "0.12", optional = true }
 num-bigint = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
@@ -91,7 +94,7 @@ resample = ["dep:rubato"]
 # AirPlay 2 with symphonia's AAC decoder and resampling, as before
 ap2 = ["ap2-core", "resample", "aac-symphonia"]
 # AirPlay 2 protocol support without pulling in an AAC decoder or the resampler
-ap2-core = ["dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid"]
+ap2-core = ["dep:chacha20poly1305", "dep:chacha20", "dep:poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid"]
 aac-symphonia = ["dep:symphonia"]
 video = ["ap2"]
 hls = ["video"]

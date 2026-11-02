@@ -1044,13 +1044,17 @@ fn setup_stream_realtime(
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
     // the decoder's buffers are sized from these: a stream the decoder can't take is refused here
     let spf = u32::try_from(spf).map_err(|_| bad("spf"))?;
-    if !crate::codec::alac::supported(spf, alac_format.bit_depth, alac_format.channels)
-        || !crate::codec::alac::supported_rate(alac_format.sample_rate)
-    {
-        return Err(RtspError::unsupported(format!(
+    let alac = crate::codec::alac::AlacConfig::defaults(
+        spf,
+        alac_format.bit_depth,
+        alac_format.channels,
+        alac_format.sample_rate,
+    )
+    .ok_or_else(|| {
+        RtspError::unsupported(format!(
             "AP2 realtime stream refused, not a shape the decoder takes: spf {spf}, {alac_format:?}"
-        )));
-    }
+        ))
+    })?;
 
     if shk.len() == 32 {
         // AP2 realtime ALAC — ChaCha20-Poly1305 per-packet encryption.
@@ -1090,13 +1094,8 @@ fn setup_stream_realtime(
 
         let handler = conn.shared.handler.clone();
         let output_config = crate::raop::realtime_audio::OutputConfig {
-            source_sample_rate: alac_format.sample_rate,
-            samples_per_frame: spf,
-            channels: alac_format.channels,
-            bit_depth: alac_format.bit_depth,
-            sample_rate: conn.shared.output_sample_rate,
-            max_channels: conn.shared.output_max_channels,
-            format: conn.shared.output_format,
+            alac,
+            output: conn.shared.output(),
             offload: conn.shared.offload.clone(),
             latency_min: stream0
                 .get("latencyMin")
@@ -1140,8 +1139,7 @@ fn setup_stream_realtime(
                         key: aes_key,
                         iv: aes_iv,
                     }),
-                    output_sample_rate: conn.shared.output_sample_rate,
-                    output_format: conn.shared.output_format,
+                    output: conn.shared.output(),
                     remote_socket: conn.remote_socket,
                     offload: None,
                 },

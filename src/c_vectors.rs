@@ -1,5 +1,6 @@
 //! Test vectors generated from the original C implementation (shairplay).
 
+use crate::codec::Decode;
 use crate::crypto::aes::AesCtr;
 use crate::crypto::fairplay::FairPlay;
 use crate::crypto::pairing::Pairing;
@@ -7,7 +8,8 @@ use crate::net::mdns::AirPlayServiceInfo;
 use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::proto::sdp::Sdp;
-use crate::raop::buffer::RaopBuffer;
+use crate::raop::pipeline::{RtpCipher, RtpDecode};
+use crate::raop::rtp::Ap1Format;
 
 // ============================================================
 // Base64 — vectors from C base64_encode/base64_decode
@@ -297,107 +299,63 @@ fn fairplay_reject_bad_version() {
 }
 
 // ============================================================
-// RTP Buffer — queue/dequeue/flush
+// AirPlay 1 RTP: formats and the library's packet decoding
 // ============================================================
-#[test]
-fn rtp_buffer_queue_dequeue() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new(
-        "96 AppleLossless",
-        "96 352 0 16 40 10 14 2 255 0 0 44100",
-        &key,
-        &iv,
-    )
-    .expect("valid fmtp");
-    // Queue returns >= 0 for valid-length packets (ALAC decode may fail on dummy data)
+
+/// The library's decoding of an AirPlay 1 stream's packets.
+fn ap1_decode(rtpmap: &str, fmtp: &str, cipher: RtpCipher) -> Option<RtpDecode> {
+    Ap1Format::parse(rtpmap, fmtp).map(|f| RtpDecode {
+        cipher,
+        codec: f.codec(),
+    })
+}
+
+fn rtp_packet(payload: &[u8]) -> Vec<u8> {
     let mut pkt = vec![
         0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    pkt.extend_from_slice(&[0u8; 256]);
-    // Just verify it doesn't reject the packet header
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        buf.queue(&pkt, true);
-    }));
-    // Packet was accepted (seqnum tracking works regardless of decode)
+    pkt.extend_from_slice(payload);
+    pkt
 }
 
 #[test]
-fn rtp_buffer_flush() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new(
+fn rtp_dummy_alac_payload_decodes_to_nothing_without_panicking() {
+    let mut d = ap1_decode(
         "96 AppleLossless",
         "96 352 0 16 40 10 14 2 255 0 0 44100",
-        &key,
-        &iv,
+        RtpCipher::Aes128Cbc {
+            key: [0; 16],
+            iv: [0; 16],
+        },
     )
     .expect("valid fmtp");
-    buf.flush(100);
-    assert!(buf.dequeue(true).is_none());
+    let _ = d.decode(&rtp_packet(&[0u8; 256]));
 }
 
 #[test]
-fn rtp_buffer_reject_short_packet() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new(
-        "96 AppleLossless",
-        "96 352 0 16 40 10 14 2 255 0 0 44100",
-        &key,
-        &iv,
-    )
-    .expect("valid fmtp");
-    assert_eq!(buf.queue(&[0u8; 4], true), -1); // too short
+fn rtp_rejects_short_packet() {
+    assert!(RtpCipher::None.open(&[0u8; 4]).is_none()); // too short
 }
 
 #[test]
-fn rtp_buffer_rejects_malformed_fmtp() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+fn rtp_rejects_malformed_fmtp() {
+    let alac = |fmtp: &str| Ap1Format::parse("96 AppleLossless", fmtp);
     // Too few fields — previously panicked via `.expect("invalid fmtp")`.
-    assert!(RaopBuffer::new("96 AppleLossless", "96 352", &key, &iv).is_none());
+    assert!(alac("96 352").is_none());
     // Non-numeric field — previously silently coerced to 0.
-    assert!(
-        RaopBuffer::new(
-            "96 AppleLossless",
-            "96 abc 0 16 40 10 14 2 255 0 0 44100",
-            &key,
-            &iv
-        )
-        .is_none()
-    );
+    assert!(alac("96 abc 0 16 40 10 14 2 255 0 0 44100").is_none());
     // Zero channels — would build a 0-channel decoder / zero-size buffers.
-    assert!(
-        RaopBuffer::new(
-            "96 AppleLossless",
-            "96 352 0 16 40 10 14 0 255 0 0 44100",
-            &key,
-            &iv
-        )
-        .is_none()
-    );
+    assert!(alac("96 352 0 16 40 10 14 0 255 0 0 44100").is_none());
     // Well-formed input still succeeds.
-    assert!(
-        RaopBuffer::new(
-            "96 AppleLossless",
-            "96 352 0 16 40 10 14 2 255 0 0 44100",
-            &key,
-            &iv
-        )
-        .is_some()
-    );
+    assert!(alac("96 352 0 16 40 10 14 2 255 0 0 44100").is_some());
 }
 
 #[test]
-fn rtp_buffer_rejects_unsupported_or_malformed_rtpmap() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
+fn rtp_rejects_unsupported_or_malformed_rtpmap() {
     let fmtp = "96 352 0 16 40 10 14 2 255 0 0 44100";
-
-    assert!(RaopBuffer::new("96 opus/48000/2", fmtp, &key, &iv).is_none());
-    assert!(RaopBuffer::new("invalid AppleLossless", fmtp, &key, &iv).is_none());
-    assert!(RaopBuffer::new("96 L16/44100/2/extra", "", &key, &iv).is_none());
+    assert!(Ap1Format::parse("96 opus/48000/2", fmtp).is_none());
+    assert!(Ap1Format::parse("invalid AppleLossless", fmtp).is_none());
+    assert!(Ap1Format::parse("96 L16/44100/2/extra", "").is_none());
 }
 
 // ============================================================
@@ -405,50 +363,37 @@ fn rtp_buffer_rejects_unsupported_or_malformed_rtpmap() {
 // ============================================================
 
 /// An `L16` rtpmap selects the raw-PCM path and needs no fmtp; unencrypted
-/// big-endian S16 samples decode straight to f32 without an ALAC decoder.
+/// big-endian S16 samples decode straight to S16 without an ALAC decoder.
 #[test]
-fn rtp_buffer_pcm_l16_decodes_big_endian_s16() {
-    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "")
+fn rtp_pcm_l16_decodes_big_endian_s16() {
+    let mut d = ap1_decode("96 L16/44100/2", "", RtpCipher::None)
         .expect("L16 rtpmap is valid without fmtp");
-
-    // RTP header (12 bytes) + two big-endian S16 samples: 0x4000 (+0.5), 0xC000 (-0.5).
-    let mut pkt = vec![
-        0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    pkt.extend_from_slice(&[0x40, 0x00, 0xC0, 0x00]);
-    assert_eq!(buf.queue(&pkt, true), 1, "L16 packet should decode");
-
-    let samples = buf.dequeue(true).expect("one decoded frame");
-    assert_eq!(samples.len(), 2);
-    assert!((samples[0] - 0.5).abs() < 1e-6, "got {}", samples[0]);
-    assert!((samples[1] + 0.5).abs() < 1e-6, "got {}", samples[1]);
+    // two big-endian S16 samples: 0x4000 (+0.5), 0xC000 (-0.5)
+    let pcm = d
+        .decode(&rtp_packet(&[0x40, 0x00, 0xC0, 0x00]))
+        .expect("L16 packet should decode");
+    assert_eq!(pcm.into_s16(), [0x4000, -0x4000]);
 }
 
 /// `L16` without an explicit channel count defaults to mono (RFC 3551).
 #[test]
-fn rtp_buffer_pcm_l16_mono_default() {
-    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100", "").expect("mono L16 valid");
-    let mut pkt = vec![
-        0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    pkt.extend_from_slice(&[0x00, 0x00, 0x7F, 0xFF]); // 0.0, ~+1.0
-    assert_eq!(buf.queue(&pkt, true), 1);
-    let samples = buf.dequeue(true).expect("frame");
-    assert_eq!(samples.len(), 2);
-    assert!(samples[0].abs() < 1e-6);
-    assert!(samples[1] > 0.99);
+fn rtp_pcm_l16_mono_default() {
+    assert_eq!(
+        Ap1Format::parse("96 L16/44100", ""),
+        Some(Ap1Format::L16 {
+            channels: 1,
+            sample_rate: 44100
+        })
+    );
+    let mut d = ap1_decode("96 L16/44100", "", RtpCipher::None).expect("mono L16 valid");
+    let pcm = d.decode(&rtp_packet(&[0x00, 0x00, 0x7F, 0xFF])).unwrap();
+    assert_eq!(pcm.into_s16(), [0, 0x7FFF]);
 }
 
 #[test]
-fn rtp_buffer_pcm_l16_rejects_incomplete_frames() {
-    let mut buf = RaopBuffer::new_unencrypted("96 L16/44100/2", "").expect("valid stereo L16");
-    let mut pkt = vec![
-        0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    pkt.extend_from_slice(&[0x00, 0x01]);
-
-    assert_eq!(buf.queue(&pkt, true), -1);
-    assert!(buf.dequeue(true).is_none());
+fn rtp_pcm_l16_rejects_incomplete_frames() {
+    let mut d = ap1_decode("96 L16/44100/2", "", RtpCipher::None).expect("valid stereo L16");
+    assert!(d.decode(&rtp_packet(&[0x00, 0x01])).is_none());
 }
 
 // ============================================================
@@ -542,7 +487,7 @@ mod ap2_tests {
 
     #[test]
     fn c_vector_audio_packet_decrypt() {
-        use crate::raop::audio_pipeline::decrypt_rtp_chacha;
+        use crate::raop::pipeline::decrypt_rtp_chacha;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
         let packet = hex_decode(AUDIO_PACKET_HEX);
@@ -555,9 +500,18 @@ mod ap2_tests {
         );
     }
 
+    /// The tag check without decryption (packets are authenticated before they are reordered) on the same vector.
+    #[test]
+    fn c_vector_audio_packet_tag_checks() {
+        let packet = hex_decode(AUDIO_PACKET_HEX);
+        use crate::raop::pipeline::RtpCipher;
+        assert!(RtpCipher::ChaCha20Poly1305 { key: [0x42; 32] }.authentic(&packet));
+        assert!(!RtpCipher::ChaCha20Poly1305 { key: [0; 32] }.authentic(&packet));
+    }
+
     #[test]
     fn audio_packet_wrong_key_fails() {
-        use crate::raop::audio_pipeline::decrypt_rtp_chacha;
+        use crate::raop::pipeline::decrypt_rtp_chacha;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
         let packet = hex_decode(AUDIO_PACKET_HEX);

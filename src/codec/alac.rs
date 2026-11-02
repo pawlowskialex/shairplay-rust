@@ -2,8 +2,10 @@
 
 use crate::codec::Pcm;
 
-/// ALAC decoder configuration, parsed from the fmtp SDP attribute.
-#[derive(Debug, Clone)]
+/// A stream's ALAC parameters (its ALACSpecificConfig): from an AirPlay 1 fmtp, or an AirPlay 2 SETUP with Apple's
+/// encoder defaults for the rest. The one place they are checked ([`supported`]), and what the decoder, the
+/// offload and the stream's format are made from.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AlacConfig {
     /// Samples per frame.
     pub(crate) frame_length: u32,
@@ -27,6 +29,110 @@ pub(crate) struct AlacConfig {
     pub(crate) avg_bit_rate: u32,
     /// Sample rate in Hz.
     pub(crate) sample_rate: u32,
+}
+
+impl AlacConfig {
+    #[cfg(feature = "ap2-core")]
+    /// A stream from a SETUP: `frame_length` samples a frame (`spf`), the rest Apple's encoder defaults (pb 40, mb 10,
+    /// kb 14, max run 255: what senders use, as shairport-sync sets up FFmpeg for them). `None` for a shape the
+    /// decoder doesn't take.
+    pub(crate) fn defaults(
+        frame_length: u32,
+        bit_depth: u8,
+        channels: u8,
+        sample_rate: u32,
+    ) -> Option<Self> {
+        Self {
+            frame_length,
+            compatible_version: 0,
+            bit_depth,
+            pb: 40,
+            mb: 10,
+            kb: 14,
+            num_channels: channels,
+            max_run: 255,
+            max_frame_bytes: 0,
+            avg_bit_rate: 0,
+            sample_rate,
+        }
+        .checked()
+    }
+
+    /// A buffered (type 103) stream: its SETUP carries no ALACSpecificConfig, frames are 352 samples.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn buffered(sample_rate: u32, bit_depth: u8, channels: u8) -> Option<Self> {
+        Self::defaults(352, bit_depth, channels, sample_rate)
+    }
+
+    /// An AirPlay 1 SDP `fmtp`: `96 <frame_length> <compat_version> <bit_depth> <pb> <mb> <kb> <channels>
+    /// <max_run> <max_frame_bytes> <avg_bitrate> <sample_rate>`. Every field must be an integer in range (a 0 sized
+    /// zero-size buffers and a 0-channel decoder; 272 isn't 8 bits), and the shape one the decoder takes.
+    pub(crate) fn from_fmtp(fmtp: &str) -> Option<Self> {
+        let vals: Vec<&str> = fmtp.split(' ').collect();
+        if vals.len() < 12 {
+            return None;
+        }
+        let p = |i: usize| vals[i].parse::<u32>().ok();
+        let b = |i: usize| vals[i].parse::<u8>().ok();
+        Self {
+            frame_length: p(1)?,
+            compatible_version: b(2)?,
+            bit_depth: b(3)?,
+            pb: b(4)?,
+            mb: b(5)?,
+            kb: b(6)?,
+            num_channels: b(7)?,
+            max_run: vals[8].parse::<u16>().ok()?,
+            max_frame_bytes: p(9)?,
+            avg_bit_rate: p(10)?,
+            sample_rate: p(11)?,
+        }
+        .checked()
+    }
+
+    /// Itself if the decoder takes it: the buffers are sized from these, and they come from a sender.
+    fn checked(self) -> Option<Self> {
+        (supported(self.frame_length, self.bit_depth, self.num_channels)
+            && supported_rate(self.sample_rate)
+            && self.kb <= 31)
+            .then_some(self)
+    }
+
+    /// The 48-byte block `AlacDecoder::set_info` takes (the ALACSpecificConfig of Apple's reference decoder).
+    pub(crate) fn info(&self) -> [u8; 48] {
+        let mut info = [0u8; 48];
+        info[24..28].copy_from_slice(&self.frame_length.to_be_bytes());
+        info[28] = self.compatible_version;
+        info[29] = self.bit_depth;
+        info[30] = self.pb;
+        info[31] = self.mb;
+        info[32] = self.kb;
+        info[33] = self.num_channels;
+        info[34..36].copy_from_slice(&self.max_run.to_be_bytes());
+        info[36..40].copy_from_slice(&self.max_frame_bytes.to_be_bytes());
+        info[40..44].copy_from_slice(&self.avg_bit_rate.to_be_bytes());
+        info[44..48].copy_from_slice(&self.sample_rate.to_be_bytes());
+        info
+    }
+
+    /// The library's decoder for this stream.
+    pub(crate) fn decoder(&self) -> AlacDecoder {
+        let mut d = AlacDecoder::new(i32::from(self.bit_depth), i32::from(self.num_channels));
+        d.set_info(&self.info());
+        d
+    }
+
+    /// What an offload is told of the stream.
+    pub(crate) fn offload(&self) -> crate::raop::offload::OffloadAlac {
+        crate::raop::offload::OffloadAlac {
+            frame_length: self.frame_length,
+            bit_depth: self.bit_depth,
+            pb: self.pb,
+            mb: self.mb,
+            kb: self.kb,
+            channels: self.num_channels,
+        }
+    }
 }
 
 /// ALAC format selected in an AirPlay 2 `audioFormat` SETUP field.
@@ -73,41 +179,7 @@ impl AlacFormat {
     }
 }
 
-/// A buffered stream's ALAC parameters (Apple's encoder defaults: [`buffered_decoder`]).
-#[cfg(feature = "ap2-core")]
-pub(crate) fn buffered_params(bit_depth: u8, channels: u8) -> crate::raop::offload::OffloadAlac {
-    crate::raop::offload::OffloadAlac {
-        frame_length: 352,
-        bit_depth,
-        pb: 40,
-        mb: 10,
-        kb: 14,
-        channels,
-    }
-}
-
-/// A decoder for buffered (type 103) ALAC streams: their SETUP carries no ALACSpecificConfig, the frames use
-/// Apple's encoder defaults (352 frames a packet; pb 40, mb 10, kb 14, max run 255: as shairport-sync sets up
-/// FFmpeg for them).
-#[cfg(feature = "ap2-core")]
-pub(crate) fn buffered_decoder(sample_rate: u32, bit_depth: u8, channels: u8) -> AlacDecoder {
-    let p = buffered_params(bit_depth, channels);
-    let mut info = [0u8; 48];
-    info[24..28].copy_from_slice(&p.frame_length.to_be_bytes());
-    info[29] = p.bit_depth;
-    info[30] = p.pb;
-    info[31] = p.mb;
-    info[32] = p.kb;
-    info[33] = p.channels;
-    info[34..36].copy_from_slice(&255u16.to_be_bytes());
-    info[44..48].copy_from_slice(&sample_rate.to_be_bytes());
-    let mut d = AlacDecoder::new(i32::from(bit_depth), i32::from(channels));
-    d.set_info(&info);
-    d
-}
-
-#[cfg(feature = "ap2-core")]
-impl crate::codec::aac::AacBackend for AlacDecoder {
+impl crate::codec::Decode for AlacDecoder {
     fn decode(&mut self, frame: &[u8]) -> Option<Pcm> {
         self.decode_frame_pcm(frame)
     }
@@ -670,7 +742,6 @@ impl AlacDecoder {
 
     /// Decode an ALAC frame into interleaved PCM: 16-bit streams as [`Pcm::S16`], 24-bit ones as
     /// [`Pcm::S24`] (no float on the way).
-    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) fn decode_frame_pcm(&mut self, input: &[u8]) -> Option<Pcm> {
         if self.max_samples_per_frame == 0 || self.bytes_per_sample <= 0 {
             return None;
@@ -1102,7 +1173,7 @@ mod decode_tests {
     #[cfg(feature = "ap2-core")]
     #[test]
     fn buffered_24bit_frames_come_out_as_s24_and_round_to_16_bits() {
-        let mut dec = buffered_decoder(48_000, 24, 2);
+        let mut dec = AlacConfig::buffered(48_000, 24, 2).unwrap().decoder();
         let samples: [i32; 4] = [0, 0x7f_ffff, -0x80_0000, 0x17f];
         let mut w = BitWriter::new();
         w.put(1, 3); // channels = 1 (stereo)
