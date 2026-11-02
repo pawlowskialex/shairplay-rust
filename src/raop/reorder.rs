@@ -59,12 +59,14 @@ struct ReorderStats {
 }
 
 /// Realtime packets in sequence order. A packet behind a gap is held while the gap is asked for again (`ASK_AGAIN`
-/// later once more); after `GIVE_UP`, or with `max_held` packets waiting, the gap is played as silence (the output
-/// queue has to cover the wait, a few hundred ms). A jump of more than `MAX_GAP` is a new start (a flush), not a
-/// loss. Without retransmits (`hold` false) gaps are given up at once.
+/// later once more, then every `ASK_LATER`); after `GIVE_UP` (or the stream's longer [`wait`](Self::wait)), or with
+/// `max_held` packets waiting, the gap is played as silence (the output queue has to cover the wait). A jump of more
+/// than `MAX_GAP`, or than what may be held, is a new start (a flush), not a loss. Without retransmits (`hold` false)
+/// gaps are given up at once.
 pub(crate) struct Reorder {
     hold: bool,
     max_held: usize,
+    give_up: std::time::Duration,
     next: Option<u64>, // extended sequence number of the next packet to play
     held: std::collections::BTreeMap<u64, Vec<u8>>, // arrived beyond a gap
     asked: std::collections::BTreeMap<u64, (std::time::Instant, std::time::Instant, u8)>, // missing: first, last ask, asks
@@ -74,6 +76,7 @@ pub(crate) struct Reorder {
 }
 
 const ASK_AGAIN: std::time::Duration = std::time::Duration::from_millis(50);
+const ASK_LATER: std::time::Duration = std::time::Duration::from_millis(250);
 const GIVE_UP: std::time::Duration = std::time::Duration::from_millis(120);
 const MAX_GAP: u64 = 64;
 
@@ -82,6 +85,7 @@ impl Reorder {
         Reorder {
             hold,
             max_held,
+            give_up: GIVE_UP,
             next: None,
             held: std::collections::BTreeMap::default(),
             asked: std::collections::BTreeMap::default(),
@@ -89,6 +93,16 @@ impl Reorder {
             last_arrival: None,
             stats: ReorderStats::default(),
         }
+    }
+
+    /// A stream that plays well after its packets arrive (on the sender's timeline) waits for a gap up to `wait`
+    /// instead of `GIVE_UP`, holding what comes behind it meanwhile (`packets_per_s`): a packet or a resend that is
+    /// late but still before its time plays.
+    #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
+    pub(crate) fn wait(&mut self, wait: std::time::Duration, packets_per_s: u32) {
+        self.give_up = wait.max(GIVE_UP);
+        let held = self.give_up.as_millis() as usize * packets_per_s as usize / 1000;
+        self.max_held = self.max_held.max(held + held / 8);
     }
 
     pub(crate) fn holding(&self) -> bool {
@@ -122,7 +136,7 @@ impl Reorder {
             self.stats.late += 1;
             return false;
         }
-        if ext - next > MAX_GAP {
+        if ext - next > MAX_GAP.max(self.max_held as u64) {
             // a new start: play what is held (gaps in it as silence), then go on from here
             self.give_up_all(out);
             self.asked.clear();
@@ -169,13 +183,15 @@ impl Reorder {
         let again: Vec<u64> = self
             .asked
             .iter()
-            .filter(|(_, (_, last, n))| *n < 2 && now.duration_since(*last) >= ASK_AGAIN)
+            .filter(|(_, (_, last, n))| {
+                now.duration_since(*last) >= if *n < 2 { ASK_AGAIN } else { ASK_LATER }
+            })
             .map(|(&m, _)| m)
             .collect();
         for m in again {
             if let Some(e) = self.asked.get_mut(&m) {
                 e.1 = now;
-                e.2 += 1;
+                e.2 = e.2.saturating_add(1);
             }
             self.ask(m, m + 1);
         }
@@ -186,8 +202,8 @@ impl Reorder {
             let waited = self
                 .asked
                 .get(&next)
-                .map_or(GIVE_UP, |(t, _, _)| now.duration_since(*t));
-            if waited < GIVE_UP && self.held.len() <= self.max_held {
+                .map_or(self.give_up, |(t, _, _)| now.duration_since(*t));
+            if waited < self.give_up && self.held.len() <= self.max_held {
                 break;
             }
             self.skip_to(first, out);
@@ -406,6 +422,36 @@ mod tests {
         assert!(!r.holding());
         r.push(3, &[3], t, &mut out);
         assert_eq!(seqs(&out), vec![(0, 10), (0, 3)]);
+    }
+
+    /// A stream that plays a second or more after its packets arrive waits for a gap that long: a resend 600 ms late
+    /// still fills it, asked for again every `ASK_LATER` meanwhile, and the 100 packets held behind it are no new start.
+    #[test]
+    fn a_stream_that_plays_later_waits_longer_for_a_gap() {
+        let (mut r, t, mut out) = (Reorder::new(true, MAX_HELD), Instant::now(), Vec::new());
+        r.wait(Duration::from_secs(1), 125);
+        r.push(0, &[0], t, &mut out);
+        for s in 2..=101u16 {
+            r.push(s, &[s as u8], t, &mut out);
+        }
+        assert_eq!(r.take_requests(), vec![(1, 1)]);
+        let mut asks = 1;
+        for ms in (10..=600).step_by(10) {
+            r.tick(t + Duration::from_millis(ms), &mut out);
+            asks += r.take_requests().len();
+        }
+        assert_eq!(asks, 4, "at once, after 50 ms, then every 250 ms");
+        assert_eq!(out.len(), 1, "still waiting for 1");
+        r.push(1, &[1], t + Duration::from_millis(600), &mut out);
+        assert_eq!(out.len(), 102);
+        assert!(out.iter().all(|(fill, _)| *fill == 0));
+        assert_eq!((r.stats.recovered, r.stats.filled), (1, 0));
+        // a gap nobody fills: silence at the wait
+        r.push(103, &[103], t + Duration::from_millis(600), &mut out);
+        r.tick(t + Duration::from_millis(1500), &mut out);
+        assert!(r.holding());
+        r.tick(t + Duration::from_millis(1600), &mut out);
+        assert_eq!(out.last().map(|(f, p)| (*f, p[0])), Some((1, 103)));
     }
 
     #[test]
