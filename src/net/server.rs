@@ -36,6 +36,41 @@ impl Default for RequestBodyPolicy {
 struct PendingRequest {
     request: HttpRequest,
     body_deadline: Option<Instant>,
+    /// When its first bytes came: its headers have [`HEADER_TIMEOUT`] from then
+    started: Option<Instant>,
+}
+
+/// Once a request's first bytes arrive, its headers have this long.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection without a session (nothing set up, not paired) may stay quiet.
+const IDLE_WITHOUT_SESSION: Duration = Duration::from_secs(30);
+
+/// A running connection, as the accept loop sees it: when it came, whether it holds a session, and how to end it
+/// when every slot is taken and a new sender comes.
+#[derive(Default)]
+struct Slot {
+    session: std::sync::atomic::AtomicBool,
+    evict: tokio::sync::Notify,
+}
+
+type Slots = Arc<std::sync::Mutex<Vec<Arc<Slot>>>>;
+
+/// Every slot is taken: end the oldest connection without a session, if there is one. Idle or half-sent
+/// connections can't keep senders out; ones that play or are paired stay.
+fn evict_one(slots: &Slots) -> bool {
+    let Ok(slots) = slots.lock() else {
+        return false;
+    };
+    match slots
+        .iter()
+        .find(|s| !s.session.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        Some(slot) => {
+            slot.evict.notify_one();
+            true
+        }
+        None => false,
+    }
 }
 
 impl PendingRequest {
@@ -44,6 +79,7 @@ impl PendingRequest {
         handler: &dyn ConnectionHandler,
         data: &[u8],
     ) -> Result<(), ProtocolError> {
+        self.started.get_or_insert_with(Instant::now);
         self.request.add_data_with_body_limit(data, |headers| {
             let policy = handler.request_body_policy(headers)?;
             self.body_deadline = policy
@@ -216,6 +252,12 @@ pub(crate) trait ConnectionHandler: Send {
         Ok(RequestBodyPolicy::default())
     }
 
+    /// Whether the connection holds a session (set something up, or is paired): one that doesn't is closed when
+    /// quiet for [`IDLE_WITHOUT_SESSION`], or first when every slot is taken.
+    fn has_session(&self) -> bool {
+        false
+    }
+
     /// Decrypt incoming raw bytes. Returns decrypted data and bytes consumed.
     /// Default: passthrough (no encryption).
     fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
@@ -324,6 +366,7 @@ impl HttpServer {
 
         let callbacks = self.callbacks.clone();
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
+        let slots = Slots::default();
         let connection_config = self.connection_config;
 
         for listener in listeners {
@@ -334,6 +377,7 @@ impl HttpServer {
                 listener,
                 callbacks.clone(),
                 semaphore.clone(),
+                slots.clone(),
                 shutdown_rx.clone(),
                 connection_config,
             );
@@ -485,6 +529,7 @@ async fn process_connection<S>(
     mut handler: Box<dyn ConnectionHandler>,
     remote: SocketAddr,
     config: ConnectionConfig,
+    slot: Arc<Slot>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -492,10 +537,20 @@ async fn process_connection<S>(
     let mut request = PendingRequest::default();
     let mut raw_buf = Vec::new(); // accumulates encrypted data
 
+    let mut last_activity = Instant::now();
     loop {
         if !send_completed_responses(&mut stream, handler.as_mut(), &mut request, config).await {
             break;
         }
+        slot.session
+            .store(handler.has_session(), std::sync::atomic::Ordering::Relaxed);
+        // the one deadline that applies now: a request's headers, its body, or quiet without a session
+        let deadline = match request.started {
+            Some(t) if !request.request.headers_complete() => Some(t + HEADER_TIMEOUT),
+            _ if request.body_deadline.is_some() => request.body_deadline,
+            None if !handler.has_session() => Some(last_activity + IDLE_WITHOUT_SESSION),
+            _ => None,
+        };
         let close = handler.close_signal();
         let closed = async {
             match &close {
@@ -505,11 +560,11 @@ async fn process_connection<S>(
         };
         let read = tokio::select! {
             r = async {
-                if let Some(deadline) = request.body_deadline {
+                if let Some(deadline) = deadline {
                     match timeout_at(deadline, stream.read(&mut buf)).await {
                         Ok(result) if Instant::now() < deadline => Some(result),
                         _ => {
-                            tracing::debug!("Request body deadline exceeded");
+                            tracing::info!(%remote, "Closing: too slow or quiet without a session");
                             None
                         }
                     }
@@ -521,7 +576,12 @@ async fn process_connection<S>(
                 tracing::info!(%remote, "Closing: another sender took over");
                 None
             }
+            () = slot.evict.notified() => {
+                tracing::info!(%remote, "Closing: every slot taken, and this connection holds no session");
+                None
+            }
         };
+        last_activity = Instant::now();
         let Some(read) = read else { break };
         let n = match read {
             Ok(0) | Err(_) => break,
@@ -559,6 +619,7 @@ fn spawn_accept_loop(
     listener: TcpListener,
     callbacks: Arc<dyn HttpdCallbacks>,
     semaphore: Arc<Semaphore>,
+    slots: Slots,
     mut shutdown_rx: watch::Receiver<bool>,
     config: ConnectionConfig,
 ) {
@@ -576,18 +637,36 @@ fn spawn_accept_loop(
                         Ok(a) => a,
                         Err(_) => continue,
                     };
-                    let permit = match semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => { tracing::warn!("Max connections reached"); continue; }
-                    };
                     let cb = callbacks.clone();
+                    let semaphore = semaphore.clone();
+                    let slots = slots.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
-                        let handler = match cb.conn_init(local, remote) {
-                            Some(h) => h,
-                            None => return,
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            // full: one without a session makes room, if there is one
+                            Err(_) if evict_one(&slots) => {
+                                match tokio::time::timeout(Duration::from_secs(1), semaphore.acquire_owned()).await {
+                                    Ok(Ok(p)) => p,
+                                    _ => return,
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(%remote, "Max connections reached, all of them with a session");
+                                return;
+                            }
                         };
-                        process_connection(stream, handler, remote, config).await;
+                        let _permit = permit;
+                        let Some(handler) = cb.conn_init(local, remote) else {
+                            return;
+                        };
+                        let slot = Arc::new(Slot::default());
+                        if let Ok(mut s) = slots.lock() {
+                            s.push(slot.clone());
+                        }
+                        process_connection(stream, handler, remote, config, slot.clone()).await;
+                        if let Ok(mut s) = slots.lock() {
+                            s.retain(|o| !Arc::ptr_eq(o, &slot));
+                        }
                     });
                 }
                 _ = shutdown_rx.changed() => {
@@ -624,6 +703,7 @@ mod tests {
             Box::new(OkHandler { disconnect: false }),
             remote,
             ConnectionConfig::default(),
+            Arc::default(),
         ));
 
         client
@@ -643,6 +723,75 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// Quiet without a session, or a request whose headers never end: the connection goes (four of them held
+    /// every slot for good before).
+    #[tokio::test(start_paused = true)]
+    async fn quiet_or_slow_connections_without_a_session_close() {
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        for (bytes, limit) in [
+            (&b""[..], IDLE_WITHOUT_SESSION),
+            (&b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n"[..], HEADER_TIMEOUT),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(process_connection(
+                server,
+                Box::new(OkHandler { disconnect: false }),
+                remote,
+                ConnectionConfig::default(),
+                Arc::default(),
+            ));
+            client.write_all(bytes).await.unwrap();
+            tokio::time::sleep(limit.saturating_sub(Duration::from_secs(1))).await;
+            assert!(!task.is_finished());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(task.is_finished(), "still open after {limit:?}");
+        }
+    }
+
+    /// Every slot taken: a new connection ends one without a session and takes its place.
+    #[tokio::test]
+    async fn a_new_sender_takes_the_slot_of_a_connection_without_a_session() {
+        struct Callbacks;
+        impl HttpdCallbacks for Callbacks {
+            fn conn_init(
+                self: Arc<Self>,
+                _local: SocketAddr,
+                _remote: SocketAddr,
+            ) -> Option<Box<dyn ConnectionHandler>> {
+                Some(Box::new(OkHandler { disconnect: false }))
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (_shutdown, receiver) = watch::channel(false);
+        spawn_accept_loop(
+            listener,
+            Arc::new(Callbacks),
+            Arc::new(Semaphore::new(1)),
+            Slots::default(),
+            receiver,
+            ConnectionConfig::default(),
+        );
+        let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut sender = tokio::net::TcpStream::connect(address).await.unwrap();
+        sender
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut tmp = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(3), sender.read(&mut tmp))
+            .await
+            .expect("the new sender got no answer")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&tmp[..n]).starts_with("RTSP/1.0 200"));
+        assert_eq!(
+            idle.read(&mut tmp).await.unwrap(),
+            0,
+            "the idle one was closed"
+        );
+    }
+
     #[tokio::test]
     async fn closes_when_handler_sets_disconnect() {
         let (mut client, server) = tokio::io::duplex(4096);
@@ -652,6 +801,7 @@ mod tests {
             Box::new(OkHandler { disconnect: true }),
             remote,
             ConnectionConfig::default(),
+            Arc::default(),
         ));
 
         client
@@ -698,6 +848,7 @@ mod tests {
             Box::new(InvalidConsumptionHandler),
             remote,
             ConnectionConfig::default(),
+            Arc::default(),
         ));
 
         client.write_all(b"encrypted").await.unwrap();

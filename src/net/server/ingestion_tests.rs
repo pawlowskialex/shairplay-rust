@@ -83,6 +83,7 @@ fn spawn(handler: BoundedHandler) -> (DuplexStream, JoinHandle<()>) {
         Box::new(handler),
         "127.0.0.1:5000".parse().unwrap(),
         ConnectionConfig::default(),
+        Arc::default(),
     ));
     (client, task)
 }
@@ -236,6 +237,7 @@ async fn deadline_releases_real_tcp_client_slot() {
         listener,
         callbacks,
         semaphore.clone(),
+        Slots::default(),
         receiver,
         ConnectionConfig::default(),
     );

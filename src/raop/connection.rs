@@ -278,6 +278,16 @@ impl Drop for RaopConnectionHandler {
 }
 
 impl ConnectionHandler for RaopConnectionHandler {
+    /// Set up a session (ANNOUNCE, SETUP), or paired (transient pairing included: iOS keeps such a connection
+    /// open, idle, for remote control).
+    fn has_session(&self) -> bool {
+        #[cfg(feature = "ap2-core")]
+        if self.conn.is_ap2 {
+            return true;
+        }
+        self.conn.session || self.conn.raop_rtp.is_some()
+    }
+
     fn request_body_policy(
         &self,
         request: &HttpRequest,
