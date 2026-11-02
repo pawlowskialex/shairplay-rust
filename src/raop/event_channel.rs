@@ -97,7 +97,9 @@ impl EventChannel {
                                         debug!(len = plain.len(), line = %String::from_utf8_lossy(first), "Event channel message received");
                                     }
                                 }
-                                Err(e) => { warn!("Event channel decrypt error: {e}"); }
+                                // the stream is out of step for good: nothing after it decrypts either, and the
+                                // buffer would only grow
+                                Err(e) => { warn!("Event channel decrypt error, closing: {e}"); break; }
                             }
                         }
                         Err(e) => { warn!("Event channel read error: {e}"); break; }

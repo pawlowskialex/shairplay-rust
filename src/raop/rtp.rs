@@ -278,7 +278,7 @@ impl RaopRtp {
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
             timing_addr.set_port(timing_rport);
-            super::ntp::spawn_ntp_responder(tsock, timing_addr);
+            super::ntp::spawn_ntp_responder(tsock, timing_addr, Some(shutdown_rx.clone()));
 
             let format = self.format;
             let output_format = self.output_format;
