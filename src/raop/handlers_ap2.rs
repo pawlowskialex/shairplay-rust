@@ -34,9 +34,10 @@ impl RaopConnection {
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
         rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
+        let peer = self.remote_socket.ip();
         tokio::spawn(async move {
-            if let Ok((stream, addr)) = event_listener.accept().await {
-                tracing::info!(%addr, "RC event channel client connected");
+            if let Some((stream, addr)) = crate::net::accept_from(&event_listener, peer).await {
+                tracing::info!(%addr, "Event channel client connected");
                 crate::net::keepalive(&stream);
                 crate::raop::event_channel::EventChannel::handle_stream(
                     stream,
@@ -866,18 +867,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                     conn.mr_supported.clone(),
                 ),
             ));
-            tokio::spawn(async move {
-                if let Ok((stream, addr)) = event_listener.accept().await {
-                    tracing::info!(%addr, "Event channel client connected");
-                    crate::net::keepalive(&stream);
-                    crate::raop::event_channel::EventChannel::handle_stream(
-                        stream,
-                        event_channel_cipher,
-                        rx,
-                    )
-                    .await;
-                }
-            });
+            conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
             sender
         };
         conn.event_sender = Some(event_sender);
@@ -908,7 +898,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                 let local_port = tsock.local_addr().ok()?.port();
                 let mut remote_timing = conn.remote_socket;
                 remote_timing.set_port(timing_rport);
-                crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing);
+                crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing, None);
                 Some(local_port)
             })
             .unwrap_or(0);
@@ -1143,7 +1133,10 @@ fn setup_stream_buffered(
         alac_offload: conn.shared.alac_offload.clone(),
     };
 
-    let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
+    let proc = crate::raop::buffered_audio::BufferedAudioProcessor {
+        listener,
+        peer: conn.remote_socket.ip(),
+    };
     let cmd_tx = proc.start(shk_arr, output_config, handler);
     conn.playout_cmd = Some(cmd_tx.clone());
     conn.shared.set_active_audio(
@@ -1177,8 +1170,9 @@ fn setup_stream_rc(
         let data_port = data_listener.local_addr().ok()?.port();
         tracing::debug!(data_port, "RC data channel opened");
 
+        let peer = conn.remote_socket.ip();
         tokio::spawn(async move {
-            if let Ok((_, addr)) = data_listener.accept().await {
+            if let Some((_, addr)) = crate::net::accept_from(&data_listener, peer).await {
                 tracing::info!(%addr, "RC data channel client connected");
             }
         });

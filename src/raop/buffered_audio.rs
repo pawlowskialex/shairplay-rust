@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::codec::aac::{AacBackend, AudioSsrc};
-use crate::error::{CodecError, NetworkError, ShairplayError};
+use crate::error::{CodecError, ShairplayError};
 use crate::raop::audio_pipeline::{
     NONCE_TRAIL_LEN, POLY1305_TAG_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha,
 };
@@ -230,6 +230,8 @@ fn play_time(timing: Timing, ts: u32, sample_rate: u32) -> Option<u64> {
 pub(crate) struct BufferedAudioProcessor {
     /// TCP listener waiting for the iPhone to connect.
     pub(crate) listener: TcpListener,
+    /// The sender: the one host whose connection it takes.
+    pub(crate) peer: std::net::IpAddr,
 }
 
 impl BufferedAudioProcessor {
@@ -362,13 +364,9 @@ impl BufferedAudioProcessor {
         let state4 = state.clone();
 
         tokio::spawn(async move {
-            let (stream, addr) = match self.listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Buffered audio accept failed: {e}");
-                    handler.on_error(&ShairplayError::Network(NetworkError::Io(e)));
-                    return;
-                }
+            let Some((stream, addr)) = crate::net::accept_from(&self.listener, self.peer).await
+            else {
+                return;
             };
             info!(%addr, "Buffered audio client connected");
             crate::net::keepalive(&stream);
