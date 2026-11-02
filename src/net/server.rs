@@ -94,61 +94,13 @@ impl PendingRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ConnectionConfig {
-    #[cfg(feature = "diagnostic-headers")]
-    header_diagnostics: crate::net::protocol_diagnostics::HeaderDiagnostics,
-}
-
-impl ConnectionConfig {
-    #[cfg(feature = "diagnostic-headers")]
-    fn set_header_diagnostics(
-        &mut self,
-        diagnostics: crate::net::protocol_diagnostics::HeaderDiagnostics,
-    ) {
-        self.header_diagnostics = diagnostics;
-    }
-
-    fn warn_if_raw(self) {
-        #[cfg(feature = "diagnostic-headers")]
-        self.header_diagnostics.warn_if_raw();
-    }
-
-    fn trace_request(self, request: &HttpRequest, encrypted: bool) {
-        #[cfg(feature = "diagnostic-headers")]
-        crate::net::protocol_diagnostics::trace_request(
-            self.header_diagnostics,
-            request,
-            encrypted,
-        );
-        #[cfg(not(feature = "diagnostic-headers"))]
-        let _ = (request, encrypted);
-    }
-
-    fn trace_response(self, response: &HttpResponse, encrypted: bool) {
-        #[cfg(feature = "diagnostic-headers")]
-        crate::net::protocol_diagnostics::trace_response(
-            self.header_diagnostics,
-            response,
-            encrypted,
-        );
-        #[cfg(not(feature = "diagnostic-headers"))]
-        let _ = (response, encrypted);
-    }
-}
-
 async fn write_bad_request_and_close<S: AsyncWrite + Unpin>(
     stream: &mut S,
     handler: Option<&mut dyn ConnectionHandler>,
-    config: ConnectionConfig,
 ) {
     let mut response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
     response.add_header("Connection", "close");
     response.finish(None);
-    let encrypted = handler
-        .as_ref()
-        .is_some_and(|handler| handler.is_encrypted());
-    config.trace_response(&response, encrypted);
     let wire_out = match handler {
         Some(handler) if handler.is_encrypted() => handler.encrypt_outgoing(response.get_data()),
         _ => response.get_data().to_vec(),
@@ -291,7 +243,6 @@ pub(crate) struct HttpServer {
     port: u16,
     running: bool,
     bind_config: BindConfig,
-    connection_config: ConnectionConfig,
 }
 
 impl HttpServer {
@@ -304,7 +255,6 @@ impl HttpServer {
             port: 0,
             running: false,
             bind_config: BindConfig::default(),
-            connection_config: ConnectionConfig::default(),
         }
     }
 
@@ -313,20 +263,11 @@ impl HttpServer {
         self.bind_config = config;
     }
 
-    #[cfg(feature = "diagnostic-headers")]
-    pub(crate) fn set_header_diagnostics(
-        &mut self,
-        diagnostics: crate::net::protocol_diagnostics::HeaderDiagnostics,
-    ) {
-        self.connection_config.set_header_diagnostics(diagnostics);
-    }
-
     /// Start listening. Returns the actual port (may differ if auto-sensing).
     pub(crate) async fn start(&mut self, port: u16) -> Result<u16, NetworkError> {
         if self.running {
             return Ok(self.port);
         }
-        self.connection_config.warn_if_raw();
 
         let bind_port = if port > 0 {
             port
@@ -367,7 +308,6 @@ impl HttpServer {
         let callbacks = self.callbacks.clone();
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
         let slots = Slots::default();
-        let connection_config = self.connection_config;
 
         for listener in listeners {
             if let Ok(addr) = listener.local_addr() {
@@ -379,7 +319,6 @@ impl HttpServer {
                 semaphore.clone(),
                 slots.clone(),
                 shutdown_rx.clone(),
-                connection_config,
             );
         }
 
@@ -427,19 +366,16 @@ async fn send_completed_responses<S: AsyncWrite + Unpin>(
     stream: &mut S,
     handler: &mut dyn ConnectionHandler,
     pending: &mut PendingRequest,
-    config: ConnectionConfig,
 ) -> bool {
     while pending.request.is_complete() {
         let request = &mut pending.request;
         let method = request.method().unwrap_or("?").to_string();
         let url = request.url().unwrap_or("?").to_string();
         tracing::debug!(%method, %url, body_len = request.data().map_or(0, <[u8]>::len), "RTSP request");
-        config.trace_request(request, handler.is_encrypted());
         let response = handler.conn_request(request);
         let status = response.status_code();
         tracing::debug!(%method, %url, status, "RTSP response");
         let response_encrypted = handler.is_encrypted();
-        config.trace_response(&response, response_encrypted);
         let disconnect = response.get_disconnect();
         let wire_out = if response_encrypted {
             handler.encrypt_outgoing(response.get_data())
@@ -461,7 +397,7 @@ async fn send_completed_responses<S: AsyncWrite + Unpin>(
         let leftover = request.take_leftover();
         *pending = PendingRequest::default();
         if !leftover.is_empty() && pending.add_data(handler, &leftover).is_err() {
-            write_bad_request_and_close(stream, Some(handler), config).await;
+            write_bad_request_and_close(stream, Some(handler)).await;
             return false;
         }
     }
@@ -473,7 +409,6 @@ async fn add_request_data<S: AsyncWrite + Unpin>(
     handler: &mut dyn ConnectionHandler,
     pending: &mut PendingRequest,
     data: &[u8],
-    config: ConnectionConfig,
 ) -> bool {
     if pending.add_data(handler, data).is_ok() {
         tracing::trace!(
@@ -484,7 +419,7 @@ async fn add_request_data<S: AsyncWrite + Unpin>(
         return true;
     }
     tracing::warn!(data_len = data.len(), "HTTP parse error");
-    write_bad_request_and_close(stream, Some(handler), config).await;
+    write_bad_request_and_close(stream, Some(handler)).await;
     false
 }
 
@@ -494,7 +429,6 @@ async fn ingest_encrypted_data<S: AsyncWrite + Unpin>(
     request: &mut PendingRequest,
     raw_buf: &mut Vec<u8>,
     data: &[u8],
-    config: ConnectionConfig,
 ) -> bool {
     if data.len() > MAX_ENCRYPTED_BUFFER_LEN.saturating_sub(raw_buf.len()) {
         tracing::warn!("Encrypted buffer exceeded 1 MB, dropping connection");
@@ -520,7 +454,7 @@ async fn ingest_encrypted_data<S: AsyncWrite + Unpin>(
     }
     tracing::trace!(plain_len = plain.len(), consumed, "Decrypted request data");
     raw_buf.drain(..consumed);
-    plain.is_empty() || add_request_data(stream, handler, request, &plain, config).await
+    plain.is_empty() || add_request_data(stream, handler, request, &plain).await
 }
 
 /// Drive one accepted connection until the peer closes or processing fails.
@@ -528,7 +462,6 @@ async fn process_connection<S>(
     mut stream: S,
     mut handler: Box<dyn ConnectionHandler>,
     remote: SocketAddr,
-    config: ConnectionConfig,
     slot: Arc<Slot>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -539,7 +472,7 @@ async fn process_connection<S>(
 
     let mut last_activity = Instant::now();
     loop {
-        if !send_completed_responses(&mut stream, handler.as_mut(), &mut request, config).await {
+        if !send_completed_responses(&mut stream, handler.as_mut(), &mut request).await {
             break;
         }
         slot.session
@@ -594,19 +527,11 @@ async fn process_connection<S>(
                 &mut request,
                 &mut raw_buf,
                 &buf[..n],
-                config,
             )
             .await
         } else {
             tracing::trace!(n, "Read plaintext data");
-            add_request_data(
-                &mut stream,
-                handler.as_mut(),
-                &mut request,
-                &buf[..n],
-                config,
-            )
-            .await
+            add_request_data(&mut stream, handler.as_mut(), &mut request, &buf[..n]).await
         };
         if !accepted {
             break;
@@ -621,7 +546,6 @@ fn spawn_accept_loop(
     semaphore: Arc<Semaphore>,
     slots: Slots,
     mut shutdown_rx: watch::Receiver<bool>,
-    config: ConnectionConfig,
 ) {
     tokio::spawn(async move {
         loop {
@@ -663,7 +587,7 @@ fn spawn_accept_loop(
                         if let Ok(mut s) = slots.lock() {
                             s.push(slot.clone());
                         }
-                        process_connection(stream, handler, remote, config, slot.clone()).await;
+                        process_connection(stream, handler, remote, slot.clone()).await;
                         if let Ok(mut s) = slots.lock() {
                             s.retain(|o| !Arc::ptr_eq(o, &slot));
                         }
@@ -702,7 +626,6 @@ mod tests {
             server,
             Box::new(OkHandler { disconnect: false }),
             remote,
-            ConnectionConfig::default(),
             Arc::default(),
         ));
 
@@ -737,7 +660,6 @@ mod tests {
                 server,
                 Box::new(OkHandler { disconnect: false }),
                 remote,
-                ConnectionConfig::default(),
                 Arc::default(),
             ));
             client.write_all(bytes).await.unwrap();
@@ -770,7 +692,6 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Slots::default(),
             receiver,
-            ConnectionConfig::default(),
         );
         let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -800,7 +721,6 @@ mod tests {
             server,
             Box::new(OkHandler { disconnect: true }),
             remote,
-            ConnectionConfig::default(),
             Arc::default(),
         ));
 
@@ -847,7 +767,6 @@ mod tests {
             server,
             Box::new(InvalidConsumptionHandler),
             remote,
-            ConnectionConfig::default(),
             Arc::default(),
         ));
 

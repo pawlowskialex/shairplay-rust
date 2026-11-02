@@ -9,7 +9,7 @@ mod tests;
 
 /// Maximum size accepted for RTSP/HTTP headers.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-/// Maximum number of headers accepted or emitted by protocol diagnostics.
+/// Maximum number of headers accepted in a request.
 pub(crate) const MAX_HEADER_COUNT: usize = 64;
 /// Maximum size accepted for a single request body.
 pub(crate) const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -237,14 +237,6 @@ impl HttpRequest {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(|s| s.as_str())
-    }
-
-    /// Iterate over parsed headers for the transport diagnostics layer.
-    #[cfg(feature = "diagnostic-headers")]
-    pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
     /// The request body, if present.

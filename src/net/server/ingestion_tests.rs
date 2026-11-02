@@ -82,7 +82,6 @@ fn spawn(handler: BoundedHandler) -> (DuplexStream, JoinHandle<()>) {
         server,
         Box::new(handler),
         "127.0.0.1:5000".parse().unwrap(),
-        ConnectionConfig::default(),
         Arc::default(),
     ));
     (client, task)
@@ -189,13 +188,7 @@ async fn completed_body_clears_deadline_and_next_request_gets_its_own() {
     assert!(pending.body_deadline.is_none());
     let (mut client, mut server) = tokio::io::duplex(1024);
     let mut handler = handler;
-    let accepted = send_completed_responses(
-        &mut server,
-        &mut handler,
-        &mut pending,
-        ConnectionConfig::default(),
-    )
-    .await;
+    let accepted = send_completed_responses(&mut server, &mut handler, &mut pending).await;
     assert!(accepted);
     pending
         .add_data(&handler, &headers("/bounded", 33))
@@ -239,7 +232,6 @@ async fn deadline_releases_real_tcp_client_slot() {
         semaphore.clone(),
         Slots::default(),
         receiver,
-        ConnectionConfig::default(),
     );
     let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
     client.write_all(&headers("/bounded", 33)).await.unwrap();
@@ -269,15 +261,8 @@ async fn encrypted_buffer_limit_is_checked_before_copying() {
     let mut pending = PendingRequest::default();
     let mut raw = vec![0; MAX_ENCRYPTED_BUFFER_LEN];
     let mut sink = tokio::io::sink();
-    let accepted = ingest_encrypted_data(
-        &mut sink,
-        &mut handler,
-        &mut pending,
-        &mut raw,
-        b"x",
-        ConnectionConfig::default(),
-    )
-    .await;
+    let accepted =
+        ingest_encrypted_data(&mut sink, &mut handler, &mut pending, &mut raw, b"x").await;
     assert!(!accepted);
     assert_eq!(raw.len(), MAX_ENCRYPTED_BUFFER_LEN);
 }
@@ -320,23 +305,10 @@ async fn encrypted_fragments_and_pipeline_use_identical_policy() {
     let mut accepted = true;
     for byte in ciphertext {
         assert!(accepted);
-        let ingested = ingest_encrypted_data(
-            &mut server,
-            &mut handler,
-            &mut pending,
-            &mut raw,
-            &[byte],
-            ConnectionConfig::default(),
-        )
-        .await;
+        let ingested =
+            ingest_encrypted_data(&mut server, &mut handler, &mut pending, &mut raw, &[byte]).await;
         assert!(ingested);
-        accepted = send_completed_responses(
-            &mut server,
-            &mut handler,
-            &mut pending,
-            ConnectionConfig::default(),
-        )
-        .await;
+        accepted = send_completed_responses(&mut server, &mut handler, &mut pending).await;
     }
     assert!(!accepted);
     let response = read_closed(&mut client).await;

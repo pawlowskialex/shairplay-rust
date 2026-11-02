@@ -118,7 +118,6 @@ let mut server = RaopServer::builder()
 | `.pipewire_auth_setup_compat()` | `false` | `pipewire-auth-setup-compat` | Experimental fixed-probe acknowledgement in classic RAOP; not MFi authentication |
 | `.max_clients()` | `10` | | Maximum concurrent connections |
 | `.bind()` | all interfaces | | Bind to specific IPs (multi-interface) |
-| `.header_diagnostics()` | `Disabled` | `diagnostic-headers` | Structured, redacted RTSP header diagnostics |
 | `.advertise_codecs()` | PCM + ALAC | AP1 | Set the ordered AP1 `cn` capability list |
 | `.advertise_encryption()` | none | AP1 | Set the ordered AP1 `et` capability list |
 | `.output_sample_rate()` | source rate | `resample` | Resample all audio to this rate |
@@ -164,8 +163,6 @@ limits and requirements for conformant receiver authentication.
 |------|-------------|-------------|
 | *(default)* | — | AirPlay 1 only |
 | `pipewire-auth-setup-compat` | none | Experimental PipeWire probe acknowledgement; explicit runtime opt-in required |
-| `diagnostic-headers` | none | Opt-in, redacted RTSP request and response header diagnostics |
-| `dangerous-raw-headers` | (implies `diagnostic-headers`) | Raw header values for explicit use in debug-assertion builds |
 | `resample` | rubato | Sample rate conversion + channel mixdown |
 | `ap2` | chacha20poly1305, hkdf, symphonia, … (implies `resample`) | Full AirPlay 2 audio |
 | `video` | (implies `ap2`) | Legacy feature set for screen mirroring (`0x527FFEE6`) |
@@ -200,28 +197,6 @@ reconnect. Real PipeWire playback remains unqualified, and the current sender's
 Digest flow does not establish password-protected interoperability. See the
 [contract and known limitations](docs/protocol/auth-setup.md#first-compatibility-contract)
 before deployment; the feature does not automatically configure a PipeWire sender.
-
-### RTSP Header Diagnostics
-
-Header diagnostics are compiled out by default. With the `diagnostic-headers`
-feature enabled, applications must still select a policy and enable the dedicated
-`shairplay::protocol_headers` tracing target at `TRACE`:
-
-```rust
-use shairplay::{HeaderDiagnostics, RaopServer};
-
-let builder = RaopServer::builder()
-    .header_diagnostics(HeaderDiagnostics::Redacted);
-```
-
-`Redacted` exposes values only for a conservative metadata allowlist. Sensitive
-and unknown header values are replaced with `<redacted>`. Bodies and media
-payloads are never logged.
-
-The separate `dangerous-raw-headers` feature adds `HeaderDiagnostics::Raw`.
-Raw mode can expose credentials, pairing material, and stable device identifiers,
-requires explicit runtime selection, and is rejected by `build()` when debug
-assertions are disabled. Control characters remain escaped in every mode.
 
 ## Implementation Status
 
