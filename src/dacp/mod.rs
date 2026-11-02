@@ -75,10 +75,9 @@ fn discover_dacp_port(dacp_id: &str, _remote_ip: std::net::IpAddr) -> Option<u16
 ///
 /// # Example
 /// ```text
-/// let mut client = DacpClient::new("7711DA8B47838CB5", "1986535575");
-/// client.discover_from_remote("192.168.1.5".parse().unwrap());
-/// // Then from a synchronous remote-control callback:
-/// // client.pause_blocking().ok();
+/// let client = DacpClient::new("7711DA8B47838CB5", "1986535575", "192.0.2.5".parse().unwrap());
+/// // from a synchronous remote-control callback (the first command finds the service, up to 2 s):
+/// client.pause_blocking().ok();
 /// ```
 /// HTTP client for sending DACP playback commands to the iPhone.
 #[derive(Debug)]
@@ -86,42 +85,41 @@ pub(crate) struct DacpClient {
     /// DACP-ID from the RTSP session. Identifies the `_dacp._tcp` mDNS service.
     dacp_id: String,
     active_remote: String,
-    addr: Option<SocketAddr>,
+    remote_ip: std::net::IpAddr,
+    /// Found on the first command, not when the session is set up: the mDNS browse takes up to 2 s, and the
+    /// SETUP that carries the DACP headers runs on the server's thread.
+    addr: std::sync::OnceLock<SocketAddr>,
 }
 
 impl DacpClient {
     /// Create a new DACP client from the values received in the AirPlay session.
-    pub(crate) fn new(dacp_id: &str, active_remote: &str) -> Self {
+    pub(crate) fn new(dacp_id: &str, active_remote: &str, remote_ip: std::net::IpAddr) -> Self {
         Self {
             dacp_id: dacp_id.to_string(),
             active_remote: active_remote.to_string(),
-            addr: None,
+            remote_ip,
+            addr: std::sync::OnceLock::new(),
         }
     }
 
-    /// Discover the Apple device's DACP service via mDNS.
-    ///
-    /// Browses `_dacp._tcp.local.` for a service matching the DACP-ID,
-    /// with a 2-second timeout. Falls back to port 3689 on the remote IP
-    /// if mDNS discovery fails.
-    pub(crate) fn discover_from_remote(&mut self, remote_ip: std::net::IpAddr) {
-        self.addr = match discover_dacp_port(&self.dacp_id, remote_ip) {
+    /// The sender's DACP service: `_dacp._tcp.local.` matching the DACP-ID (an mDNS browse of up to 2 s, once),
+    /// else port 3689 on the sender's address.
+    fn addr(&self) -> SocketAddr {
+        *self.addr.get_or_init(|| match discover_dacp_port(&self.dacp_id, self.remote_ip) {
             Some(port) => {
                 debug!(port, dacp_id = %self.dacp_id, "DACP service discovered via mDNS");
-                Some(SocketAddr::new(remote_ip, port))
+                SocketAddr::new(self.remote_ip, port)
             }
             None => {
                 debug!(dacp_id = %self.dacp_id, "DACP mDNS discovery failed, falling back to port 3689");
-                Some(SocketAddr::new(remote_ip, DACP_DEFAULT_PORT))
+                SocketAddr::new(self.remote_ip, DACP_DEFAULT_PORT)
             }
-        };
+        })
     }
 
     /// Send a raw DACP command from synchronous callbacks.
     pub(crate) fn command_blocking(&self, path: &str) -> Result<(), NetworkError> {
-        let addr = self.addr.ok_or_else(|| {
-            NetworkError::Mdns("DACP not discovered yet — call discover() first".into())
-        })?;
+        let addr = self.addr();
 
         let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;

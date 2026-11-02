@@ -52,24 +52,10 @@ pub(crate) struct DacpRemoteControl {
 
 impl DacpRemoteControl {
     /// Create a new DACP remote control client for the given iPhone.
-    pub(crate) fn new(dacp_id: &str, active_remote: &str, remote_addr: &[u8]) -> Self {
-        let mut client = crate::dacp::DacpClient::new(dacp_id, active_remote);
-        let ip = match remote_addr.len() {
-            4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                remote_addr[0],
-                remote_addr[1],
-                remote_addr[2],
-                remote_addr[3],
-            )),
-            16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(remote_addr);
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            }
-            _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        };
-        client.discover_from_remote(ip);
-        Self { client }
+    pub(crate) fn new(dacp_id: &str, active_remote: &str, remote: std::net::IpAddr) -> Self {
+        Self {
+            client: crate::dacp::DacpClient::new(dacp_id, active_remote, remote),
+        }
     }
 }
 

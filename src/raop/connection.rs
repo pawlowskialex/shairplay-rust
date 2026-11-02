@@ -189,6 +189,7 @@ fn new_raop_connection(
         #[cfg(feature = "ap2-core")]
         controller: None,
         nonce: digest::generate_nonce(MAX_NONCE_LEN),
+        challenges: 0,
         #[cfg(feature = "ap2-core")]
         srp_server: None,
         #[cfg(feature = "ap2-core")]

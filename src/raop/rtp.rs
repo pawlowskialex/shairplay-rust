@@ -61,20 +61,6 @@ fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, ShairplayError> {
         .map_err(Into::into)
 }
 
-/// Parse the SDP `c=` remote address to raw IP bytes for DACP callbacks.
-/// Handles "IP6 ::1" prefix and IPv4-mapped IPv6 addresses.
-pub(crate) fn remote_addr_bytes(remote: &str) -> Vec<u8> {
-    let addr_str = remote.strip_prefix("IP6 ").unwrap_or(remote);
-    if let Ok(ip) = addr_str.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => v4.octets().to_vec(),
-            IpAddr::V6(v6) => v6.octets().to_vec(),
-        }
-    } else {
-        vec![]
-    }
-}
-
 /// Mutable state shared between the RTP receive loop and the RTSP handler thread.
 /// Updated via async message passing (tokio Mutex), consumed in the receive loop.
 struct RtpState {

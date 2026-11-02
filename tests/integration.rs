@@ -318,6 +318,36 @@ async fn tcp_connect_and_options() {
     server.stop().await;
 }
 
+/// Apple-Challenge is answered on OPTIONS, a few times a connection: each answer is an RSA private-key operation.
+#[tokio::test]
+#[serial]
+async fn apple_challenge_is_answered_on_options_a_few_times() {
+    let (mut server, port, _) = start_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let challenge = "Apple-Challenge: dGVzdHRlc3R0ZXN0dGVzdA==\r\n";
+    let resp = send_rtsp(
+        &mut stream,
+        &format!("GET_PARAMETER * RTSP/1.0\r\nCSeq: 1\r\n{challenge}\r\n"),
+    )
+    .await;
+    assert!(!resp.contains("Apple-Response"), "got: {resp}");
+    for cseq in 2..8 {
+        let resp = send_rtsp(
+            &mut stream,
+            &format!("OPTIONS * RTSP/1.0\r\nCSeq: {cseq}\r\n{challenge}\r\n"),
+        )
+        .await;
+        assert_eq!(
+            resp.contains("Apple-Response"),
+            cseq < 6,
+            "CSeq {cseq}: {resp}"
+        );
+    }
+    server.stop().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn unknown_rtsp_method_returns_404() {

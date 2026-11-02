@@ -229,6 +229,9 @@ const ROUTES: &[Route] = &[
     },
 ];
 
+/// Apple-Challenges answered on one connection.
+const MAX_CHALLENGES: u8 = 4;
+
 /// Dispatch an RTSP request: authenticate, resolve route, call handler, build response.
 pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> HttpResponse {
     let method = request.method().unwrap_or("");
@@ -261,12 +264,17 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     }
 
     // --- Middleware: Apple-Challenge ---
+    // Senders send it on OPTIONS (some on ANNOUNCE), once or twice a connection. Each answer is an RSA private-key
+    // operation on the runtime's thread: not on any request, and not without end.
     if let Some(challenge) = request.header("Apple-Challenge")
+        && matches!(method, "OPTIONS" | "ANNOUNCE")
+        && conn.challenges < MAX_CHALLENGES
         && let Ok(sig) =
             conn.shared
                 .rsakey
                 .sign_challenge(challenge, &conn.local_addr, &conn.shared.hwaddr)
     {
+        conn.challenges += 1;
         response.add_header("Apple-Response", &sig);
     }
 

@@ -33,6 +33,8 @@ pub(crate) struct RaopConnection {
     #[cfg(feature = "ap2-core")]
     pub(crate) controller: Option<String>,
     pub(crate) nonce: String,
+    /// Apple-Challenges signed on this connection (each an RSA-2048 private-key operation)
+    pub(crate) challenges: u8,
     /// Cheap shared handle to server-wide config (identity, keys, handler, settings).
     /// Replaces the ~17 fields that were previously deep-copied into every connection.
     pub(crate) shared: Arc<crate::raop::connection::RaopShared>,
@@ -367,11 +369,10 @@ pub(crate) fn handle_setup(
     if let (Some(dacp_id), Some(active_remote)) =
         (request.header("DACP-ID"), request.header("Active-Remote"))
     {
-        let addr_bytes = crate::raop::rtp::remote_addr_bytes(&conn.remote_socket.ip().to_string());
         let remote = std::sync::Arc::new(crate::raop::DacpRemoteControl::new(
             dacp_id,
             active_remote,
-            &addr_bytes,
+            conn.remote_socket.ip(),
         ));
         conn.shared.handler.on_remote_control(remote);
     }
@@ -552,6 +553,7 @@ mod tests {
             remote_socket: "127.0.0.1:5000".parse().unwrap(),
             session: false,
             nonce: String::new(),
+            challenges: 0,
             shared,
             id: 0,
             close: Arc::new(tokio::sync::Notify::new()),
