@@ -212,7 +212,6 @@ struct Entry {
     ts: u32,
     /// Units of silence owed before it (lost ones the source gave up on)
     fill: u32,
-    len: usize,
     /// Decoded only to prime a lapped decoder: not played
     preroll: bool,
     state: State,
@@ -247,9 +246,6 @@ pub(crate) struct Decoder {
     lapped: bool,
     next_seq: Option<u32>,
     seq_mask: u32,
-    /// AirPlay 1's late packets: a unit that came out empty may be replaced by a later one under its sequence
-    /// number, so an empty one is held until a unit after it has decoded
-    replaceable: bool,
 }
 
 impl Decoder {
@@ -262,7 +258,6 @@ impl Decoder {
             lapped: false,
             next_seq: None,
             seq_mask: u32::MAX,
-            replaceable: false,
         }
     }
 
@@ -271,12 +266,6 @@ impl Decoder {
     pub(crate) fn lapped(mut self, seq_mask: u32) -> Self {
         self.lapped = true;
         self.seq_mask = seq_mask;
-        self
-    }
-
-    /// Late units may replace empty ones: see [`replace`](Self::replace).
-    pub(crate) fn replaceable(mut self) -> Self {
-        self.replaceable = true;
         self
     }
 
@@ -319,7 +308,6 @@ impl Decoder {
             seq,
             ts,
             fill,
-            len: unit.len(),
             preroll,
             state,
         });
@@ -343,29 +331,6 @@ impl Decoder {
             #[cfg(feature = "ap2-core")]
             Library::Offload => self.offload.as_mut()?.decode(unit).map(Pcm::S16),
         }
-    }
-
-    /// AirPlay 1: a packet under sequence number `seq` came again (the reorder stage had let one through). A sender
-    /// may open with placeholders under the first sequence numbers and send the frames under the same numbers after
-    /// them: one that is here and came out empty is replaced, one with the offload by a longer packet (with a new
-    /// tag: the placeholder's result is not taken for it); a decoded one stays. `false`: not taken.
-    pub(crate) fn replace(&mut self, seq: u32, unit: &[u8]) -> bool {
-        let Some(i) = self.queue.iter().position(|e| e.seq == seq) else {
-            return false;
-        };
-        let replace = match &self.queue[i].state {
-            State::Done(Some(_)) => false,
-            State::Done(None) => true,
-            State::Pending => unit.len() > self.queue[i].len,
-        };
-        if !replace {
-            return false;
-        }
-        let tag = self.tag();
-        let (_, state) = self.start(tag, unit);
-        let e = &mut self.queue[i];
-        (e.tag, e.len, e.state) = (tag, unit.len(), state);
-        true
     }
 
     /// Finished units from the offload into their entries.
@@ -395,7 +360,7 @@ impl Decoder {
                 },
                 Decoded2::Failed => None,
             };
-            // a unit flushed, or replaced, while it was out: its result is dropped
+            // a unit flushed while it was out: its result is dropped
             if let Some(e) = self
                 .queue
                 .iter_mut()
@@ -414,23 +379,11 @@ impl Decoder {
             .map(|e| (e.ts, matches!(e.state, State::Done(_))))
     }
 
-    /// The next unit, if it is decoded (see [`replaceable`](Self::replaceable) for the empty ones it holds).
+    /// The next unit, if it is decoded.
     pub(crate) fn pop(&mut self) -> Option<Unit> {
         self.collect();
-        let head = self.queue.front()?;
-        match &head.state {
-            State::Pending => return None,
-            State::Done(None)
-                if self.replaceable
-                    && !self
-                        .queue
-                        .iter()
-                        .skip(1)
-                        .any(|e| matches!(e.state, State::Done(Some(_)))) =>
-            {
-                return None;
-            }
-            State::Done(_) => {}
+        if matches!(self.queue.front()?.state, State::Pending) {
+            return None;
         }
         let e = self.queue.pop_front()?;
         let State::Done(pcm) = e.state else {
@@ -686,28 +639,6 @@ mod tests {
         d.push(21, 0, 0, &[21, 0]);
         finish(&q, 2);
         assert_eq!(out(&mut d), [Some(21)]);
-    }
-
-    #[test]
-    fn a_placeholder_is_replaced_by_the_frame_a_decoded_frame_is_not() {
-        let (mut d, q) = decoder();
-        let mut d2 = Decoder::new(None, Library::Frames(Box::new(Bytes))).replaceable();
-        // with the offload: the longer packet replaces the pending placeholder; its result isn't taken for the frame
-        d = d.replaceable();
-        d.push(40, 0, 0, &[1, 0]);
-        assert!(d.replace(40, &[40, 0, 0]));
-        assert!(!d.replace(40, &[41, 0])); // shorter: no
-        finish(&q, 2);
-        assert_eq!(out(&mut d), [Some(40)]);
-        // in software: an empty one waits for a unit after it, and may be replaced meanwhile
-        d2.push(1, 0, 0, &[9]);
-        assert!(out(&mut d2).is_empty(), "held: it may be a placeholder");
-        assert!(d2.replace(1, &[1, 0]));
-        d2.push(2, 0, 0, &[2, 0]);
-        assert!(!d2.replace(2, &[3, 0])); // decoded: stays
-        d2.push(3, 0, 0, &[7]); // a bad unit mid-stream ...
-        d2.push(4, 0, 0, &[4, 0]); // ... comes out empty once one after it decodes
-        assert_eq!(out(&mut d2), [Some(1), Some(2), None, Some(4)]);
     }
 
     #[cfg(feature = "ap2-core")]
