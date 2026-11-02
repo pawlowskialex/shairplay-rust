@@ -3,8 +3,8 @@
 use crate::codec::Pcm;
 
 /// A stream's ALAC parameters (its ALACSpecificConfig): from an AirPlay 1 fmtp, or an AirPlay 2 SETUP with Apple's
-/// encoder defaults for the rest. The one place they are checked ([`supported`]), and what the decoder, the
-/// offload and the stream's format are made from.
+/// encoder defaults for the rest. The one place they are checked ([`supported`]), and what the library's decoder,
+/// what any decoder is told (`AlacParams`) and the stream's format are made from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AlacConfig {
     /// Samples per frame.
@@ -32,7 +32,6 @@ pub(crate) struct AlacConfig {
 }
 
 impl AlacConfig {
-    #[cfg(feature = "ap2-core")]
     /// A stream from a SETUP: `frame_length` samples a frame (`spf`), the rest Apple's encoder defaults (pb 40, mb 10,
     /// kb 14, max run 255: what senders use, as shairport-sync sets up FFmpeg for them). `None` for a shape the
     /// decoder doesn't take.
@@ -122,9 +121,9 @@ impl AlacConfig {
         d
     }
 
-    /// What an offload is told of the stream.
-    pub(crate) fn offload(&self) -> crate::raop::offload::OffloadAlac {
-        crate::raop::offload::OffloadAlac {
+    /// What a decoder is told of the stream.
+    pub(crate) fn params(&self) -> crate::decoder::AlacParams {
+        crate::decoder::AlacParams {
             frame_length: self.frame_length,
             bit_depth: self.bit_depth,
             pb: self.pb,

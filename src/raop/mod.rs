@@ -16,7 +16,6 @@ pub(crate) mod handlers_hls;
 #[cfg(feature = "hls")]
 pub mod hls;
 pub(crate) mod ntp;
-pub mod offload;
 pub(crate) mod pipeline;
 #[cfg(feature = "ap2-core")]
 pub(crate) mod realtime_audio;

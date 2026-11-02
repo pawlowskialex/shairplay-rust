@@ -43,8 +43,8 @@ pub(crate) struct RaopShared {
     /// This does not size or bound the receiver's local PCM buffer.
     #[cfg_attr(not(feature = "ap2-core"), allow(dead_code))]
     pub(crate) audio_buffer_size: u32,
-    /// The application's offload, if it supplied one.
-    pub(crate) offload: Option<crate::raop::offload::OffloadFactory>,
+    /// The application's decoders, if it supplied them.
+    pub(crate) decoders: Option<crate::decoder::DecoderFactory>,
     #[cfg(feature = "ap2-core")]
     pub(crate) pin: Option<String>,
     /// The next pair-setup's SRP state, made ahead of time.
