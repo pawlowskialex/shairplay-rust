@@ -127,6 +127,36 @@ mod tests {
             .unwrap();
     }
 
+    /// A timing request (0xd2) is answered (0xd3) with its transmit time as the reply's origin and our receive and
+    /// transmit times, NTP's 1900 epoch.
+    #[tokio::test]
+    async fn a_timing_request_is_answered() {
+        let responder = socket().await;
+        let at = responder.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let _task = spawn_ntp_responder(responder, "127.0.0.1:0".parse().unwrap(), Some(rx));
+        let sender = socket().await;
+        let mut req = [0u8; 32];
+        req[..4].copy_from_slice(&[0x80, 0xd2, 0x00, 0x07]);
+        req[24..32].copy_from_slice(&[0xE0, 1, 2, 3, 4, 5, 6, 7]);
+        sender.send_to(&req, at).await.unwrap();
+        let mut resp = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), sender.recv_from(&mut resp))
+            .await
+            .expect("no answer")
+            .unwrap();
+        assert_eq!(n, 32);
+        assert_eq!(resp[1], 0xd3);
+        assert_eq!(
+            &resp[8..16],
+            &req[24..32],
+            "the request's transmit time as the origin"
+        );
+        let secs = |off: usize| u32::from_be_bytes(resp[off..off + 4].try_into().unwrap());
+        // NTP seconds now: past 2020 (3_786_825_600), well before 2036's wrap
+        assert!(secs(16) > 3_786_825_600 && secs(16) == secs(24));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_responder_ends_when_the_sender_falls_silent() {
         let task = spawn_ntp_responder(socket().await, "127.0.0.1:9".parse().unwrap(), None);

@@ -485,7 +485,7 @@ impl RaopServerBuilder {
 /// decodes audio, and delivers f32 PCM samples via [`AudioSession`].
 /// Automatically registers mDNS services for network discovery.
 pub struct RaopServer {
-    shared: Arc<RaopShared>,
+    pub(crate) shared: Arc<RaopShared>,
     httpd: HttpServer,
     mdns: Option<MdnsService>,
     bind: BindConfig,

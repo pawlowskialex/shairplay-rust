@@ -10,6 +10,9 @@ use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer, SampleForma
 
 #[path = "integration/auth_setup.rs"]
 mod auth_setup;
+#[cfg(feature = "ap2-core")]
+#[path = "integration/streams.rs"]
+mod streams;
 #[allow(dead_code)]
 mod support;
 
@@ -1169,6 +1172,11 @@ mod ap2_tests {
     }
 
     pub(super) async fn perform_transient_pairing(stream: &mut TcpStream) -> [u8; 64] {
+        srp_pair(stream, "3939", true).await
+    }
+
+    /// pair-setup M1-M4 with `pin` (transient: the flag, else normal, M5 to follow): the SRP session key.
+    async fn srp_pair(stream: &mut TcpStream, pin: &str, transient: bool) -> [u8; 64] {
         use num_bigint::BigUint;
         use sha2::{Digest, Sha512};
 
@@ -1202,11 +1210,13 @@ mod ap2_tests {
         let (resp, _) = rtsp_post(stream, "/pair-verify", 0, &m1_verify.encode()).await;
         assert!(resp.contains("200"), "pair-verify M1");
 
-        // M1: pair-setup (transient)
+        // M1: pair-setup
         let mut m1 = TlvValues::new();
         m1.add(TlvType::State as u8, &[1]);
         m1.add(TlvType::Method as u8, &[0]);
-        m1.add(TlvType::Flags as u8, &[0x10]);
+        if transient {
+            m1.add(TlvType::Flags as u8, &[0x10]);
+        }
         let (resp, body) = rtsp_post(stream, "/pair-setup", 1, &m1.encode()).await;
         assert!(resp.contains("200"), "M2 response");
         let m2 = TlvValues::decode(&body).expect("M2 TLV");
@@ -1259,7 +1269,7 @@ mod ap2_tests {
         let mut h = Sha512::new();
         h.update(b"Pair-Setup");
         h.update(b":");
-        h.update(b"3939");
+        h.update(pin.as_bytes());
         let ucp = h.finalize();
         let mut buf2 = Vec::new();
         buf2.extend(&to_bytes_be(&salt_bn));
@@ -1306,6 +1316,112 @@ mod ap2_tests {
         );
 
         session_key
+    }
+
+    /// pair-setup M5 with controller `id` and its key `sk` after [`srp_pair`]: M6, decoded.
+    async fn pair_m5(
+        stream: &mut TcpStream,
+        session_key: &[u8; 64],
+        id: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> TlvValues {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use ed25519_dalek::Signer;
+        let hkdf = |salt: &str, info: &str| {
+            let mut out = [0u8; 32];
+            hkdf::Hkdf::<sha2::Sha512>::new(Some(salt.as_bytes()), session_key)
+                .expand(info.as_bytes(), &mut out)
+                .unwrap();
+            out
+        };
+        let device_x = hkdf(
+            "Pair-Setup-Controller-Sign-Salt",
+            "Pair-Setup-Controller-Sign-Info",
+        );
+        let pk = sk.verifying_key();
+        let signed = [&device_x[..], id.as_bytes(), pk.as_bytes()].concat();
+        let mut inner = TlvValues::new();
+        inner.add(TlvType::Identifier as u8, id.as_bytes());
+        inner.add(TlvType::PublicKey as u8, pk.as_bytes());
+        inner.add(TlvType::Signature as u8, &sk.sign(&signed).to_bytes());
+        let key = hkdf("Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info");
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(b"PS-Msg05");
+        let encrypted = chacha20poly1305::ChaCha20Poly1305::new((&key).into())
+            .encrypt((&nonce).into(), inner.encode().as_slice())
+            .unwrap();
+        let mut m5 = TlvValues::new();
+        m5.add(TlvType::State as u8, &[5]);
+        m5.add(TlvType::EncryptedData as u8, &encrypted);
+        post_tlv(stream, "/pair-setup", 5, &m5).await
+    }
+
+    /// A PIN server with `store`.
+    async fn pin_server(store: Arc<dyn shairplay::PairingStore>) -> (RaopServer, u16) {
+        let mut server = RaopServer::builder()
+            .mdns(false)
+            .ptp(false)
+            .name("PinPairing")
+            .hwaddr([0x02, 0, 0, 0, 0, 0x20])
+            .port(0)
+            .pin("3939")
+            .pairing_store(store)
+            .build(empty_handler())
+            .unwrap();
+        server.start().await.unwrap();
+        let port = server.service_info().port;
+        (server, port)
+    }
+
+    /// A store with no room.
+    struct Full;
+    impl shairplay::PairingStore for Full {
+        fn get(&self, _: &str) -> Option<[u8; 32]> {
+            None
+        }
+        fn put(&self, _: &str, _: [u8; 32], _: bool) -> bool {
+            false
+        }
+        fn remove(&self, _: &str) {}
+        fn list(&self) -> Vec<(String, [u8; 32], bool)> {
+            Vec::new()
+        }
+    }
+
+    /// pair-setup's M5: a controller is stored as an admin; an identifier already paired with another key is
+    /// refused (Authentication), and so is the pairing when the store has no room (MaxPeers): no M6 for a pairing
+    /// that wasn't kept.
+    #[tokio::test]
+    #[serial]
+    async fn ap2_pair_setup_m5_stores_refuses_a_taken_identifier_and_a_full_store() {
+        use shairplay::{MemoryPairingStore, PairingStore};
+        let store = Arc::new(MemoryPairingStore::default());
+        let (mut server, port) = pin_server(store.clone()).await;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        let m6 = pair_m5(&mut stream, &key, "phone", &sk).await;
+        assert_eq!(m6.get_type(TlvType::State), Some(&[6u8][..]));
+        assert!(m6.get_type(TlvType::Error).is_none());
+        assert_eq!(store.get("phone"), Some(*sk.verifying_key().as_bytes()));
+        assert!(store.is_admin("phone"));
+
+        // the same identifier, another key
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        let m6 = pair_m5(&mut stream, &key, "phone", &other).await;
+        assert_eq!(m6.get_type(TlvType::Error), Some(&[2u8][..]));
+        assert_eq!(store.get("phone"), Some(*sk.verifying_key().as_bytes()));
+        server.stop().await;
+
+        let (mut server, port) = pin_server(Arc::new(Full)).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        let m6 = pair_m5(&mut stream, &key, "phone", &sk).await;
+        assert_eq!(m6.get_type(TlvType::State), Some(&[6u8][..]));
+        assert_eq!(m6.get_type(TlvType::Error), Some(&[4u8][..]));
+        server.stop().await;
     }
 
     #[tokio::test]

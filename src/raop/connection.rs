@@ -141,6 +141,16 @@ fn new_raop_connection(
     }
 }
 
+/// A connection of `shared`'s server, for unit tests of the handlers.
+#[cfg(test)]
+pub(crate) fn connection_for_test(
+    shared: Arc<RaopShared>,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> handlers::RaopConnection {
+    new_raop_connection(shared, local, remote)
+}
+
 impl HttpdCallbacks for RaopShared {
     fn conn_init(
         self: Arc<Self>,

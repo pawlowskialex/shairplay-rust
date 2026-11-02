@@ -472,17 +472,11 @@ pub(crate) fn handle_set_parameter(
     Ok(None)
 }
 
-// --- AirPlay 2 handlers ---
-
 // Verifies that handler-facing error notification (`AudioHandler::on_error`) is
-// actually wired to a representative failure path. Gated to AP1-only builds so the
-// `RaopShared`/`RaopConnection` literals below need only the base (non-AP2) fields.
-#[cfg(all(test, not(feature = "ap2-core")))]
+// actually wired to a representative failure path.
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::pairing::Pairing;
-    use crate::crypto::rsa::RsaKey;
-    use crate::raop::connection::RaopShared;
     use crate::raop::{AudioFormat, AudioHandler, AudioSession};
     use std::sync::{Arc, Mutex};
 
@@ -502,36 +496,15 @@ mod tests {
     }
 
     fn test_connection(handler: Arc<RecordingHandler>) -> RaopConnection {
-        let shared = Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
-            pairing: Arc::new(Pairing::generate().unwrap()),
-            hwaddr: vec![0u8; 6],
-            password: String::new(),
-            #[cfg(feature = "pipewire-auth-setup-compat")]
-            pipewire_auth_setup_compat: false,
-            handler,
-            output_sample_rate: None,
-            output_max_channels: None,
-            output_format: crate::raop::SampleFormat::F32,
-            audio_buffer_size: 0x10_0000,
-            offload: None,
-            identity: crate::raop::DeviceIdentity::default(),
-            sessions: Default::default(),
-        });
-        let pairing = shared.pairing.create_session();
-        RaopConnection {
-            announced: None,
-            fairplay: FairPlay::new(),
-            pairing,
-            local_addr: vec![127, 0, 0, 1],
-            remote_socket: "127.0.0.1:5000".parse().unwrap(),
-            session: false,
-            nonce: String::new(),
-            challenges: 0,
-            shared,
-            id: 0,
-            close: Arc::new(tokio::sync::Notify::new()),
-        }
+        let server = crate::raop::RaopServer::builder()
+            .mdns(false)
+            .build(handler)
+            .unwrap();
+        crate::raop::connection::connection_for_test(
+            server.shared.clone(),
+            "127.0.0.1:7000".parse().unwrap(),
+            "127.0.0.1:5000".parse().unwrap(),
+        )
     }
 
     fn fp_setup_request(body: &[u8]) -> HttpRequest {
