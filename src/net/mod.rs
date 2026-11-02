@@ -4,8 +4,6 @@
 pub mod features;
 pub mod mdns;
 pub(crate) mod mdns_scope;
-#[cfg(feature = "diagnostic-headers")]
-pub(crate) mod protocol_diagnostics;
 #[cfg(feature = "ap2-core")]
 pub(crate) mod ptp;
 pub(crate) mod server;

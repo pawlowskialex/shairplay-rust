@@ -99,8 +99,6 @@ default = ["fairplay"]
 # docs/fairplay-provenance.md. Build with `default-features = false` to leave it out.
 fairplay = []
 pipewire-auth-setup-compat = []
-diagnostic-headers = []
-dangerous-raw-headers = ["diagnostic-headers"]
 resample = ["dep:rubato"]
 # AirPlay 2 with symphonia's AAC decoder and resampling, as before
 ap2 = ["ap2-core", "resample", "aac-symphonia"]
