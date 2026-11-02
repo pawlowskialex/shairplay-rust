@@ -1051,6 +1051,7 @@ fn setup_stream_realtime(
                 .get("latencyMin")
                 .and_then(|v| v.as_unsigned_integer())
                 .and_then(|v| u32::try_from(v).ok()),
+            peer: Some(conn.remote_socket.ip()),
         };
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
