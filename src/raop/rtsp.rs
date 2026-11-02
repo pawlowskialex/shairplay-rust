@@ -229,6 +229,18 @@ const ROUTES: &[Route] = &[
     },
 ];
 
+/// What a sender may ask before pair-verify on a receiver with a PIN: what it is, and pairing with it.
+#[cfg(feature = "ap2-core")]
+fn open_before_pairing(method: &str, url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url);
+    match method {
+        "OPTIONS" => true,
+        "GET" => path == "/info",
+        "POST" => matches!(path, "/pair-setup" | "/pair-verify" | "/pair-pin-start"),
+        _ => false,
+    }
+}
+
 /// Apple-Challenges answered on one connection.
 const MAX_CHALLENGES: u8 = 4;
 
@@ -261,6 +273,22 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             response.finish(None);
             return response;
         }
+    }
+
+    // --- Middleware: with a PIN, only paired controllers ---
+    // A PIN means only controllers that paired with it play: everything but finding the receiver and pairing
+    // with it waits for pair-verify. Without this a plaintext SETUP (its own stream key) or an AirPlay 1 ANNOUNCE
+    // played on a receiver with a PIN.
+    #[cfg(feature = "ap2-core")]
+    if conn.shared.pin.is_some() && conn.controller.is_none() && !open_before_pairing(method, url) {
+        tracing::info!(
+            method,
+            url,
+            "refused before pair-verify (the receiver has a PIN)"
+        );
+        response = new_response(470, "Connection Authorization Required", cseq);
+        response.finish(None);
+        return response;
     }
 
     // --- Middleware: Apple-Challenge ---

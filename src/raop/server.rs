@@ -304,7 +304,10 @@ impl RaopServerBuilder {
     ///
     /// Without a PIN, AP2 uses the shairport-sync-style transient pairing
     /// profile. Setting a PIN changes mDNS/GET /info status flags so clients
-    /// perform persistent M1-M6 pair-setup and later use pair-verify.
+    /// perform persistent M1-M6 pair-setup and later use pair-verify, and only
+    /// controllers that did may play or control the receiver: until pair-verify
+    /// a connection gets `OPTIONS`, `GET /info` and the pairing requests, the
+    /// rest answers 470. AirPlay 1 senders can't pair, so they don't play.
     pub fn pin(mut self, pin: impl Into<String>) -> Self {
         self.pin = Some(pin.into());
         self

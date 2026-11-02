@@ -724,6 +724,54 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    /// With a PIN nothing plays or controls before pair-verify: a plaintext SETUP with its own stream key, or an
+    /// AirPlay 1 ANNOUNCE, played before.
+    #[tokio::test]
+    #[serial]
+    async fn ap2_with_a_pin_only_paired_controllers_get_past_pairing() {
+        let mut server = RaopServer::builder()
+            .name("PinGateTest")
+            .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+            .port(0)
+            .pin("1234")
+            .build(empty_handler())
+            .unwrap();
+        server.start().await.unwrap();
+        let port = server.service_info().port;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let status = |r: &str| r.lines().next().unwrap_or("").to_string();
+        let ok = send_rtsp(&mut stream, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").await;
+        assert_eq!(status(&ok), "RTSP/1.0 200 OK");
+        let info = send_rtsp(&mut stream, "GET /info RTSP/1.0\r\nCSeq: 2\r\n\r\n").await;
+        assert_eq!(status(&info), "RTSP/1.0 200 OK");
+        let sdp = "v=0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/44100/2\r\n";
+        for (cseq, req) in [
+            (
+                3,
+                format!(
+                    "ANNOUNCE rtsp://x/1 RTSP/1.0\r\nCSeq: 3\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                    sdp.len()
+                ),
+            ),
+            (4, "SETUP rtsp://x/1 RTSP/1.0\r\nCSeq: 4\r\nTransport: RTP/AVP/UDP\r\n\r\n".into()),
+            (5, "RECORD rtsp://x/1 RTSP/1.0\r\nCSeq: 5\r\n\r\n".into()),
+            (
+                6,
+                "SET_PARAMETER rtsp://x/1 RTSP/1.0\r\nCSeq: 6\r\nContent-Type: text/parameters\r\nContent-Length: 14\r\n\r\nvolume: -10.0\n".into(),
+            ),
+        ] {
+            let r = send_rtsp(&mut stream, &req).await;
+            assert_eq!(
+                status(&r),
+                "RTSP/1.0 470 Connection Authorization Required",
+                "CSeq {cseq}: {r}"
+            );
+        }
+        server.stop().await;
+    }
+
     #[test]
     fn ap2_pin_pairing_service_info_advertises_persistent_pairing() {
         let server = RaopServer::builder()
