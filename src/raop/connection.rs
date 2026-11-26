@@ -52,6 +52,9 @@ pub(crate) struct RaopShared {
     /// The application's say in a home's setup (the builder's `home`)
     #[cfg(feature = "ap2-core")]
     pub(crate) home: Option<Arc<dyn crate::raop::HomeSetup>>,
+    /// What the Home app configured (`POST /configure`); the default without a home
+    #[cfg(feature = "ap2-core")]
+    pub(crate) home_config: std::sync::RwLock<crate::raop::HomeConfiguration>,
     /// The next pair-setup's SRP state, made ahead of time.
     #[cfg(feature = "ap2-core")]
     pub(crate) srp_spare: std::sync::Arc<crate::crypto::pairing_homekit::SrpSpare>,
@@ -86,10 +89,43 @@ impl RaopShared {
     /// `updateInfo`.
     #[cfg(feature = "ap2-core")]
     pub(crate) fn status_flags(&self) -> u32 {
-        crate::raop::config::ap2_status_flags(
+        let flags = crate::raop::config::ap2_status_flags(
             self.pin.is_some(),
             self.pairing_store.has_any_pairing(),
-        )
+        );
+        if self.home_configuration().access_control {
+            flags | crate::raop::config::AP2_STATUS_DEVICE_SETUP_FOR_HK_ACCESS_CONTROL
+        } else {
+            flags
+        }
+    }
+
+    /// What the Home app configured, as it is now.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn home_configuration(&self) -> crate::raop::HomeConfiguration {
+        self.home_config
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    /// Take the home's new `configuration`: the application keeps it, the records say it. Nothing without a
+    /// home or when it didn't change.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn configure_home(&self, configuration: crate::raop::HomeConfiguration) {
+        let Some(home) = &self.home else {
+            return;
+        };
+        let Ok(mut current) = self.home_config.write() else {
+            return;
+        };
+        if *current == configuration {
+            return;
+        }
+        *current = configuration;
+        home.configured(&current);
+        drop(current);
+        self.reannounce();
     }
 
     /// The AirPlay 2 features advertised.

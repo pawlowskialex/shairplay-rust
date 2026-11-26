@@ -469,6 +469,13 @@ impl RaopServerBuilder {
             seed
         });
 
+        // a home's configuration lasts as long as its pairings
+        #[cfg(feature = "ap2-core")]
+        let home_config = match &self.home {
+            Some(home) if pairing_store.has_any_pairing() => home.configuration(),
+            _ => Default::default(),
+        };
+
         let shared = Arc::new(RaopShared {
             identity: self.identity.clone(),
             rsakey,
@@ -502,6 +509,8 @@ impl RaopServerBuilder {
             pair_failures: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "ap2-core")]
             pin: self.pin,
+            #[cfg(feature = "ap2-core")]
+            home_config: std::sync::RwLock::new(home_config),
             #[cfg(feature = "ap2-core")]
             home: self.home,
             #[cfg(feature = "video")]
@@ -682,6 +691,7 @@ impl Advert {
                 &shared.pairing_id,
                 shared.features(),
                 shared.status_flags(),
+                shared.home_configuration().access.level(),
                 &shared.identity,
             );
         }

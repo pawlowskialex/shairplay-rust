@@ -135,8 +135,8 @@ impl AirPlayServiceInfo {
     }
 
     /// Create AP2 service info with full AirPlay 2 feature flags.
-    /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID); `features` and
-    /// `status_flags` as the receiver advertises them now.
+    /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID); `features`,
+    /// `status_flags` and `access_level` (`acl`: who may play) as the receiver advertises them now.
     #[cfg(feature = "ap2-core")]
     #[allow(clippy::too_many_arguments)]
     pub fn new_airplay2(
@@ -148,6 +148,7 @@ impl AirPlayServiceInfo {
         pi: &str,
         features: u64,
         status_flags: u32,
+        access_level: u8,
         identity: &crate::raop::DeviceIdentity,
     ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
@@ -184,7 +185,7 @@ impl AirPlayServiceInfo {
         }
 
         let airplay_txt = vec![
-            ("acl".into(), "0".into()),
+            ("acl".into(), access_level.to_string()),
             ("btaddr".into(), "00:00:00:00:00:00".into()),
             ("deviceid".into(), hw_airplay),
             ("features".into(), ft),
@@ -659,6 +660,7 @@ mod tests {
             "12345678-1234-1234-1234-123456789abc",
             crate::net::features::receiver_features_for_pairing(false),
             crate::raop::config::ap2_status_flags(false, false),
+            0,
             &crate::raop::DeviceIdentity::default(),
         );
 
@@ -691,6 +693,7 @@ mod tests {
             "my-uuid-here",
             crate::net::features::receiver_features_for_pairing(false),
             crate::raop::config::ap2_status_flags(false, false),
+            0,
             &crate::raop::DeviceIdentity::default(),
         );
 
@@ -725,6 +728,7 @@ mod tests {
             "pi",
             crate::net::features::receiver_features_for_pairing(false),
             crate::raop::config::ap2_status_flags(false, false),
+            0,
             &crate::raop::DeviceIdentity::default(),
         );
         assert_eq!(info.raop_name, "123456789ABC@My Speaker");
@@ -743,6 +747,7 @@ mod tests {
             "my-uuid-here",
             crate::net::features::receiver_features_for_pairing(true),
             crate::raop::config::ap2_status_flags(true, false),
+            0,
             &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
@@ -776,6 +781,7 @@ mod tests {
             "my-uuid-here",
             crate::net::features::receiver_features_for_pairing(true),
             crate::raop::config::ap2_status_flags(true, false),
+            0,
             &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
@@ -815,6 +821,7 @@ mod tests {
             "pi",
             crate::net::features::receiver_features_for_pairing(false),
             crate::raop::config::ap2_status_flags(false, false),
+            0,
             &id,
         );
         let get = |k: &str| {

@@ -50,6 +50,12 @@ impl RtspError {
         Self::new(400, detail)
     }
 
+    /// 404: the receiver has no such resource (a route its configuration leaves out).
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn not_found(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(404, detail)
+    }
+
     /// 415: a stream or format the receiver doesn't take.
     pub(crate) fn unsupported(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(415, detail)
@@ -169,7 +175,7 @@ pub(super) fn request_body_policy(
         (
             "POST",
             "/pair-setup" | "/pair-verify" | "/pair-pin-start" | "/pairings" | "/pair-add"
-            | "/pair-remove" | "/pair-list",
+            | "/pair-remove" | "/pair-list" | "/configure",
         ) => 4 * 1024,
         ("SET_PARAMETER", _) | ("POST", "/command") => conn.shared.max_artwork_size,
         _ => 64 * 1024,
@@ -226,6 +232,12 @@ const ROUTES: &[Route] = &[
         method: "POST",
         path: "/pairings",
         handler: handlers_ap2::handle_pairings,
+    },
+    #[cfg(feature = "ap2-core")]
+    Route {
+        method: "POST",
+        path: "/configure",
+        handler: handlers_ap2::handle_configure,
     },
     // the same requests at the paths AirPlay senders use (the Home app's controllers)
     #[cfg(feature = "ap2-core")]
@@ -402,17 +414,20 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
         }
     }
 
-    // --- Middleware: with a PIN, only paired controllers ---
+    // --- Middleware: with a PIN, or for a home's members only, only paired controllers ---
     // A PIN means only controllers that paired with it play: everything but finding the receiver and pairing
     // with it waits for pair-verify. Without this a plaintext SETUP (its own stream key) or an AirPlay 1 ANNOUNCE
-    // played on a receiver with a PIN.
+    // played on a receiver with a PIN. A home that lets only its members play is the same: its controllers.
     #[cfg(feature = "ap2-core")]
-    if conn.shared.pin.is_some() && conn.controller().is_none() && !open_before_pairing(method, url)
+    if (conn.shared.pin.is_some()
+        || conn.shared.home_configuration().access == crate::raop::HomeAccess::HomeMembers)
+        && conn.controller().is_none()
+        && !open_before_pairing(method, url)
     {
         tracing::info!(
             method,
             url,
-            "refused before pair-verify (the receiver has a PIN)"
+            "refused before pair-verify (a PIN, or the home's members only)"
         );
         response = new_response(470, "Connection Authorization Required", cseq);
         response.finish(None);

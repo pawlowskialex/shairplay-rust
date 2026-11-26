@@ -1779,6 +1779,9 @@ mod ap2_tests {
     struct Home {
         allow: bool,
         asked: std::sync::Mutex<Vec<std::net::IpAddr>>,
+        /// What `configured` saved, given back by `configuration`
+        saved: std::sync::Mutex<shairplay::HomeConfiguration>,
+        configured: std::sync::atomic::AtomicUsize,
     }
 
     impl Home {
@@ -1786,7 +1789,12 @@ mod ap2_tests {
             Arc::new(Self {
                 allow,
                 asked: Default::default(),
+                saved: Default::default(),
+                configured: Default::default(),
             })
+        }
+        fn saved(&self) -> shairplay::HomeConfiguration {
+            self.saved.lock().unwrap().clone()
         }
         fn asked(&self) -> usize {
             self.asked.lock().unwrap().len()
@@ -1797,6 +1805,14 @@ mod ap2_tests {
         fn allow_setup(&self, peer: std::net::IpAddr) -> bool {
             self.asked.lock().unwrap().push(peer);
             self.allow
+        }
+        fn configuration(&self) -> shairplay::HomeConfiguration {
+            self.saved()
+        }
+        fn configured(&self, configuration: &shairplay::HomeConfiguration) {
+            *self.saved.lock().unwrap() = configuration.clone();
+            self.configured
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1962,6 +1978,196 @@ mod ap2_tests {
                 .is_none()
         );
         assert_eq!(store.get("member"), None);
+        server.stop().await;
+    }
+
+    /// A home set up on `port` by controller "home-admin": its verified, encrypted session.
+    async fn home_admin(port: u16) -> (TcpStream, crate::support::EncryptedChannel) {
+        let admin = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        pair_m5(&mut stream, &key, "home-admin", &admin).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        (stream, control_channel(&secret))
+    }
+
+    /// `POST /configure` with the Home app's ConfigurationDictionary: the response's head and plist.
+    async fn configure(
+        stream: &mut TcpStream,
+        channel: &mut crate::support::EncryptedChannel,
+        access_control: bool,
+        level: u64,
+    ) -> (String, plist::Dictionary) {
+        let mut asked = plist::Dictionary::new();
+        asked.insert(
+            "Enable_HK_Access_Control".into(),
+            plist::Value::Boolean(access_control),
+        );
+        asked.insert(
+            "Access_Control_Level".into(),
+            plist::Value::Integer(level.into()),
+        );
+        asked.insert("Device_Name".into(), plist::Value::String("Kitchen".into()));
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "ConfigurationDictionary".into(),
+            plist::Value::Dictionary(asked),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+        let (head, answer) = post_encrypted(
+            stream,
+            channel,
+            "/configure",
+            "application/x-apple-binary-plist",
+            &body,
+        )
+        .await;
+        let answer = plist::from_bytes::<plist::Value>(&answer)
+            .ok()
+            .and_then(|v| v.into_dictionary())
+            .unwrap_or_default();
+        (head, answer)
+    }
+
+    /// The Home app's `/configure` from the home's admin: the application keeps the configuration, the status
+    /// flags say the speaker is set up for the home's access control (bit 10: 0x404), the answer carries the
+    /// speaker's identity. Another session's `/configure` is refused, and without a HomeSetup there is none.
+    #[tokio::test]
+    #[serial]
+    async fn the_home_app_configures_the_speaker() {
+        let home = Home::new(true);
+        let store = Arc::new(shairplay::MemoryPairingStore::default());
+        let (mut server, port) = home_server(home.clone(), store).await;
+        assert_eq!(airplay_txt(&server.service_info(), "flags"), Some("0x4"));
+        let (mut stream, mut channel) = home_admin(port).await;
+        let (head, answer) = configure(&mut stream, &mut channel, true, 0).await;
+        assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+        let info = server.service_info();
+        assert_eq!(
+            answer.get("Identifier").and_then(|v| v.as_string()),
+            airplay_txt(&info, "pi")
+        );
+        let pk = answer.get("PublicKey").and_then(|v| v.as_data()).unwrap();
+        let pk_hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(Some(pk_hex.as_str()), airplay_txt(&info, "pk"));
+        assert_eq!(
+            answer
+                .get("Enable_HK_Access_Control")
+                .and_then(|v| v.as_boolean()),
+            Some(true)
+        );
+        assert_eq!(
+            home.saved(),
+            shairplay::HomeConfiguration {
+                access_control: true,
+                access: shairplay::HomeAccess::Everyone,
+                name: Some("Kitchen".into()),
+            }
+        );
+        assert_eq!(airplay_txt(&info, "flags"), Some("0x404"));
+        assert_eq!(airplay_txt(&info, "acl"), Some("0"));
+
+        // not the admin's session
+        let mut plain = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let resp = send_rtsp(
+            &mut plain,
+            "POST /configure RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("RTSP/1.0 470"), "{resp}");
+        server.stop().await;
+
+        let (mut server, port, _) = start_server().await;
+        let mut plain = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let resp = send_rtsp(
+            &mut plain,
+            "POST /configure RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("RTSP/1.0 404"), "{resp}");
+        server.stop().await;
+    }
+
+    /// A home for its members only (`Access_Control_Level` 1, `acl=1`): a session that didn't verify as one of
+    /// its controllers gets nothing past pairing, and transient pair-setup is refused.
+    #[tokio::test]
+    #[serial]
+    async fn a_home_for_its_members_only_refuses_other_senders() {
+        let home = Home::new(true);
+        let store = Arc::new(shairplay::MemoryPairingStore::default());
+        let (mut server, port) = home_server(home.clone(), store).await;
+        let (mut stream, mut channel) = home_admin(port).await;
+        configure(&mut stream, &mut channel, true, 1).await;
+        assert_eq!(home.saved().access, shairplay::HomeAccess::HomeMembers);
+        assert_eq!(airplay_txt(&server.service_info(), "acl"), Some("1"));
+
+        let mut other = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let resp = send_rtsp(&mut other, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").await;
+        assert!(resp.starts_with("RTSP/1.0 200"), "OPTIONS: {resp}");
+        let m2 = post_tlv(&mut other, "/pair-setup", 2, &transient_m1()).await;
+        assert_eq!(
+            m2.get_type(TlvType::Error),
+            Some(&[2u8][..]),
+            "transient refused"
+        );
+        let resp = send_rtsp(
+            &mut other,
+            "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("RTSP/1.0 470"), "SETUP: {resp}");
+        server.stop().await;
+    }
+
+    /// The home's configuration lasts as long as its pairings: given back at the start while a controller is
+    /// paired; gone (the application told) with the last admin's pairing, after which the speaker may be set up
+    /// again.
+    #[tokio::test]
+    #[serial]
+    async fn the_home_goes_with_its_last_admin() {
+        use shairplay::PairingStore;
+        let home = Home::new(true);
+        let store = Arc::new(shairplay::MemoryPairingStore::default());
+        let (mut server, port) = home_server(home.clone(), store.clone()).await;
+        let (mut stream, mut channel) = home_admin(port).await;
+        configure(&mut stream, &mut channel, true, 0).await;
+        server.stop().await;
+
+        let (mut server, port) = home_server(home.clone(), store.clone()).await;
+        assert_eq!(
+            airplay_txt(&server.service_info(), "flags"),
+            Some("0x404"),
+            "restored"
+        );
+        let admin = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        let mut channel = control_channel(&secret);
+        post_encrypted(
+            &mut stream,
+            &mut channel,
+            "/pair-remove",
+            "application/pairing+tlv8",
+            &pairing_request(4, "home-admin", None, false),
+        )
+        .await;
+        assert!(!store.has_any_pairing());
+        assert_eq!(home.saved(), shairplay::HomeConfiguration::default());
+        assert_eq!(airplay_txt(&server.service_info(), "flags"), Some("0x4"));
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        let m6 = pair_m5(&mut stream, &key, "new-admin", &admin).await;
+        assert!(m6.get_type(TlvType::Error).is_none(), "set up again");
+        server.stop().await;
+
+        // pairings gone while stopped (another store): a saved configuration counts for nothing at the start
+        let stale = Home::new(true);
+        stale.saved.lock().unwrap().access_control = true;
+        let (mut server, _) =
+            home_server(stale, Arc::new(shairplay::MemoryPairingStore::default())).await;
+        assert_eq!(airplay_txt(&server.service_info(), "flags"), Some("0x4"));
         server.stop().await;
     }
 

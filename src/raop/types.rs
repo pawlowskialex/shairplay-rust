@@ -187,6 +187,62 @@ pub trait HomeSetup: Send + Sync + 'static {
     /// pair-setup proves the PIN), nor once a controller is paired: pair-setup is refused then (HAP's
     /// Unavailable), and the admin adds controllers.
     fn allow_setup(&self, peer: std::net::IpAddr) -> bool;
+
+    /// The home's configuration as [`configured`](Self::configured) last saved it, read at the start. Only taken
+    /// while a controller is paired (without one there is no home). Default: none, access control off.
+    fn configuration(&self) -> HomeConfiguration {
+        HomeConfiguration::default()
+    }
+
+    /// The Home app configured the speaker (`POST /configure`), or its home went (the last admin's pairing
+    /// removed: the default configuration): keep it for [`configuration`](Self::configuration).
+    fn configured(&self, _configuration: &HomeConfiguration) {}
+}
+
+/// What the Home app configured for the speaker (`POST /configure`), kept by the application through
+/// [`HomeSetup`].
+#[cfg(feature = "ap2-core")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeConfiguration {
+    /// The speaker is set up for the home's access control: the status flags say so (bit 10,
+    /// `DeviceWasSetupForHKAccessControl`).
+    pub access_control: bool,
+    /// Who may play to the speaker (`acl` in its mDNS records).
+    pub access: HomeAccess,
+    /// The name the Home app gave the speaker, if it sent one. The server keeps advertising its own name; the
+    /// application decides whether to take this one.
+    pub name: Option<String>,
+}
+
+/// Who may play to a speaker set up for a home (the Home app's "Allow Speaker Access").
+#[cfg(feature = "ap2-core")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HomeAccess {
+    /// Everyone, or anyone on the same network (one level on the wire: 0).
+    #[default]
+    Everyone,
+    /// Only the home's members: controllers its admin added (1). Others can't pair.
+    HomeMembers,
+}
+
+#[cfg(feature = "ap2-core")]
+impl HomeAccess {
+    /// The level on the wire (`Access_Control_Level`, `acl`).
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Everyone => 0,
+            Self::HomeMembers => 1,
+        }
+    }
+
+    /// From the wire's level. A level this crate doesn't know is taken as [`HomeMembers`](Self::HomeMembers),
+    /// the stricter one.
+    pub fn from_level(level: u64) -> Self {
+        match level {
+            0 => Self::Everyone,
+            _ => Self::HomeMembers,
+        }
+    }
 }
 
 /// Storage for paired device keys. Implement this to persist pairing across restarts.

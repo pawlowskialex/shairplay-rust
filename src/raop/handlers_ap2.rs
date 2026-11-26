@@ -113,6 +113,13 @@ pub(crate) fn handle_pair_setup(
                     pairing_homekit::TLV_ERROR_MAX_TRIES,
                 )));
             }
+            // a home for its members only: no transient pair-setup (only its controllers pair-verify)
+            if conn.shared.home_configuration().access == crate::raop::HomeAccess::HomeMembers
+                && pairing_homekit::m1_is_transient(data)
+            {
+                tracing::warn!("transient pair-setup refused: the home's members only");
+                return Ok(Some(pairing_homekit::pairing_error_response(2)));
+            }
             // without a PIN, a persistent pair-setup is a home's setup: only while unpaired, and if the
             // application lets it (else process_m1 refuses it)
             let home_setup = conn.shared.pin.is_none() && !pairing_homekit::m1_is_transient(data);
@@ -337,6 +344,10 @@ pub(crate) fn handle_pairings(
         request.data().unwrap_or(&[]),
     );
     if !removed.is_empty() {
+        if !conn.shared.pairing_store.has_any_pairing() {
+            // no admin left: no home (the speaker may be set up again)
+            conn.shared.configure_home(Default::default());
+        }
         // the last pairing's removal changes the status flags
         conn.shared.reannounce();
     }
@@ -344,6 +355,82 @@ pub(crate) fn handle_pairings(
         conn.shared.sessions.close_controller(&id);
     }
     Ok(Some(body))
+}
+
+#[cfg(feature = "ap2-core")]
+/// `POST /configure`, from the home's admin after it set the speaker up: the home's access control, its level and
+/// the name it gave the speaker (`ConfigurationDictionary`'s `Enable_HK_Access_Control`, `Access_Control_Level`,
+/// `Device_Name`). Answered with the speaker's identity while access control is on, as shairport-sync and
+/// goplay2 answer the Home app. 404 without a [`crate::raop::HomeSetup`].
+pub(crate) fn handle_configure(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Handled {
+    if conn.shared.home.is_none() {
+        return Err(RtspError::not_found("no home setup"));
+    }
+    if !conn
+        .controller()
+        .is_some_and(|c| conn.shared.pairing_store.is_admin(c))
+    {
+        return Err(RtspError::unauthorized(
+            "/configure: not the admin's session",
+        ));
+    }
+    let body: plist::Value = request
+        .data()
+        .and_then(|d| plist::from_bytes(d).ok())
+        .ok_or(bad("/configure: not a plist"))?;
+    let asked = body
+        .as_dictionary()
+        .and_then(|d| d.get("ConfigurationDictionary"))
+        .and_then(|v| v.as_dictionary())
+        .ok_or(bad("/configure: no ConfigurationDictionary"))?;
+    let mut config = conn.shared.home_configuration();
+    if let Some(on) = asked
+        .get("Enable_HK_Access_Control")
+        .and_then(|v| v.as_boolean())
+    {
+        config.access_control = on;
+    }
+    if let Some(level) = asked
+        .get("Access_Control_Level")
+        .and_then(|v| v.as_unsigned_integer())
+    {
+        config.access = crate::raop::HomeAccess::from_level(level);
+    }
+    if let Some(name) = asked.get("Device_Name").and_then(|v| v.as_string()) {
+        config.name = Some(name.to_string());
+    }
+    tracing::info!(?config, "/configure: the home's configuration");
+    conn.shared.configure_home(config.clone());
+
+    let mut answer = plist::Dictionary::new();
+    if config.access_control {
+        let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&conn.shared.identity_seed);
+        answer.insert(
+            "Identifier".into(),
+            plist::Value::String(conn.shared.pairing_id.clone()),
+        );
+        answer.insert(
+            "Enable_HK_Access_Control".into(),
+            plist::Value::Boolean(true),
+        );
+        answer.insert(
+            "PublicKey".into(),
+            plist::Value::Data(vk.as_bytes().to_vec()),
+        );
+        answer.insert(
+            "Device_Name".into(),
+            plist::Value::String(conn.shared.airplay_name.clone()),
+        );
+        answer.insert(
+            "Access_Control_Level".into(),
+            plist::Value::Integer(u64::from(config.access.level()).into()),
+        );
+    }
+    plist_reply(response, &answer)
 }
 
 #[cfg(feature = "ap2-core")]
