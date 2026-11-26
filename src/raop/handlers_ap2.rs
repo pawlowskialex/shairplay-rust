@@ -421,6 +421,16 @@ pub(crate) fn handle_configure(
         .and_then(|d| d.get("ConfigurationDictionary"))
         .and_then(|v| v.as_dictionary())
         .ok_or(bad("/configure: no ConfigurationDictionary"))?;
+    tracing::debug!(
+        asked = ?asked
+            .iter()
+            .map(|(k, v)| match v {
+                plist::Value::Data(d) => format!("{k}=<{} bytes>", d.len()),
+                other => format!("{k}={other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        "/configure asks"
+    );
     let mut config = conn.shared.home_configuration();
     if let Some(on) = asked
         .get("Enable_HK_Access_Control")
@@ -702,6 +712,10 @@ pub(crate) fn handle_info(
     dict.insert("macAddress".into(), plist::Value::String(hw));
     dict.insert(
         "pi".into(),
+        plist::Value::String(conn.shared.pairing_id.clone()),
+    );
+    dict.insert(
+        "psi".into(),
         plist::Value::String(conn.shared.pairing_id.clone()),
     );
     dict.insert(

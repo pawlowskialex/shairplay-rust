@@ -1787,11 +1787,15 @@ mod ap2_tests {
         let n = stream.read(&mut buf).await.unwrap();
         let end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let info = plist::from_bytes::<plist::Value>(&buf[end..n]).unwrap();
-        info.as_dictionary()
-            .and_then(|d| d.get("pi"))
-            .and_then(|v| v.as_string())
-            .unwrap()
-            .to_string()
+        let get = |k: &str| {
+            info.as_dictionary()
+                .and_then(|d| d.get(k))
+                .and_then(|v| v.as_string())
+                .map(str::to_string)
+        };
+        // the Home app finds its accessory by psi [HW 2026-11-26]: the pi
+        assert_eq!(get("psi"), get("pi"), "GET /info's psi");
+        get("pi").unwrap()
     }
 
     /// The controller's side of the encrypted channel after pair-verify's `secret`.

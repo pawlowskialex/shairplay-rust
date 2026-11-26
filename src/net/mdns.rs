@@ -196,6 +196,8 @@ impl AirPlayServiceInfo {
             ("model".into(), identity.model.clone()),
             ("protovers".into(), AP2_PROTOVERS.into()),
             ("pi".into(), pi.into()),
+            // the pairing service identifier: the Home app finds its accessory's records by it
+            ("psi".into(), pi.into()),
             ("pk".into(), pk_hex.into()),
             ("srcvers".into(), AP2_SRCVERS.into()),
             ("vv".into(), "2".into()),
@@ -713,6 +715,7 @@ mod tests {
         assert_eq!(find("model"), Some("AppleTV2,1"));
         assert_eq!(find("protovers"), Some("1.1"));
         assert!(find("pi").is_some());
+        assert_eq!(find("psi"), find("pi"), "psi: the pi");
         assert!(find("pk").is_some());
         assert_eq!(find("vv"), Some("2"));
     }
