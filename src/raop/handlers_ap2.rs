@@ -322,8 +322,9 @@ pub(crate) fn handle_pair_verify(
 }
 
 #[cfg(feature = "ap2-core")]
-/// HAP pairing management, POST /pairings: [`pairings`] on this session's verified controller; the controllers whose
-/// pairing went have their connections closed (this one's after its response).
+/// HAP pairing management, POST /pairings (and AirPlay's `/pair-add`, `/pair-remove`, `/pair-list`, the same TLVs):
+/// [`pairings`] on this session's verified controller; the controllers whose pairing went have their connections
+/// closed (this one's after its response).
 pub(crate) fn handle_pairings(
     conn: &mut RaopConnection,
     request: &HttpRequest,

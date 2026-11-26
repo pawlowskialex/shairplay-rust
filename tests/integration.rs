@@ -1696,6 +1696,85 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    /// pair-verify on `stream` as controller `id` with its key `sk`: the session's shared secret, from which
+    /// the encrypted channel's keys come.
+    async fn pair_verify(
+        stream: &mut TcpStream,
+        id: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> [u8; 32] {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use ed25519_dalek::Signer;
+        let eph = x25519_dalek::StaticSecret::from([5u8; 32]);
+        let eph_pk = x25519_dalek::PublicKey::from(&eph);
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::PublicKey as u8, eph_pk.as_bytes());
+        let m2 = post_tlv(stream, "/pair-verify", 1, &m1).await;
+        let server_pk: [u8; 32] = m2.get_type(TlvType::PublicKey).unwrap().try_into().unwrap();
+        let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(server_pk));
+        let mut key = [0u8; 32];
+        hkdf::Hkdf::<sha2::Sha512>::new(Some(b"Pair-Verify-Encrypt-Salt"), shared.as_bytes())
+            .expand(b"Pair-Verify-Encrypt-Info", &mut key)
+            .unwrap();
+        let signed = [eph_pk.as_bytes(), id.as_bytes(), &server_pk[..]].concat();
+        let mut inner = TlvValues::new();
+        inner.add(TlvType::Identifier as u8, id.as_bytes());
+        inner.add(TlvType::Signature as u8, &sk.sign(&signed).to_bytes());
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(b"PV-Msg03");
+        let encrypted = chacha20poly1305::ChaCha20Poly1305::new((&key).into())
+            .encrypt((&nonce).into(), inner.encode().as_slice())
+            .unwrap();
+        let mut m3 = TlvValues::new();
+        m3.add(TlvType::State as u8, &[3]);
+        m3.add(TlvType::EncryptedData as u8, &encrypted);
+        let m4 = post_tlv(stream, "/pair-verify", 2, &m3).await;
+        assert_eq!(m4.get_type(TlvType::State), Some(&[4u8][..]));
+        assert!(m4.get_type(TlvType::Error).is_none(), "pair-verify as {id}");
+        *shared.as_bytes()
+    }
+
+    /// The controller's side of the encrypted channel after pair-verify's `secret`.
+    fn control_channel(secret: &[u8]) -> crate::support::EncryptedChannel {
+        crate::support::EncryptedChannel::new(
+            secret,
+            "Control-Salt",
+            "Control-Write-Encryption-Key",
+            "Control-Salt",
+            "Control-Read-Encryption-Key",
+        )
+        .unwrap()
+    }
+
+    /// `POST path` with `body` of `content_type` on the encrypted channel: the response's head and body.
+    async fn post_encrypted(
+        stream: &mut TcpStream,
+        channel: &mut crate::support::EncryptedChannel,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        let mut req = format!(
+            "POST {path} RTSP/1.0\r\nCSeq: 9\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        stream
+            .write_all(&channel.encrypt_ctx.encrypt(&req).unwrap())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 16384];
+        let n = stream.read(&mut buf).await.unwrap();
+        let (plain, _) = channel.decrypt_ctx.decrypt(&buf[..n]).unwrap();
+        let end = plain.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&plain[..end]).into_owned(),
+            plain[end..].to_vec(),
+        )
+    }
+
     /// A [`shairplay::HomeSetup`] that answers `allow` and keeps who asked.
     struct Home {
         allow: bool,
@@ -1788,6 +1867,101 @@ mod ap2_tests {
         assert_eq!(allowing.asked(), 1, "not asked once paired");
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         perform_transient_pairing(&mut stream).await;
+        server.stop().await;
+    }
+
+    /// A pairing-management request (HAP's TLV: State 1, `method`, an identifier, a key, a permission).
+    fn pairing_request(method: u8, id: &str, pk: Option<&[u8; 32]>, admin: bool) -> Vec<u8> {
+        let mut t = TlvValues::new();
+        t.add(TlvType::State as u8, &[1]);
+        t.add(TlvType::Method as u8, &[method]);
+        if method != 5 {
+            t.add(TlvType::Identifier as u8, id.as_bytes());
+        }
+        if let Some(pk) = pk {
+            t.add(TlvType::PublicKey as u8, pk);
+            t.add(TlvType::Permissions as u8, &[u8::from(admin)]);
+        }
+        t.encode()
+    }
+
+    /// The home's admin manages its controllers at AirPlay's paths (`/pair-add`, `/pair-list`, `/pair-remove`)
+    /// on its verified session; a session that didn't verify as an admin gets Authentication.
+    #[tokio::test]
+    #[serial]
+    async fn the_admin_manages_controllers_at_the_pair_paths() {
+        use shairplay::{MemoryPairingStore, PairingStore};
+        let store = Arc::new(MemoryPairingStore::default());
+        let (mut server, port) = home_server(Home::new(true), store.clone()).await;
+        let admin = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        pair_m5(&mut stream, &key, "home-admin", &admin).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let add = TlvValues::decode(&pairing_request(3, "x", Some(&[1; 32]), false)).unwrap();
+        let refused = post_tlv(&mut stream, "/pair-add", 1, &add).await;
+        assert_eq!(
+            refused.get_type(TlvType::Error),
+            Some(&[2u8][..]),
+            "not verified"
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        let mut channel = control_channel(&secret);
+        let tlv = "application/pairing+tlv8";
+        let member = [3u8; 32];
+        let (head, body) = post_encrypted(
+            &mut stream,
+            &mut channel,
+            "/pair-add",
+            tlv,
+            &pairing_request(3, "member", Some(&member), false),
+        )
+        .await;
+        assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+        assert!(
+            TlvValues::decode(&body)
+                .unwrap()
+                .get_type(TlvType::Error)
+                .is_none()
+        );
+        assert_eq!(store.get("member"), Some(member));
+        assert!(!store.is_admin("member"));
+
+        let (_, body) = post_encrypted(
+            &mut stream,
+            &mut channel,
+            "/pair-list",
+            tlv,
+            &pairing_request(5, "", None, false),
+        )
+        .await;
+        let listed = TlvValues::decode(&body).unwrap();
+        let ids: Vec<_> = listed
+            .entries()
+            .filter(|(t, _)| *t == TlvType::Identifier as u8)
+            .map(|(_, v)| String::from_utf8(v.to_vec()).unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"member".to_string()) && ids.contains(&"home-admin".to_string()));
+
+        let (_, body) = post_encrypted(
+            &mut stream,
+            &mut channel,
+            "/pair-remove",
+            tlv,
+            &pairing_request(4, "member", None, false),
+        )
+        .await;
+        assert!(
+            TlvValues::decode(&body)
+                .unwrap()
+                .get_type(TlvType::Error)
+                .is_none()
+        );
+        assert_eq!(store.get("member"), None);
         server.stop().await;
     }
 

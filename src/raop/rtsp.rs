@@ -166,7 +166,11 @@ pub(super) fn request_body_policy(
     let url = request.url().unwrap_or("");
     let path = url.split('?').next().unwrap_or(url);
     let max_bytes = match (request.method().unwrap_or(""), path) {
-        ("POST", "/pair-setup" | "/pair-verify" | "/pair-pin-start" | "/pairings") => 4 * 1024,
+        (
+            "POST",
+            "/pair-setup" | "/pair-verify" | "/pair-pin-start" | "/pairings" | "/pair-add"
+            | "/pair-remove" | "/pair-list",
+        ) => 4 * 1024,
         ("SET_PARAMETER", _) | ("POST", "/command") => conn.shared.max_artwork_size,
         _ => 64 * 1024,
     };
@@ -221,6 +225,25 @@ const ROUTES: &[Route] = &[
     Route {
         method: "POST",
         path: "/pairings",
+        handler: handlers_ap2::handle_pairings,
+    },
+    // the same requests at the paths AirPlay senders use (the Home app's controllers)
+    #[cfg(feature = "ap2-core")]
+    Route {
+        method: "POST",
+        path: "/pair-add",
+        handler: handlers_ap2::handle_pairings,
+    },
+    #[cfg(feature = "ap2-core")]
+    Route {
+        method: "POST",
+        path: "/pair-remove",
+        handler: handlers_ap2::handle_pairings,
+    },
+    #[cfg(feature = "ap2-core")]
+    Route {
+        method: "POST",
+        path: "/pair-list",
         handler: handlers_ap2::handle_pairings,
     },
     #[cfg(feature = "ap2-core")]

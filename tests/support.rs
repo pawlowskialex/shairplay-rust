@@ -17,6 +17,7 @@ pub enum TlvType {
     Error = 7,
     State = 6,
     Signature = 10,
+    Permissions = 11,
     Flags = 19,
 }
 
@@ -38,6 +39,11 @@ impl TlvValues {
             .iter()
             .find(|(t, _)| *t == tag as u8)
             .map(|(_, v)| v.as_slice())
+    }
+
+    /// Every item, in order: (tag, value).
+    pub fn entries(&self) -> impl Iterator<Item = (u8, &[u8])> {
+        self.0.iter().map(|(t, v)| (*t, v.as_slice()))
     }
 
     pub fn encode(&self) -> Vec<u8> {
