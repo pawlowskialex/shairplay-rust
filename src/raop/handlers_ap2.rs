@@ -185,6 +185,8 @@ pub(crate) fn handle_pair_setup(
                         client_id,
                         "AP2 normal pair-setup complete, client key stored"
                     );
+                    // a first pairing changes the status flags
+                    conn.shared.reannounce();
                     Ok(Some(m6))
                 }
                 Err(e) => {
@@ -299,6 +301,10 @@ pub(crate) fn handle_pairings(
         conn.controller(),
         request.data().unwrap_or(&[]),
     );
+    if !removed.is_empty() {
+        // the last pairing's removal changes the status flags
+        conn.shared.reannounce();
+    }
     for id in removed {
         conn.shared.sessions.close_controller(&id);
     }
@@ -522,10 +528,7 @@ pub(crate) fn handle_info(
     );
     dict.insert(
         "features".into(),
-        plist::Value::Integer(
-            (crate::net::features::receiver_features_for_pairing(conn.shared.pin.is_some()) as i64)
-                .into(),
-        ),
+        plist::Value::Integer((conn.shared.features() as i64).into()),
     );
     dict.insert(
         "model".into(),
@@ -547,13 +550,7 @@ pub(crate) fn handle_info(
     );
     dict.insert(
         "statusFlags".into(),
-        plist::Value::Integer(
-            (config::ap2_status_flags(
-                conn.shared.pin.is_some(),
-                conn.shared.pairing_store.has_any_pairing(),
-            ) as i64)
-                .into(),
-        ),
+        plist::Value::Integer(i64::from(conn.shared.status_flags()).into()),
     );
     dict.insert("pk".into(), plist::Value::String(pk_hex));
     dict.insert(
@@ -634,11 +631,7 @@ pub(crate) fn handle_pair_pin_start(
 /// Build the `updateInfo` `POST /command` message queued on a freshly-opened
 /// event channel (status flags, features, model, versions). Identical for the
 /// RC-only and normal event channels.
-fn build_update_info_message(
-    requires_pin_pairing: bool,
-    already_paired: bool,
-    model: &str,
-) -> Option<Vec<u8>> {
+fn build_update_info_message(status_flags: u32, features: u64, model: &str) -> Option<Vec<u8>> {
     use crate::raop::config;
 
     let mut update_info = plist::Dictionary::new();
@@ -646,16 +639,11 @@ fn build_update_info_message(
     let mut value = plist::Dictionary::new();
     value.insert(
         "statusFlags".into(),
-        plist::Value::Integer(
-            (config::ap2_status_flags(requires_pin_pairing, already_paired) as i64).into(),
-        ),
+        plist::Value::Integer(i64::from(status_flags).into()),
     );
     value.insert(
         "features".into(),
-        plist::Value::Integer(
-            (crate::net::features::receiver_features_for_pairing(requires_pin_pairing) as i64)
-                .into(),
-        ),
+        plist::Value::Integer((features as i64).into()),
     );
     value.insert("model".into(), plist::Value::String(model.into()));
     value.insert(
@@ -890,8 +878,8 @@ fn setup_initial(
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
                     if let Some(msg) = build_update_info_message(
-                        conn.shared.pin.is_some(),
-                        conn.shared.pairing_store.has_any_pairing(),
+                        conn.shared.status_flags(),
+                        conn.shared.features(),
                         &conn.shared.identity.model,
                     ) {
                         let _ = tx.send(msg);
@@ -941,8 +929,8 @@ fn setup_initial(
 
             // Queue updateInfo so it's sent immediately when client connects
             if let Some(msg) = build_update_info_message(
-                conn.shared.pin.is_some(),
-                conn.shared.pairing_store.has_any_pairing(),
+                conn.shared.status_flags(),
+                conn.shared.features(),
                 &conn.shared.identity.model,
             ) {
                 let _ = tx.send(msg);

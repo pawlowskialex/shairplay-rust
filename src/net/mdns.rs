@@ -58,7 +58,7 @@ pub(crate) const AP2_SRCVERS: &str = crate::raop::config::AP2_SRCVERS;
 pub(crate) const AP2_PROTOVERS: &str = crate::raop::config::AP2_PROTOVERS;
 
 /// mDNS service information for AirPlay network discovery.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AirPlayServiceInfo {
     /// RAOP service name ("AABBCCDDEEFF@Display Name").
     pub raop_name: String,
@@ -135,7 +135,8 @@ impl AirPlayServiceInfo {
     }
 
     /// Create AP2 service info with full AirPlay 2 feature flags.
-    /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID).
+    /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID); `features` and
+    /// `status_flags` as the receiver advertises them now.
     #[cfg(feature = "ap2-core")]
     #[allow(clippy::too_many_arguments)]
     pub fn new_airplay2(
@@ -145,20 +146,17 @@ impl AirPlayServiceInfo {
         password: bool,
         pk_hex: &str,
         pi: &str,
-        requires_pin_pairing: bool,
-        already_paired: bool,
+        features: u64,
+        status_flags: u32,
         identity: &crate::raop::DeviceIdentity,
     ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
         let hw_airplay = util::hwaddr_airplay(hwaddr);
         let raop_name = format!("{hw_raop}@{name}");
 
-        let features = super::features::receiver_features_for_pairing(requires_pin_pairing);
         let features_lo = features & 0xFFFFFFFF;
         let features_hi = (features >> 32) & 0xFFFFFFFF;
         let ft = format!("0x{features_lo:X},0x{features_hi:X}");
-        let status_flags =
-            crate::raop::config::ap2_status_flags(requires_pin_pairing, already_paired);
 
         let raop_txt = vec![
             // AP1 compatibility fields (allows classic AirPlay fallback)
@@ -330,6 +328,21 @@ impl MdnsService {
         Ok(())
     }
 
+    /// Register the services again with `info`'s records (the `_airplay._tcp` one only if it was registered).
+    /// The old registrations go first: Bonjour would take the same name registered twice for a conflict and
+    /// rename the new one.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn update(&mut self, info: &AirPlayServiceInfo) -> Result<(), NetworkError> {
+        let airplay = !self._airplay_regs.is_empty();
+        self._raop_regs.clear();
+        self._airplay_regs.clear();
+        self.register_raop(info)?;
+        if airplay {
+            self.register_airplay(info)?;
+        }
+        Ok(())
+    }
+
     /// Unregister the services. Bonjour's daemon, mDNSResponder, sends their goodbyes itself,
     /// also after this process exits, so there is nothing to wait for.
     pub(crate) async fn unregister_all(&mut self) {
@@ -442,6 +455,18 @@ impl MdnsService {
             .register(svc)
             .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
         tracing::info!(name = %info.airplay_name, port = info.port, "mDNS: _airplay._tcp registered");
+        Ok(())
+    }
+
+    /// Register the services again with `info`'s records (the `_airplay._tcp` one only if it was registered):
+    /// the daemon replaces a service registered under the same name and announces it.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn update(&mut self, info: &AirPlayServiceInfo) -> Result<(), NetworkError> {
+        let airplay = self.airplay_fullname.is_some();
+        self.register_raop(info)?;
+        if airplay {
+            self.register_airplay(info)?;
+        }
         Ok(())
     }
 
@@ -632,8 +657,8 @@ mod tests {
             false,
             "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
             "12345678-1234-1234-1234-123456789abc",
-            false,
-            false,
+            crate::net::features::receiver_features_for_pairing(false),
+            crate::raop::config::ap2_status_flags(false, false),
             &crate::raop::DeviceIdentity::default(),
         );
 
@@ -664,8 +689,8 @@ mod tests {
             false,
             "abcd1234",
             "my-uuid-here",
-            false,
-            false,
+            crate::net::features::receiver_features_for_pairing(false),
+            crate::raop::config::ap2_status_flags(false, false),
             &crate::raop::DeviceIdentity::default(),
         );
 
@@ -698,8 +723,8 @@ mod tests {
             false,
             "pk",
             "pi",
-            false,
-            false,
+            crate::net::features::receiver_features_for_pairing(false),
+            crate::raop::config::ap2_status_flags(false, false),
             &crate::raop::DeviceIdentity::default(),
         );
         assert_eq!(info.raop_name, "123456789ABC@My Speaker");
@@ -716,8 +741,8 @@ mod tests {
             false,
             "abcd1234",
             "my-uuid-here",
-            true,
-            false,
+            crate::net::features::receiver_features_for_pairing(true),
+            crate::raop::config::ap2_status_flags(true, false),
             &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
@@ -749,8 +774,8 @@ mod tests {
             false,
             "abcd1234",
             "my-uuid-here",
-            true,
-            false,
+            crate::net::features::receiver_features_for_pairing(true),
+            crate::raop::config::ap2_status_flags(true, false),
             &crate::raop::DeviceIdentity::default(),
         );
         let raop = |key: &str| {
@@ -788,8 +813,8 @@ mod tests {
             false,
             "00",
             "pi",
-            false,
-            false,
+            crate::net::features::receiver_features_for_pairing(false),
+            crate::raop::config::ap2_status_flags(false, false),
             &id,
         );
         let get = |k: &str| {

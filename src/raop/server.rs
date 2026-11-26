@@ -503,6 +503,8 @@ impl RaopServerBuilder {
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
             sessions: Default::default(),
+            #[cfg(feature = "ap2-core")]
+            records_changed: tokio::sync::Notify::new(),
         });
 
         let mut httpd = HttpServer::new(shared.clone(), self.max_clients);
@@ -512,13 +514,17 @@ impl RaopServerBuilder {
             shared,
             httpd,
             mdns: None,
+            mdns_applied: None,
+            reannouncer: None,
             mdns_scope: self.mdns_scope,
             bind: self.bind,
-            name: self.name,
-            hwaddr,
-            ap1_advertisement,
-            #[cfg(feature = "ap2-core")]
-            mode: self.mode,
+            advert: Advert {
+                name: self.name,
+                hwaddr,
+                ap1_advertisement,
+                #[cfg(feature = "ap2-core")]
+                mode: self.mode,
+            },
             announce: self.mdns,
             #[cfg(feature = "ap2-core")]
             ptp: self.ptp,
@@ -534,14 +540,13 @@ impl RaopServerBuilder {
 pub struct RaopServer {
     pub(crate) shared: Arc<RaopShared>,
     httpd: HttpServer,
-    mdns: Option<MdnsService>,
+    /// The registered services; the reannouncer registers them again when their records change
+    mdns: Option<Arc<std::sync::Mutex<MdnsService>>>,
+    mdns_applied: Option<MdnsScopeApplied>,
+    reannouncer: Option<tokio::task::JoinHandle<()>>,
     mdns_scope: MdnsScope,
     bind: BindConfig,
-    name: String,
-    hwaddr: Vec<u8>,
-    ap1_advertisement: Ap1Advertisement,
-    #[cfg(feature = "ap2-core")]
-    mode: AirPlayMode,
+    advert: Advert,
     /// mDNS on start (the builder's mdns)
     announce: bool,
     #[cfg(feature = "ap2-core")]
@@ -570,7 +575,7 @@ impl RaopServer {
         // AirPlay 2 PTP sink: accept the sender's clock on 319/320 so it doesn't
         // stall the buffered-audio start. No-op if the ports can't be bound.
         #[cfg(feature = "ap2-core")]
-        if self.mode == AirPlayMode::AirPlay2 {
+        if self.advert.mode == AirPlayMode::AirPlay2 {
             crate::net::ptp::spawn_ptp_sink(&self.ptp).await;
         }
 
@@ -579,8 +584,19 @@ impl RaopServer {
             let mut mdns = MdnsService::new(scope_plan.as_ref())?;
             mdns.register_raop(&info)?;
             #[cfg(feature = "ap2-core")]
-            if self.mode == AirPlayMode::AirPlay2 {
+            if self.advert.mode == AirPlayMode::AirPlay2 {
                 mdns.register_airplay(&info)?;
+            }
+            self.mdns_applied = Some(mdns.applied().clone());
+            let mdns = Arc::new(std::sync::Mutex::new(mdns));
+            #[cfg(feature = "ap2-core")]
+            if self.advert.mode == AirPlayMode::AirPlay2 {
+                self.reannouncer = Some(tokio::spawn(reannounce(
+                    self.shared.clone(),
+                    self.advert.clone(),
+                    self.httpd.port(),
+                    mdns.clone(),
+                )));
             }
             self.mdns = Some(mdns);
         }
@@ -591,7 +607,7 @@ impl RaopServer {
     /// What was done with the requested [`MdnsScope`], or `None` while no mDNS service
     /// is registered (not started, or skipped with the builder's `mdns(false)`).
     pub fn mdns_scope_applied(&self) -> Option<&MdnsScopeApplied> {
-        self.mdns.as_ref().map(MdnsService::applied)
+        self.mdns_applied.as_ref()
     }
 
     /// Whether the server is currently running.
@@ -602,8 +618,17 @@ impl RaopServer {
     /// Stop the server: unregister mDNS services, close all listeners, stop every stream and close every
     /// connection.
     pub async fn stop(&mut self) {
-        if let Some(mut mdns) = self.mdns.take() {
-            mdns.unregister_all().await;
+        if let Some(task) = self.reannouncer.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.mdns_applied = None;
+        if let Some(mdns) = self.mdns.take() {
+            // the reannouncer, the only other holder, has ended
+            let mdns = Arc::try_unwrap(mdns).ok().and_then(|m| m.into_inner().ok());
+            if let Some(mut mdns) = mdns {
+                mdns.unregister_all().await;
+            }
         }
         self.httpd.stop().await;
         self.shared.sessions.close_all();
@@ -611,34 +636,74 @@ impl RaopServer {
 
     /// Get the mDNS service info for this server.
     pub fn service_info(&self) -> AirPlayServiceInfo {
+        self.advert.service_info(&self.shared, self.httpd.port())
+    }
+}
+
+/// What the mDNS records are made of besides the shared state.
+#[derive(Clone)]
+struct Advert {
+    name: String,
+    hwaddr: Vec<u8>,
+    ap1_advertisement: Ap1Advertisement,
+    #[cfg(feature = "ap2-core")]
+    mode: AirPlayMode,
+}
+
+impl Advert {
+    /// The services' records as they are now, for a server on `port`.
+    fn service_info(&self, shared: &RaopShared, port: u16) -> AirPlayServiceInfo {
         #[cfg(feature = "ap2-core")]
-        {
-            if self.mode == AirPlayMode::AirPlay2 {
-                let (_, vk) =
-                    crate::crypto::pairing_homekit::identity_keypair(&self.shared.identity_seed);
-                let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-                let pi = self.shared.pairing_id.clone();
-                return AirPlayServiceInfo::new_airplay2(
-                    &self.name,
-                    self.httpd.port(),
-                    &self.hwaddr,
-                    !self.shared.password.is_empty(),
-                    &pk_hex,
-                    &pi,
-                    self.shared.pin.is_some(),
-                    self.shared.pairing_store.has_any_pairing(),
-                    &self.shared.identity,
-                );
-            }
+        if self.mode == AirPlayMode::AirPlay2 {
+            let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&shared.identity_seed);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            return AirPlayServiceInfo::new_airplay2(
+                &self.name,
+                port,
+                &self.hwaddr,
+                !shared.password.is_empty(),
+                &pk_hex,
+                &shared.pairing_id,
+                shared.features(),
+                shared.status_flags(),
+                &shared.identity,
+            );
         }
         AirPlayServiceInfo::new_with_ap1_advertisement(
             &self.name,
-            self.httpd.port(),
+            port,
             &self.hwaddr,
-            !self.shared.password.is_empty(),
+            !shared.password.is_empty(),
             &self.ap1_advertisement,
-            &self.shared.identity,
+            &shared.identity,
         )
+    }
+}
+
+/// Registers the services again each time their records change ([`RaopShared::reannounce`]), so browsers see
+/// the status flags as they are: a sender reads them to choose how to pair.
+#[cfg(feature = "ap2-core")]
+async fn reannounce(
+    shared: Arc<RaopShared>,
+    advert: Advert,
+    port: u16,
+    mdns: Arc<std::sync::Mutex<MdnsService>>,
+) {
+    let mut announced = advert.service_info(&shared, port);
+    loop {
+        shared.records_changed.notified().await;
+        let info = advert.service_info(&shared, port);
+        if info == announced {
+            continue;
+        }
+        let Ok(mut mdns) = mdns.lock() else {
+            return;
+        };
+        match mdns.update(&info) {
+            Ok(()) => tracing::info!("mDNS: records announced again"),
+            Err(e) => tracing::warn!("mDNS: announcing the new records failed: {e}"),
+        }
+        announced = info;
     }
 }
 

@@ -1696,6 +1696,75 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    fn airplay_txt<'a>(info: &'a shairplay::AirPlayServiceInfo, key: &str) -> Option<&'a str> {
+        info.airplay_txt
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The status flags a PIN receiver advertises follow its pairings: `OneTimePairingRequired` (bit 9) alone
+    /// until a controller paired, with `DeviceSetupForHKAccessControl` (bit 10) since.
+    #[tokio::test]
+    #[serial]
+    async fn a_first_pairing_changes_the_advertised_status_flags() {
+        let (mut server, port) =
+            pin_server(Arc::new(shairplay::MemoryPairingStore::default())).await;
+        assert_eq!(airplay_txt(&server.service_info(), "flags"), Some("0x204"));
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        pair_m5(&mut stream, &key, "phone", &sk).await;
+        let info = server.service_info();
+        assert_eq!(airplay_txt(&info, "flags"), Some("0x604"));
+        assert_eq!(raop_txt(&info, "sf"), "0x604");
+        server.stop().await;
+    }
+
+    /// Browsers hear of changed status flags without the receiver restarting: the first pairing's records are
+    /// announced again (Linux: mdns-sd, both on this host).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn a_first_pairing_is_announced_again() {
+        let name = format!("Reannounce{}", std::process::id());
+        let mut server = RaopServer::builder()
+            .ptp(false)
+            .name(&name)
+            .hwaddr([0x02, 0, 0, 0, 0, 0x21])
+            .port(0)
+            .pin("3939")
+            .build(empty_handler())
+            .unwrap();
+        server.start().await.unwrap();
+        let port = server.service_info().port;
+        let browser = mdns_sd::ServiceDaemon::new().unwrap();
+        let events = browser.browse("_airplay._tcp.local.").unwrap();
+        let flags_seen = |flags: &'static str| {
+            let (events, name) = (events.clone(), name.clone());
+            tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while let Ok(event) = events.recv_deadline(deadline) {
+                    if let mdns_sd::ServiceEvent::ServiceResolved(info) = event
+                        && info.get_fullname().contains(&name)
+                        && info.get_property_val_str("flags") == Some(flags)
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
+        };
+        assert!(flags_seen("0x204").await.unwrap(), "unpaired");
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        pair_m5(&mut stream, &key, "phone", &sk).await;
+        assert!(flags_seen("0x604").await.unwrap(), "paired");
+        let _ = browser.shutdown();
+        server.stop().await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn ap2_remote_control_only_setup() {

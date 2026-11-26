@@ -73,9 +73,35 @@ pub(crate) struct RaopShared {
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
     /// Every connection and the stream it plays
     pub(crate) sessions: crate::raop::sessions::Sessions,
+    /// Woken when what the mDNS records say changed (`reannounce`)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) records_changed: tokio::sync::Notify,
 }
 
 impl RaopShared {
+    /// The AirPlay 2 status flags as they are now: mDNS' `sf` and `flags`, `GET /info`, the event channel's
+    /// `updateInfo`.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn status_flags(&self) -> u32 {
+        crate::raop::config::ap2_status_flags(
+            self.pin.is_some(),
+            self.pairing_store.has_any_pairing(),
+        )
+    }
+
+    /// The AirPlay 2 features advertised.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn features(&self) -> u64 {
+        crate::net::features::receiver_features_for_pairing(self.pin.is_some())
+    }
+
+    /// Something the mDNS records carry changed (a first pairing, the last one removed): the server announces
+    /// them again.
+    #[cfg(feature = "ap2-core")]
+    pub(crate) fn reannounce(&self) {
+        self.records_changed.notify_one();
+    }
+
     /// What streams' samples go out as (the builder's output options).
     pub(crate) fn output(&self) -> crate::raop::pipeline::OutputConfig {
         crate::raop::pipeline::OutputConfig {
