@@ -1696,6 +1696,113 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    /// A [`shairplay::HomeSetup`] that answers `allow` and keeps who asked.
+    struct Home {
+        allow: bool,
+        asked: std::sync::Mutex<Vec<std::net::IpAddr>>,
+    }
+
+    impl Home {
+        fn new(allow: bool) -> Arc<Self> {
+            Arc::new(Self {
+                allow,
+                asked: Default::default(),
+            })
+        }
+        fn asked(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    impl shairplay::HomeSetup for Home {
+        fn allow_setup(&self, peer: std::net::IpAddr) -> bool {
+            self.asked.lock().unwrap().push(peer);
+            self.allow
+        }
+    }
+
+    /// A server without a PIN that may be set up for a home, with `store`.
+    async fn home_server(
+        home: Arc<Home>,
+        store: Arc<dyn shairplay::PairingStore>,
+    ) -> (RaopServer, u16) {
+        let mut server = RaopServer::builder()
+            .mdns(false)
+            .ptp(false)
+            .name("HomeSetup")
+            .hwaddr([0x02, 0, 0, 0, 0, 0x22])
+            .port(0)
+            .home(home)
+            .pairing_store(store)
+            .build(empty_handler())
+            .unwrap();
+        server.start().await.unwrap();
+        let port = server.service_info().port;
+        (server, port)
+    }
+
+    /// A persistent pair-setup's M1: no Flags.
+    fn persistent_m1() -> TlvValues {
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::Method as u8, &[0]);
+        m1
+    }
+
+    /// Without a PIN, a persistent pair-setup (the Home app's "Add Accessory" with 3939) goes through only if the
+    /// application's HomeSetup allows it, and only while no controller is paired: then pair-setup is refused as
+    /// Unavailable, without asking. Transient pair-setup stays open.
+    #[tokio::test]
+    #[serial]
+    async fn a_home_is_set_up_once_and_only_when_the_application_allows_it() {
+        use shairplay::{MemoryPairingStore, PairingStore};
+        let store = Arc::new(MemoryPairingStore::default());
+        let refusing = Home::new(false);
+        let (mut server, port) = home_server(refusing.clone(), store.clone()).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let m2 = post_tlv(&mut stream, "/pair-setup", 1, &persistent_m1()).await;
+        assert_eq!(m2.get_type(TlvType::Error), Some(&[2u8][..]), "refused");
+        assert_eq!(
+            *refusing.asked.lock().unwrap(),
+            ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        server.stop().await;
+
+        let allowing = Home::new(true);
+        let (mut server, port) = home_server(allowing.clone(), store.clone()).await;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = srp_pair(&mut stream, "3939", false).await;
+        let m6 = pair_m5(&mut stream, &key, "home-admin", &sk).await;
+        assert!(m6.get_type(TlvType::Error).is_none(), "set up");
+        assert!(store.is_admin("home-admin"));
+        assert_eq!(allowing.asked(), 1);
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let m2 = post_tlv(&mut stream, "/pair-setup", 1, &persistent_m1()).await;
+        assert_eq!(
+            m2.get_type(TlvType::Error),
+            Some(&[6u8][..]),
+            "paired: Unavailable"
+        );
+        assert_eq!(allowing.asked(), 1, "not asked once paired");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        perform_transient_pairing(&mut stream).await;
+        server.stop().await;
+    }
+
+    /// Without a PIN and without a HomeSetup, a persistent pair-setup is refused: it would prove only the
+    /// well-known 3939 and leave whoever asked an admin.
+    #[tokio::test]
+    #[serial]
+    async fn without_a_home_setup_a_persistent_pair_setup_is_refused() {
+        let (mut server, port, _) = start_server().await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let m2 = post_tlv(&mut stream, "/pair-setup", 1, &persistent_m1()).await;
+        assert_eq!(m2.get_type(TlvType::Error), Some(&[2u8][..]));
+        server.stop().await;
+    }
+
     fn airplay_txt<'a>(info: &'a shairplay::AirPlayServiceInfo, key: &str) -> Option<&'a str> {
         info.airplay_txt
             .iter()

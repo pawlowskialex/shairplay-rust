@@ -19,7 +19,10 @@ const PAIRING_METHOD_PAIR_SETUP: u8 = 0x00;
 // Pairing Type Flags (HAP R14 table 5-18; HomeKit ADK's HAPPairingFlag)
 const PAIRING_FLAG_TRANSIENT: u32 = 1 << 4;
 const PAIRING_FLAG_SPLIT: u32 = 1 << 24;
-const TLV_ERROR_AUTHENTICATION: u8 = 0x02;
+/// kTLVError_Authentication (HAP)
+pub(crate) const TLV_ERROR_AUTHENTICATION: u8 = 0x02;
+/// kTLVError_Unavailable: the accessory is paired already and takes no more pair-setup (HAP)
+pub(crate) const TLV_ERROR_UNAVAILABLE: u8 = 0x06;
 
 // HKDF salt/info labels reused across the pair-setup and pair-verify handshakes.
 const PS_ENCRYPT_SALT: &str = "Pair-Setup-Encrypt-Salt";
@@ -96,6 +99,15 @@ impl SrpSpare {
     }
 }
 
+/// Whether a pair-setup M1 asks for transient pair-setup (its Flags' transient bit); `false` for one that
+/// doesn't decode (its `process_m1` refuses it).
+pub(crate) fn m1_is_transient(data: &[u8]) -> bool {
+    TlvValues::decode(data)
+        .ok()
+        .and_then(|tlv| tlv.get_type(TlvType::Flags).map(read_flags))
+        .is_some_and(|flags| flags & PAIRING_FLAG_TRANSIENT != 0)
+}
+
 /// A Flags TLV's value: a little-endian integer of any length (iOS sends one byte, some senders
 /// four), of which the low 32 bits count, as in HomeKit ADK's `HAPPairingReadFlags`.
 fn read_flags(value: &[u8]) -> u32 {
@@ -121,6 +133,7 @@ pub(crate) struct SrpServer {
     m2: Vec<u8>,
     is_transient: bool,
     allow_transient: bool,
+    allow_persistent: bool,
     verified: bool,
 }
 
@@ -213,8 +226,16 @@ impl SrpServer {
             m2: Vec::new(),
             is_transient: false,
             allow_transient,
+            // with a PIN; without one only by `allow_persistent`
+            allow_persistent: !allow_transient,
             verified: false,
         })
+    }
+
+    /// Let a persistent pair-setup through without a PIN, with the well-known 3939: setting the speaker up for a
+    /// home ([`crate::raop::HomeSetup`]), which the handler decided on before M1.
+    pub(crate) fn allow_persistent(&mut self) {
+        self.allow_persistent = true;
     }
 
     /// Process M1 from client. Returns (salt, B) for M2 response.
@@ -246,7 +267,7 @@ impl SrpServer {
         }
         // Without a PIN only transient pairing: a persistent one would prove only the well-known 3939 and leave
         // whoever asked a stored (admin) controller.
-        if !self.is_transient && self.allow_transient {
+        if !self.is_transient && !self.allow_persistent {
             return Err(CryptoError::PairingHandshake(
                 "persistent pair-setup needs a PIN".into(),
             ));

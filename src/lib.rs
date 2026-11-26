@@ -108,6 +108,8 @@ pub use error::ShairplayError;
 pub use net::mdns::AirPlayServiceInfo;
 pub use net::mdns_scope::{MdnsScope, MdnsScopeApplied};
 pub use net::server::BindConfig;
+#[cfg(feature = "ap2-core")]
+pub use raop::HomeSetup;
 #[cfg(feature = "hls")]
 pub use raop::hls::{HlsHandler, HlsSession};
 #[cfg(feature = "video")]

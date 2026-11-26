@@ -113,11 +113,33 @@ pub(crate) fn handle_pair_setup(
                     pairing_homekit::TLV_ERROR_MAX_TRIES,
                 )));
             }
+            // without a PIN, a persistent pair-setup is a home's setup: only while unpaired, and if the
+            // application lets it (else process_m1 refuses it)
+            let home_setup = conn.shared.pin.is_none() && !pairing_homekit::m1_is_transient(data);
+            if home_setup && let Some(home) = &conn.shared.home {
+                if conn.shared.pairing_store.has_any_pairing() {
+                    tracing::warn!(
+                        "pair-setup refused: paired already (the admin adds controllers)"
+                    );
+                    return Ok(Some(pairing_homekit::pairing_error(
+                        2,
+                        pairing_homekit::TLV_ERROR_UNAVAILABLE,
+                    )));
+                }
+                if !home.allow_setup(conn.remote_socket.ip()) {
+                    tracing::warn!(peer = %conn.remote_socket.ip(), "home setup: not allowed by the application");
+                    return Ok(Some(pairing_homekit::pairing_error_response(2)));
+                }
+                tracing::info!(peer = %conn.remote_socket.ip(), "home setup: allowed");
+            }
             let mut srp = conn
                 .shared
                 .srp_spare
                 .take()
                 .map_err(failed("pair-setup M1: the SRP state"))?;
+            if home_setup && conn.shared.home.is_some() {
+                srp.allow_persistent();
+            }
             if let Err(e) = srp.process_m1(data) {
                 tracing::warn!("pair-setup M1 failed: {e}");
                 conn.shared.handler.on_error(&ShairplayError::Crypto(e));
@@ -169,6 +191,18 @@ pub(crate) fn handle_pair_setup(
                         "pair-setup M5: identifier already paired with another key"
                     );
                     Ok(Some(pairing_homekit::pairing_error_response(6)))
+                }
+                // a home's setup makes one admin: another that completed first took the speaker
+                Ok(_)
+                    if conn.shared.pin.is_none() && conn.shared.pairing_store.has_any_pairing() =>
+                {
+                    tracing::warn!(
+                        "pair-setup M5: another controller set the speaker up meanwhile"
+                    );
+                    Ok(Some(pairing_homekit::pairing_error(
+                        6,
+                        pairing_homekit::TLV_ERROR_UNAVAILABLE,
+                    )))
                 }
                 Ok((client_id, client_pk)) => {
                     let m6 = srp

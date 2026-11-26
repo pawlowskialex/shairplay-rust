@@ -49,6 +49,9 @@ pub(crate) struct RaopShared {
     pub(crate) decoders: Option<crate::decoder::DecoderFactory>,
     #[cfg(feature = "ap2-core")]
     pub(crate) pin: Option<String>,
+    /// The application's say in a home's setup (the builder's `home`)
+    #[cfg(feature = "ap2-core")]
+    pub(crate) home: Option<Arc<dyn crate::raop::HomeSetup>>,
     /// The next pair-setup's SRP state, made ahead of time.
     #[cfg(feature = "ap2-core")]
     pub(crate) srp_spare: std::sync::Arc<crate::crypto::pairing_homekit::SrpSpare>,

@@ -85,6 +85,8 @@ pub struct RaopServerBuilder {
     #[cfg(feature = "ap2-core")]
     pairing_store: Option<Arc<dyn PairingStore>>,
     #[cfg(feature = "ap2-core")]
+    home: Option<Arc<dyn HomeSetup>>,
+    #[cfg(feature = "ap2-core")]
     mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
@@ -130,6 +132,8 @@ impl RaopServerBuilder {
             mdns_scope: MdnsScope::default(),
             #[cfg(feature = "ap2-core")]
             pairing_store: None,
+            #[cfg(feature = "ap2-core")]
+            home: None,
             #[cfg(feature = "ap2-core")]
             mode: AirPlayMode::default(),
             output_sample_rate: None,
@@ -269,6 +273,16 @@ impl RaopServerBuilder {
     #[cfg(feature = "ap2-core")]
     pub fn pairing_store(mut self, store: Arc<dyn PairingStore>) -> Self {
         self.pairing_store = Some(store);
+        self
+    }
+
+    /// Let the speaker be set up for a home in Apple's Home app ("Add Accessory" without a code): a persistent
+    /// pair-setup with 3939, while no controller is paired, if `home` allows it ([`HomeSetup`]). Only without a
+    /// PIN (with one, pair-setup proves it). Persist the pairings ([`pairing_store`](Self::pairing_store)), or
+    /// the home's controllers are forgotten at the next start.
+    #[cfg(feature = "ap2-core")]
+    pub fn home(mut self, home: Arc<dyn HomeSetup>) -> Self {
+        self.home = Some(home);
         self
     }
 
@@ -488,6 +502,8 @@ impl RaopServerBuilder {
             pair_failures: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "ap2-core")]
             pin: self.pin,
+            #[cfg(feature = "ap2-core")]
+            home: self.home,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,
             #[cfg(feature = "video")]
