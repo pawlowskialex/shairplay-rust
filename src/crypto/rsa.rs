@@ -5,7 +5,7 @@ use rsa::pkcs1v15::SigningKey;
 use rsa::signature::SignatureEncoding;
 use rsa::signature::hazmat::PrehashSigner;
 use rsa::traits::PublicKeyParts;
-use rsa::{Oaep, RsaPrivateKey};
+use rsa::{Oaep, PrivateKey};
 
 use base64::Engine as _;
 
@@ -24,14 +24,14 @@ const B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
 
 /// RSA key for RAOP authentication. Equivalent to rsakey_t.
 pub(crate) struct RsaKey {
-    key: RsaPrivateKey,
+    key: PrivateKey,
 }
 
 impl RsaKey {
     /// Load an RSA private key from a PEM string. Equivalent to rsakey_init_pem.
     pub(crate) fn from_pem(pem: &str) -> Result<Self, CryptoError> {
         let key =
-            RsaPrivateKey::from_pkcs1_pem(pem).map_err(|e| CryptoError::RsaKey(e.to_string()))?;
+            PrivateKey::from_pkcs1_pem(pem).map_err(|e| CryptoError::RsaKey(e.to_string()))?;
         Ok(Self { key })
     }
 
@@ -79,7 +79,7 @@ impl RsaKey {
     pub(crate) fn decrypt(&self, b64_input: &str) -> Result<Vec<u8>, CryptoError> {
         let ciphertext = B64.decode(b64_input).map_err(|_| CryptoError::RsaDecrypt)?;
 
-        let key_len = self.key.n().bits() / 8;
+        let key_len = self.key.size();
         // Reject ciphertext larger than the modulus: it cannot be a valid RSA
         // block, and copying it into the modulus-sized buffer below would panic.
         if ciphertext.len() > key_len {
@@ -90,7 +90,7 @@ impl RsaKey {
         let offset = key_len.saturating_sub(ciphertext.len());
         padded[offset..offset + ciphertext.len()].copy_from_slice(&ciphertext);
 
-        let padding = Oaep::new::<sha1::Sha1>();
+        let padding = Oaep::<sha1::Sha1>::new();
         self.key
             .decrypt(padding, &padded)
             .map_err(|_| CryptoError::RsaDecrypt)

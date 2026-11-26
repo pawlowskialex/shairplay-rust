@@ -42,11 +42,11 @@ httparse = "1"
 # Crypto
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
-rsa = "0.9"
+rsa = { version = "0.10", features = ["pkcs1v15"] }
 aes = "0.9"
 cbc = "0.2"
 ctr = "0.10"
-sha1 = "0.10" # stays on digest 0.10 until rsa 0.10 is stable: rsa 0.9 takes sha1::Sha1 as its digest type parameter
+sha1 = "0.11.0-rc.5" # the version on digest 0.11, which rsa 0.10 takes as its digest type parameter
 sha2 = "0.11"
 md-5 = "0.11"
 hmac = "0.13"
