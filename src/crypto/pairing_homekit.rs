@@ -16,7 +16,9 @@ use crate::error::CryptoError;
 const USERNAME: &str = "Pair-Setup";
 const TRANSIENT_PIN: &str = "3939";
 const PAIRING_METHOD_PAIR_SETUP: u8 = 0x00;
-const PAIRING_FLAGS_TRANSIENT: u8 = 0x10;
+// Pairing Type Flags (HAP R14 table 5-18; HomeKit ADK's HAPPairingFlag)
+const PAIRING_FLAG_TRANSIENT: u32 = 1 << 4;
+const PAIRING_FLAG_SPLIT: u32 = 1 << 24;
 const TLV_ERROR_AUTHENTICATION: u8 = 0x02;
 
 // HKDF salt/info labels reused across the pair-setup and pair-verify handshakes.
@@ -92,6 +94,16 @@ impl SrpSpare {
             None => SrpServer::new(self.pin.as_deref()),
         }
     }
+}
+
+/// A Flags TLV's value: a little-endian integer of any length (iOS sends one byte, some senders
+/// four), of which the low 32 bits count, as in HomeKit ADK's `HAPPairingReadFlags`.
+fn read_flags(value: &[u8]) -> u32 {
+    value
+        .iter()
+        .take(4)
+        .enumerate()
+        .fold(0, |flags, (i, &b)| flags | u32::from(b) << (8 * i))
 }
 
 /// SRP-6a server state for HomeKit pairing.
@@ -219,12 +231,14 @@ impl SrpServer {
             ));
         }
 
-        // Flags is a TLV8 integer: little-endian, any length (iOS sends one byte, some senders four)
-        self.is_transient = tlv
-            .get_type(TlvType::Flags)
-            .filter(|f| (1..=4).contains(&f.len()))
-            .map(|f| f.iter().rev().fold(0u32, |v, &b| v << 8 | u32::from(b)))
-            .is_some_and(|flags| flags & u32::from(PAIRING_FLAGS_TRANSIENT) != 0);
+        let flags = tlv.get_type(TlvType::Flags).map_or(0, read_flags);
+        // Split pair-setup keeps the SRP verifier for a later session; it isn't implemented here
+        if flags & PAIRING_FLAG_SPLIT != 0 {
+            return Err(CryptoError::PairingHandshake(
+                "split pair-setup is not supported".into(),
+            ));
+        }
+        self.is_transient = flags & PAIRING_FLAG_TRANSIENT != 0;
         if self.is_transient && !self.allow_transient {
             return Err(CryptoError::PairingHandshake(
                 "transient pair-setup is disabled when a PIN is configured".into(),
@@ -1072,14 +1086,71 @@ mod tests {
         assert_eq!(server.shared_secret().unwrap(), &session_key[..]);
     }
 
-    #[test]
-    fn pin_pairing_rejects_transient_flag() {
-        let mut server = SrpServer::new(Some("1234")).unwrap();
+    fn m1_with_flags(flags: &[u8]) -> Vec<u8> {
         let mut m1 = TlvValues::new();
         m1.add(TlvType::State as u8, &[1]);
         m1.add(TlvType::Method as u8, &[PAIRING_METHOD_PAIR_SETUP]);
-        m1.add(TlvType::Flags as u8, &[PAIRING_FLAGS_TRANSIENT]);
-        assert!(server.process_m1(&m1.encode()).is_err());
+        m1.add(TlvType::Flags as u8, flags);
+        m1.encode()
+    }
+
+    /// The transient flag in each encoding of the Flags integer senders use or may use.
+    const TRANSIENT_FLAGS: [&[u8]; 4] = [
+        &[0x10],
+        &[0x10, 0, 0, 0],
+        &[0x10, 0, 0, 0, 0],
+        &[0x10, 0, 0, 0, 0, 0, 0, 0],
+    ];
+
+    /// Flags is a TLV8 integer: little-endian, not always one byte long, its low 32 bits counted
+    /// (bytes past them ignored, as by HomeKit ADK's `HAPPairingReadFlags`); bits that mean
+    /// nothing here are ignored. Transient ones are tried without a PIN, the others with one (without
+    /// a PIN a persistent pair-setup is refused).
+    #[test]
+    fn m1_flags_are_read_as_a_little_endian_integer() {
+        let unknown_bits: [&[u8]; 2] = [&[0x10, 0, 0x01, 0], &[0x10, 0, 0, 0, 0x01]];
+        for flags in TRANSIENT_FLAGS.into_iter().chain(unknown_bits) {
+            let mut server = SrpServer::new(None).unwrap();
+            server.process_m1(&m1_with_flags(flags)).unwrap();
+            assert!(server.is_transient(), "{flags:02x?}");
+        }
+        let not_transient: [&[u8]; 4] = [&[0, 0x10], &[0x01], &[0], &[]];
+        for flags in not_transient {
+            let mut server = SrpServer::new(Some("1234")).unwrap();
+            server.process_m1(&m1_with_flags(flags)).unwrap();
+            assert!(!server.is_transient(), "{flags:02x?}");
+        }
+    }
+
+    /// Split pair-setup (bit 24) reuses an SRP verifier across sessions: not supported, so refused
+    /// rather than run as another kind of pair-setup.
+    #[test]
+    fn m1_split_flag_is_refused() {
+        let mut with_pin = SrpServer::new(Some("1234")).unwrap();
+        assert!(
+            with_pin
+                .process_m1(&m1_with_flags(&[0, 0, 0, 0x01]))
+                .is_err()
+        );
+        for flags in [&[0x10, 0, 0, 0x01][..], &[0x10, 0, 0, 0x01, 0]] {
+            let mut server = SrpServer::new(None).unwrap();
+            assert!(
+                server.process_m1(&m1_with_flags(flags)).is_err(),
+                "{flags:02x?}"
+            );
+        }
+    }
+
+    /// With a PIN, transient pair-setup is refused however its flag is encoded.
+    #[test]
+    fn pin_pairing_rejects_transient_flag() {
+        for flags in TRANSIENT_FLAGS {
+            let mut server = SrpServer::new(Some("1234")).unwrap();
+            assert!(
+                server.process_m1(&m1_with_flags(flags)).is_err(),
+                "{flags:02x?}"
+            );
+        }
     }
 
     /// Without a PIN only transient pairing: a persistent one would only prove 3939 and store an admin.
@@ -1466,7 +1537,7 @@ f126dd202b60f0e738f46c3f9cebb86b250e64fabca09432a74e854d9d359b0b\
         let mut m1 = TlvValues::new();
         m1.add(TlvType::State as u8, &[1]);
         m1.add(TlvType::Method as u8, &[0]);
-        m1.add(TlvType::Flags as u8, &[PAIRING_FLAGS_TRANSIENT]);
+        m1.add(TlvType::Flags as u8, &[0x10]);
         m1.encode()
     }
 
