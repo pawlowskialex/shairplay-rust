@@ -213,7 +213,7 @@ pub(crate) fn handle_pair_setup(
                 }
                 Ok((client_id, client_pk)) => {
                     let m6 = srp
-                        .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
+                        .build_m6(&conn.shared.pairing_id, &conn.shared.identity_seed)
                         .map_err(failed("pair-setup M6"))?;
                     if !conn.shared.pairing_store.put(&client_id, client_pk, true) {
                         tracing::warn!(client_id, "pair-setup M5: the pairing store is full");
@@ -270,7 +270,8 @@ pub(crate) fn handle_pair_verify(
     match state {
         1 => {
             tracing::info!("AP2 pair-verify M1 received");
-            let mut pv = PairVerifyServer::new(&conn.shared.device_id, &conn.shared.identity_seed);
+            // the accessory's identifier: its pairing identifier (`pi`), as /configure and the records name it
+            let mut pv = PairVerifyServer::new(&conn.shared.pairing_id, &conn.shared.identity_seed);
             match pv.process_m1_build_m2(data) {
                 Ok(m2) => {
                     tracing::debug!(m2_len = m2.len(), "pair-verify M2 built");

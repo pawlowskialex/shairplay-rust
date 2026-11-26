@@ -1628,6 +1628,31 @@ mod ap2_tests {
         post_tlv(stream, "/pair-setup", 5, &m5).await
     }
 
+    /// The identifier the accessory gives in pair-setup's M6 (after [`srp_pair`]'s `session_key`).
+    fn m6_accessory(session_key: &[u8; 64], m6: &TlvValues) -> String {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        let mut key = [0u8; 32];
+        hkdf::Hkdf::<sha2::Sha512>::new(Some(b"Pair-Setup-Encrypt-Salt"), session_key)
+            .expand(b"Pair-Setup-Encrypt-Info", &mut key)
+            .unwrap();
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(b"PS-Msg06");
+        let inner = chacha20poly1305::ChaCha20Poly1305::new((&key).into())
+            .decrypt(
+                (&nonce).into(),
+                m6.get_type(TlvType::EncryptedData).unwrap(),
+            )
+            .unwrap();
+        String::from_utf8(
+            TlvValues::decode(&inner)
+                .unwrap()
+                .get_type(TlvType::Identifier)
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
     /// A PIN server with `store`.
     async fn pin_server(store: Arc<dyn shairplay::PairingStore>) -> (RaopServer, u16) {
         let mut server = RaopServer::builder()
@@ -1675,6 +1700,8 @@ mod ap2_tests {
         let m6 = pair_m5(&mut stream, &key, "phone", &sk).await;
         assert_eq!(m6.get_type(TlvType::State), Some(&[6u8][..]));
         assert!(m6.get_type(TlvType::Error).is_none());
+        // the identifier pair-verify gives later, the `pi`
+        assert_eq!(m6_accessory(&key, &m6), pairing_id_on(port).await);
         assert_eq!(store.get("phone"), Some(*sk.verifying_key().as_bytes()));
         assert!(store.is_admin("phone"));
 
@@ -1697,12 +1724,12 @@ mod ap2_tests {
     }
 
     /// pair-verify on `stream` as controller `id` with its key `sk`: the session's shared secret, from which
-    /// the encrypted channel's keys come.
+    /// the encrypted channel's keys come, and the identifier the accessory gave in M2.
     async fn pair_verify(
         stream: &mut TcpStream,
         id: &str,
         sk: &ed25519_dalek::SigningKey,
-    ) -> [u8; 32] {
+    ) -> ([u8; 32], String) {
         use chacha20poly1305::aead::{Aead, KeyInit};
         use ed25519_dalek::Signer;
         let eph = x25519_dalek::StaticSecret::from([5u8; 32]);
@@ -1717,6 +1744,22 @@ mod ap2_tests {
         hkdf::Hkdf::<sha2::Sha512>::new(Some(b"Pair-Verify-Encrypt-Salt"), shared.as_bytes())
             .expand(b"Pair-Verify-Encrypt-Info", &mut key)
             .unwrap();
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(b"PV-Msg02");
+        let m2_inner = chacha20poly1305::ChaCha20Poly1305::new((&key).into())
+            .decrypt(
+                (&nonce).into(),
+                m2.get_type(TlvType::EncryptedData).unwrap(),
+            )
+            .unwrap();
+        let accessory = String::from_utf8(
+            TlvValues::decode(&m2_inner)
+                .unwrap()
+                .get_type(TlvType::Identifier)
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
         let signed = [eph_pk.as_bytes(), id.as_bytes(), &server_pk[..]].concat();
         let mut inner = TlvValues::new();
         inner.add(TlvType::Identifier as u8, id.as_bytes());
@@ -1732,7 +1775,23 @@ mod ap2_tests {
         let m4 = post_tlv(stream, "/pair-verify", 2, &m3).await;
         assert_eq!(m4.get_type(TlvType::State), Some(&[4u8][..]));
         assert!(m4.get_type(TlvType::Error).is_none(), "pair-verify as {id}");
-        *shared.as_bytes()
+        (*shared.as_bytes(), accessory)
+    }
+
+    /// The `pi` the server on `port` gives in GET /info.
+    async fn pairing_id_on(port: u16) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = "GET /info RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 16384];
+        let n = stream.read(&mut buf).await.unwrap();
+        let end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let info = plist::from_bytes::<plist::Value>(&buf[end..n]).unwrap();
+        info.as_dictionary()
+            .and_then(|d| d.get("pi"))
+            .and_then(|v| v.as_string())
+            .unwrap()
+            .to_string()
     }
 
     /// The controller's side of the encrypted channel after pair-verify's `secret`.
@@ -1924,7 +1983,7 @@ mod ap2_tests {
         );
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        let (secret, _) = pair_verify(&mut stream, "home-admin", &admin).await;
         let mut channel = control_channel(&secret);
         let tlv = "application/pairing+tlv8";
         let member = [3u8; 32];
@@ -1988,7 +2047,10 @@ mod ap2_tests {
         let key = srp_pair(&mut stream, "3939", false).await;
         pair_m5(&mut stream, &key, "home-admin", &admin).await;
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        let (secret, accessory) = pair_verify(&mut stream, "home-admin", &admin).await;
+        // the Home app knows the accessory by the identifier /configure gives, its `pi` [HW 2026-11-26: with
+        // the device ID instead the iPhone dropped pair-verify after M2 and showed "No Response"]
+        assert_eq!(accessory, pairing_id_on(port).await);
         (stream, control_channel(&secret))
     }
 
@@ -2143,7 +2205,7 @@ mod ap2_tests {
         );
         let admin = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let secret = pair_verify(&mut stream, "home-admin", &admin).await;
+        let (secret, _) = pair_verify(&mut stream, "home-admin", &admin).await;
         let mut channel = control_channel(&secret);
         post_encrypted(
             &mut stream,

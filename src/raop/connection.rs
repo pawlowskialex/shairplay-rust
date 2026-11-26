@@ -70,9 +70,6 @@ pub(crate) struct RaopShared {
     pub(crate) video_eiv: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
     #[cfg(feature = "ap2-core")]
     pub(crate) pairing_id: String,
-    /// Accessory device id (`hwaddr_airplay(hwaddr)`), computed once at build.
-    #[cfg(feature = "ap2-core")]
-    pub(crate) device_id: String,
     #[cfg(feature = "ap2-core")]
     pub(crate) airplay_name: String,
     #[cfg(feature = "hls")]

@@ -449,8 +449,6 @@ impl RaopServerBuilder {
         #[cfg(feature = "ap2-core")]
         let pairing_id = derive_pi_from_hwaddr(&hwaddr);
         #[cfg(feature = "ap2-core")]
-        let device_id = crate::util::hwaddr_airplay(&hwaddr);
-        #[cfg(feature = "ap2-core")]
         let airplay_name = self.name.clone();
 
         #[cfg(feature = "ap2-core")]
@@ -521,8 +519,6 @@ impl RaopServerBuilder {
             video_eiv: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "ap2-core")]
             pairing_id,
-            #[cfg(feature = "ap2-core")]
-            device_id,
             #[cfg(feature = "ap2-core")]
             airplay_name,
             #[cfg(feature = "hls")]
