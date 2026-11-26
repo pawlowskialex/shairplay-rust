@@ -7,7 +7,8 @@
 | mDNS discovery | — | `_airplay._tcp` + `_raop._tcp`, `et=0,3,5` |
 | HomeKit pairing (persistent) | — | Configurable PIN, PairingStore key persistence — **default** in the example |
 | SRP-6a transient pairing | — | PIN 3939, automatic, no persistence — example opt-in via `--transient` |
-| Paired-state statusFlags | — | Advertises `sf` = 0x004 transient / 0x204 PIN-unpaired / 0x604 PIN-paired, gated by `has_any_pairing()` so paired controllers reconnect via pair-verify |
+| Paired-state statusFlags | — | Advertises `sf` = 0x004 transient / 0x204 PIN-unpaired / 0x604 PIN-paired / 0x404 set up for a home, gated by `has_any_pairing()` so paired controllers reconnect via pair-verify; announced again over mDNS when they change |
+| Home app setup | — | `RaopServerBuilder::home(HomeSetup)`: "Add Accessory" without a code (persistent pair-setup with 3939) while unpaired and if the application allows it; `/pair-add`, `/pair-remove`, `/pair-list`; `POST /configure` (access control, level `acl` 0 everyone / 1 the home's members, name), kept by the application. Not yet tried against the Home app |
 | Session handoff | — | A new audio SETUP stops the previous session (`set_active_audio`), so playback never lingers after a disconnect/switch |
 | Encrypted RTSP transport | — | ChaCha20-Poly1305, HKDF-SHA512 key derivation |
 | FairPlay handshake | — | Full fp-setup M1/M2 (feature `fairplay`, on by default) |

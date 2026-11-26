@@ -136,6 +136,7 @@ let mut server = RaopServer::builder()
 | `.pin()` | `"3939"` | `ap2` | PIN for HomeKit pairing |
 | `.mode()` | `AirPlayMode::AirPlay2` | `ap2` | Runtime protocol mode (AP1 or AP2) |
 | `.pairing_store()` | `MemoryPairingStore` | `ap2` | Persistent key storage |
+| `.home()` | none | `ap2` | Setup in the Home app (`HomeSetup`: the application allows it, keeps the home's configuration) |
 | `.video_handler()` | none | `video` | Video session factory |
 | `.hls_handler()` | none | `hls` | HLS video playback handler |
 
