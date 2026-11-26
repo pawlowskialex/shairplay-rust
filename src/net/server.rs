@@ -532,8 +532,13 @@ where
     let mut buf = [0u8; 4096];
     let mut last_activity = Instant::now();
     loop {
-        if !conn.answer(&mut stream).await {
-            break;
+        if conn.pending.request.is_complete() {
+            if !conn.answer(&mut stream).await {
+                break;
+            }
+            // an answer is activity: one that took long (a handler waiting for a person at the receiver) doesn't
+            // leave its connection past the quiet limit
+            last_activity = Instant::now();
         }
         let has_session = conn.handler().has_session();
         slot.session
@@ -717,6 +722,59 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
             assert!(task.is_finished(), "still open after {limit:?}");
         }
+    }
+
+    /// A request answered after longer than a connection without a session may stay quiet (a handler waiting for
+    /// a person at the receiver) gets its answer, and the connection stays: the quiet time counts from the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_answer_leaves_the_connection_open() {
+        struct Slow(
+            Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+            Arc<std::sync::atomic::AtomicBool>,
+        );
+        impl ConnectionHandler for Slow {
+            fn request(&mut self, req: &HttpRequest) -> Reply {
+                if req.method() == Some("POST") {
+                    self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = self.0.lock().unwrap().recv();
+                }
+                OkHandler { disconnect: false }.request(req)
+            }
+        }
+        let (release, wait) = std::sync::mpsc::channel();
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(process_connection(
+            server,
+            Box::new(Slow(Arc::new(std::sync::Mutex::new(wait)), waiting.clone())),
+            remote,
+            Arc::default(),
+        ));
+        client
+            .write_all(b"POST /pair-setup RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        // the request is being answered (on the blocking pool), then the time passes
+        while !waiting.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(IDLE_WITHOUT_SESSION + Duration::from_secs(5)).await;
+        release.send(()).unwrap();
+        let mut tmp = [0u8; 256];
+        let n = client.read(&mut tmp).await.unwrap();
+        assert!(String::from_utf8_lossy(&tmp[..n]).starts_with("RTSP/1.0 200"));
+        client
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 2\r\n\r\n")
+            .await
+            .unwrap();
+        let n = client.read(&mut tmp).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&tmp[..n]).starts_with("RTSP/1.0 200"),
+            "the connection stayed"
+        );
+        assert!(!task.is_finished());
     }
 
     /// Every slot taken: a new connection ends one without a session and takes its place.
