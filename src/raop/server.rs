@@ -13,6 +13,11 @@ use std::sync::Arc;
 
 const AIRPORT_KEY: &str = include_str!("../../airport.key");
 
+/// `RaopServerBuilder::max_artwork_size` unless set.
+const DEFAULT_MAX_ARTWORK_SIZE: usize = 8 * 1024 * 1024;
+/// The most `max_artwork_size` may be: the largest body the transport takes for any request.
+const MAX_ARTWORK_SIZE: usize = crate::proto::http::MAX_BODY_BYTES;
+
 fn airport_rsakey() -> Arc<RsaKey> {
     use std::sync::OnceLock;
     static KEY: OnceLock<Arc<RsaKey>> = OnceLock::new();
@@ -85,6 +90,7 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     output_format: crate::raop::SampleFormat,
     audio_buffer_size: u32,
+    max_artwork_size: usize,
     decoders: Option<crate::decoder::DecoderFactory>,
     ap1_codecs: Option<Vec<Ap1Codec>>,
     ap1_encryption: Option<Vec<Ap1Encryption>>,
@@ -130,6 +136,7 @@ impl RaopServerBuilder {
             output_max_channels: None,
             output_format: crate::raop::SampleFormat::F32,
             audio_buffer_size: 0x10_0000,
+            max_artwork_size: DEFAULT_MAX_ARTWORK_SIZE,
             decoders: None,
             ap1_codecs: None,
             ap1_encryption: None,
@@ -308,6 +315,21 @@ impl RaopServerBuilder {
         self
     }
 
+    /// Set the largest body a sender may send with cover art, in bytes: AirPlay 1's `SET_PARAMETER`
+    /// (`image/jpeg`, `image/png`, and the DMAP metadata and volume on the same method) and AirPlay 2's
+    /// `POST /command` (now-playing info, which can include artwork). A request announcing a larger
+    /// body is refused with 400 Bad Request when its headers arrive and its connection closed, which
+    /// ends that sender's session, so the limit should be above the largest artwork the senders in
+    /// use send. Default: 8 MiB. At most 32 MiB, the largest body any request may have; a larger
+    /// value is taken as 32 MiB.
+    ///
+    /// Each connection may hold one such body while it arrives (10 s at most), so the receiver's
+    /// memory for them is up to `max_clients` times this.
+    pub fn max_artwork_size(mut self, bytes: usize) -> Self {
+        self.max_artwork_size = bytes.min(MAX_ARTWORK_SIZE);
+        self
+    }
+
     /// The application's decoders ([`crate::decoder`]): `factory` is asked for each stream with its
     /// [`StreamInfo`](crate::decoder::StreamInfo) and makes its decoder, or leaves the stream to the library's
     /// ([`builtin`](crate::decoder::builtin)), which it may also use inside its own (a fallback).
@@ -454,6 +476,7 @@ impl RaopServerBuilder {
             realtime_latency_ns: self.realtime_latency_ns,
             output_format: self.output_format,
             audio_buffer_size: self.audio_buffer_size,
+            max_artwork_size: self.max_artwork_size,
             decoders: self.decoders.clone(),
             #[cfg(feature = "ap2-core")]
             srp_spare: {
