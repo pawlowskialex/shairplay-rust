@@ -2171,6 +2171,76 @@ mod ap2_tests {
         server.stop().await;
     }
 
+    /// The Home app's setup as an iPhone does it [HW 2026-11-26]: transient pair-setup, then `/pair-add` of the
+    /// home's controller on that session. While no controller is paired and the application allows it, the
+    /// controller is stored as the admin and the session is its: `/configure` follows on it. Refused when the
+    /// application says no; once paired, another transient session's `/pair-add` is refused without asking.
+    #[tokio::test]
+    #[serial]
+    async fn the_home_app_adds_its_controller_from_a_transient_session() {
+        use shairplay::{MemoryPairingStore, PairingStore};
+        let tlv = "application/pairing+tlv8";
+        let home_key = [4u8; 32];
+        let add = pairing_request(3, "home", Some(&home_key), false);
+
+        let refusing = Home::new(false);
+        let store = Arc::new(MemoryPairingStore::default());
+        let (mut server, port) = home_server(refusing.clone(), store.clone()).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = perform_transient_pairing(&mut stream).await;
+        let mut channel = control_channel(&key);
+        let (_, body) = post_encrypted(&mut stream, &mut channel, "/pair-add", tlv, &add).await;
+        let answer = TlvValues::decode(&body).unwrap();
+        assert_eq!(
+            answer.get_type(TlvType::Error),
+            Some(&[2u8][..]),
+            "not allowed"
+        );
+        assert_eq!(refusing.asked(), 1);
+        assert!(!store.has_any_pairing());
+        server.stop().await;
+
+        let home = Home::new(true);
+        let (mut server, port) = home_server(home.clone(), store.clone()).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = perform_transient_pairing(&mut stream).await;
+        let mut channel = control_channel(&key);
+        let (head, body) = post_encrypted(&mut stream, &mut channel, "/pair-add", tlv, &add).await;
+        assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+        assert!(
+            TlvValues::decode(&body)
+                .unwrap()
+                .get_type(TlvType::Error)
+                .is_none()
+        );
+        assert_eq!(store.get("home"), Some(home_key));
+        assert!(
+            store.is_admin("home"),
+            "the home's first controller is its admin"
+        );
+        assert_eq!(home.asked(), 1);
+        let (head, _) = configure(&mut stream, &mut channel, true, 0).await;
+        assert!(
+            head.starts_with("RTSP/1.0 200"),
+            "/configure on the setup's session: {head}"
+        );
+        assert_eq!(airplay_txt(&server.service_info(), "flags"), Some("0x404"));
+
+        let mut other = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let key = perform_transient_pairing(&mut other).await;
+        let mut channel = control_channel(&key);
+        let intruder = pairing_request(3, "intruder", Some(&[5; 32]), true);
+        let (_, body) = post_encrypted(&mut other, &mut channel, "/pair-add", tlv, &intruder).await;
+        assert_eq!(
+            TlvValues::decode(&body).unwrap().get_type(TlvType::Error),
+            Some(&[2u8][..]),
+            "paired: only the admin adds"
+        );
+        assert_eq!(home.asked(), 1, "not asked once paired");
+        assert_eq!(store.get("intruder"), None);
+        server.stop().await;
+    }
+
     /// Without a PIN and without a HomeSetup, a persistent pair-setup is refused: it would prove only the
     /// well-known 3939 and leave whoever asked an admin.
     #[tokio::test]

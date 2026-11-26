@@ -338,11 +338,44 @@ pub(crate) fn handle_pairings(
     response: &mut HttpResponse,
 ) -> Handled {
     response.add_header("Content-Type", "application/pairing+tlv8");
+    let request = request.data().unwrap_or(&[]);
+    // The Home app sets the speaker up from a transient session: its first AddPairing, while no controller is
+    // paired, adds the home's admin if the application allows it (HomeSetup); the session is that admin's then
+    // (the /configure and the AddPairings that follow on it).
+    let setup = matches!(conn.peer, Peer::Transient)
+        && !conn.shared.pairing_store.has_any_pairing()
+        && pairings_add(request).is_some();
+    if setup && let Some(home) = &conn.shared.home {
+        let peer = conn.remote_socket.ip();
+        if !home.allow_setup(peer) {
+            tracing::warn!(%peer, "home setup (AddPairing): not allowed by the application");
+            return Ok(Some(pairing_homekit::pairing_error(
+                2,
+                pairing_homekit::TLV_ERROR_AUTHENTICATION,
+            )));
+        }
+        tracing::info!(%peer, "home setup (AddPairing): allowed");
+    }
+    let first_admin = setup && conn.shared.home.is_some();
     let (body, removed) = pairings(
         conn.shared.pairing_store.as_ref(),
         conn.controller(),
-        request.data().unwrap_or(&[]),
+        request,
+        first_admin,
     );
+    if first_admin
+        && let Some(id) = pairings_add(request)
+        && conn.shared.pairing_store.is_admin(&id)
+    {
+        tracing::info!(
+            id,
+            "home setup: the home's admin added; this session is its"
+        );
+        conn.shared.sessions.verified(conn.id, &id);
+        conn.peer = Peer::Controller(id);
+        // a first pairing changes the status flags
+        conn.shared.reannounce();
+    }
     if !removed.is_empty() {
         if !conn.shared.pairing_store.has_any_pairing() {
             // no admin left: no home (the speaker may be set up again)
@@ -434,13 +467,29 @@ pub(crate) fn handle_configure(
 }
 
 #[cfg(feature = "ap2-core")]
+/// The identifier a pairing request (State 1) adds, if it is an AddPairing (Method 3).
+fn pairings_add(body: &[u8]) -> Option<String> {
+    use crate::crypto::tlv::{TlvType, TlvValues};
+    let tlv = TlvValues::decode(body).ok()?;
+    if tlv.get_type(TlvType::State) != Some(&[1][..])
+        || tlv.get_type(TlvType::Method) != Some(&[3][..])
+    {
+        return None;
+    }
+    tlv.get_type(TlvType::Identifier)
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .map(str::to_string)
+}
+
+#[cfg(feature = "ap2-core")]
 /// HAP pairing management (State 1; Method 3 AddPairing, 4 RemovePairing, 5 ListPairings) for a session verified as
-/// `controller`: only an admin may. Removing the last admin removes every pairing. Returns the response TLV and the
-/// controllers removed.
+/// `controller`: only an admin may, or, with `first_admin`, a home's setup adding its first controller (as an admin).
+/// Removing the last admin removes every pairing. Returns the response TLV and the controllers removed.
 pub(crate) fn pairings(
     store: &dyn crate::raop::PairingStore,
     controller: Option<&str>,
     body: &[u8],
+    first_admin: bool,
 ) -> (Vec<u8>, Vec<String>) {
     use crate::crypto::tlv::{TlvType, TlvValues};
     // HAP's kTLVError codes
@@ -459,7 +508,10 @@ pub(crate) fn pairings(
     if tlv.get_type(TlvType::State) != Some(&[1][..]) {
         return error(resp, UNKNOWN);
     }
-    let Some(admin) = controller.filter(|c| store.is_admin(c)) else {
+    let Some(admin) = controller
+        .filter(|c| store.is_admin(c))
+        .or(first_admin.then_some("the home's setup"))
+    else {
         tracing::warn!(?controller, "/pairings: not an admin controller's session");
         return error(resp, AUTHENTICATION);
     };
@@ -477,10 +529,12 @@ pub(crate) fn pairings(
             ) else {
                 return error(resp, UNKNOWN);
             };
-            let admin_perm = tlv
-                .get_type(TlvType::Permissions)
-                .and_then(|p| p.first())
-                .is_some_and(|p| p & 1 != 0);
+            // a home's first controller is its admin, whatever it asked
+            let admin_perm = first_admin
+                || tlv
+                    .get_type(TlvType::Permissions)
+                    .and_then(|p| p.first())
+                    .is_some_and(|p| p & 1 != 0);
             // an identifier already paired with another key is refused (HAP); the same one updates its permission
             if store.get(&id).is_some_and(|k| k != pk) {
                 return error(resp, UNKNOWN);
@@ -528,6 +582,11 @@ pub(crate) fn pairings(
 #[cfg(all(test, feature = "ap2-core"))]
 mod pairings_tests {
     use super::pairings;
+
+    /// `pairings` for a session (no home setup).
+    fn pairings_t(s: &dyn PairingStore, c: Option<&str>, b: &[u8]) -> (Vec<u8>, Vec<String>) {
+        pairings(s, c, b, false)
+    }
     use crate::crypto::tlv::{TlvType, TlvValues};
     use crate::raop::{MemoryPairingStore, PairingStore};
 
@@ -560,19 +619,19 @@ mod pairings_tests {
         s.put("admin", [1; 32], true);
         s.put("user", [2; 32], false);
         assert_eq!(
-            err(&pairings(&s, None, &req(5, None, None, None)).0),
+            err(&pairings_t(&s, None, &req(5, None, None, None)).0),
             Some(2)
         );
         assert_eq!(
-            err(&pairings(&s, Some("user"), &req(5, None, None, None)).0),
+            err(&pairings_t(&s, Some("user"), &req(5, None, None, None)).0),
             Some(2)
         );
         assert_eq!(
-            err(&pairings(&s, Some("stranger"), &req(5, None, None, None)).0),
+            err(&pairings_t(&s, Some("stranger"), &req(5, None, None, None)).0),
             Some(2)
         );
         assert_eq!(
-            err(&pairings(&s, Some("admin"), &req(5, None, None, None)).0),
+            err(&pairings_t(&s, Some("admin"), &req(5, None, None, None)).0),
             None
         );
     }
@@ -581,7 +640,7 @@ mod pairings_tests {
     fn add_list_and_remove() {
         let s = MemoryPairingStore::default();
         s.put("admin", [1; 32], true);
-        let (r, _) = pairings(
+        let (r, _) = pairings_t(
             &s,
             Some("admin"),
             &req(3, Some("phone"), Some([3; 32]), Some(0)),
@@ -590,20 +649,20 @@ mod pairings_tests {
         assert_eq!(s.get("phone"), Some([3; 32]));
         assert!(!s.is_admin("phone"));
         // the same identifier with another key is refused
-        let (r, _) = pairings(
+        let (r, _) = pairings_t(
             &s,
             Some("admin"),
             &req(3, Some("phone"), Some([4; 32]), Some(1)),
         );
         assert_eq!(err(&r), Some(1));
-        let (r, _) = pairings(&s, Some("admin"), &req(5, None, None, None));
+        let (r, _) = pairings_t(&s, Some("admin"), &req(5, None, None, None));
         let listed = TlvValues::decode(&r).unwrap();
         assert_eq!(err(&r), None);
         assert!(
             listed.get_type(TlvType::Separator).is_some(),
             "two controllers, separated"
         );
-        let (r, removed) = pairings(&s, Some("admin"), &req(4, Some("phone"), None, None));
+        let (r, removed) = pairings_t(&s, Some("admin"), &req(4, Some("phone"), None, None));
         assert_eq!((err(&r), removed), (None, vec!["phone".to_string()]));
         assert_eq!(s.get("phone"), None);
     }
@@ -613,7 +672,7 @@ mod pairings_tests {
         let s = MemoryPairingStore::default();
         s.put("admin", [1; 32], true);
         s.put("user", [2; 32], false);
-        let (r, mut removed) = pairings(&s, Some("admin"), &req(4, Some("admin"), None, None));
+        let (r, mut removed) = pairings_t(&s, Some("admin"), &req(4, Some("admin"), None, None));
         removed.sort();
         assert_eq!(
             (err(&r), removed),

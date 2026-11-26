@@ -173,16 +173,17 @@ pub trait AudioHandler: Send + Sync + 'static {
 
 /// The application's part in setting the speaker up for a home in Apple's Home app ([`RaopServerBuilder::home`]).
 ///
-/// The Home app adds a speaker that has no setup code by a persistent pair-setup with the well-known code 3939:
-/// its controller becomes the speaker's admin, which then adds the home's other controllers (`/pair-add`). Anyone
-/// on the network could do that first, so the server asks the application before it lets one through. Without a
-/// `HomeSetup` (and without a PIN) a persistent pair-setup is refused, as before.
+/// The Home app adds a speaker that has no setup code from a transient session (pair-setup with the well-known
+/// code 3939, as any sender): its first `/pair-add` there stores the home's controller as the speaker's admin, and
+/// the session is that admin's for what follows on it (`/configure`, the home's other controllers). A persistent
+/// pair-setup with 3939 is let through the same way. Anyone on the network could do either first, so the server
+/// asks the application before it lets one through. Without a `HomeSetup` (and without a PIN) neither is, as before.
 ///
 /// [`RaopServerBuilder::home`]: crate::RaopServerBuilder::home
 #[cfg(feature = "ap2-core")]
 pub trait HomeSetup: Send + Sync + 'static {
-    /// A controller at `peer` asks to set the speaker up (a pair-setup M1 without the transient flag) while no
-    /// controller is paired. `true` lets it go on. The server answers requests on its blocking pool, so this may
+    /// A controller at `peer` asks to set the speaker up (the first `/pair-add` from a transient session, or a
+    /// pair-setup M1 without the transient flag) while no controller is paired. `true` lets it go on. The server answers requests on its blocking pool, so this may
     /// wait a few seconds, e.g. for a button press on the speaker. Not asked when the server has a PIN (that
     /// pair-setup proves the PIN), nor once a controller is paired: pair-setup is refused then (HAP's
     /// Unavailable), and the admin adds controllers.
